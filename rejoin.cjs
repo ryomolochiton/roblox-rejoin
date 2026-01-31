@@ -486,14 +486,14 @@ Timestamp: ${systemInfo.timestamp}
         const result = execSync(`sqlite3 "${sdcardPath}" "SELECT value FROM cookies WHERE name = '.ROBLOSECURITY' LIMIT 1"`).toString().trim();
         
         if (!result) {
-          console.error(`❌ [${packageName}] Không tìm được cookie ROBLOSECURITY trong database!`);
-          try {
-  execSync(`rm -f "${sdcardPath}"`);
-} catch {} => {});
-          return null;
-        }
-        
-        cookieValue = result;
+  console.error(`❌ [${packageName}] Không tìm được cookie ROBLOSECURITY trong database!`);
+  try {
+    execSync(`rm -f "${sdcardPath}"`);
+  } catch {}
+  return null;
+}
+
+cookieValue = result;
       } catch (err) {
         console.error(`❌ [${packageName}] Lỗi khi query sqlite3: ${err.message}`);
         try {
