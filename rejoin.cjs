@@ -499,8 +499,8 @@ Timestamp: ${systemInfo.timestamp}
         try {
   execSync(`rm -f "${sdcardPath}"`);
 } catch (e) {
-  // bỏ qua lỗi
-          }
+  // console.error(e);
+        }
         return null;
       }
       
