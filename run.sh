@@ -9,6 +9,5 @@ if [ ! -x "$NODE_BIN" ]; then
 fi
 
 cd "$BASE"
-
-echo "🚀 Starting Roblox Rejoin Tool"
+echo "🚀 Roblox Rejoin Tool"
 "$NODE_BIN" rejoin.cjs </dev/tty
