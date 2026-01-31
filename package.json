@@ -1,0 +1,26 @@
+{
+  "name": "roblox-rejoin",
+  "version": "1.0.0",
+  "description": "Roblox Auto Rejoin Tool",
+  "main": "rejoin.cjs",
+  "type": "commonjs",
+  "scripts": {
+    "start": "node rejoin.cjs"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/buithanhquang052008-cloud/roblox-rejoin.git"
+  },
+  "author": "buithanhquang052008-cloud",
+  "license": "ISC",
+  "bugs": {
+    "url": "https://github.com/buithanhquang052008-cloud/roblox-rejoin/issues"
+  },
+  "homepage": "https://github.com/buithanhquang052008-cloud/roblox-rejoin",
+  "dependencies": {
+    "axios": "^1.11.0",
+    "boxen": "^8.0.1",
+    "cli-table3": "^0.6.5",
+    "figlet": "^1.8.2"
+  }
+}
