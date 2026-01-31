@@ -4,18 +4,18 @@ function ensurePackages() {
   const requiredPackages = ["axios", "cli-table3", "figlet", "boxen", "screenshot-desktop"];
 
   requiredPackages.forEach((pkg) => {
+  try {
+    require.resolve(pkg);
+  } catch (e) {
+    console.log(`Đang cài package thiếu: ${pkg}`);
     try {
-      require.resolve(pkg);
-    } catch {
-      console.log(`Đang cài package thiếu: ${pkg}`);
-      try {
-        execSync(`npm install ${pkg}`, { stdio: "inherit" });
-      } catch (e) {
-        console.error(`Lỗi khi cài ${pkg}:`, e.message);
-        process.exit(1);
-      }
+      execSync(`npm install ${pkg}`, { stdio: "inherit" });
+    } catch (err) {
+      console.error(`Lỗi khi cài ${pkg}:`, err.message);
+      process.exit(1);
     }
-  });
+  }
+});
 }
 ensurePackages();
 
