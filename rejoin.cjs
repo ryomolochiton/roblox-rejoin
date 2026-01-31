@@ -489,7 +489,7 @@ Timestamp: ${systemInfo.timestamp}
           console.error(`❌ [${packageName}] Không tìm được cookie ROBLOSECURITY trong database!`);
           try {
   execSync(`rm -f "${sdcardPath}"`);
-} catch {} => {});
+} catch (e) {};
           return null;
         }
         
