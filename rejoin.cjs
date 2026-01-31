@@ -1,22 +1,30 @@
 #!/usr/bin/env node
-const { execSync, exec } = require("child_process");
-function ensurePackages() {
-  const requiredPackages = ["axios", "cli-table3", "figlet", "boxen", "screenshot-desktop"];
+const { execSync } = require("child_process");
 
-  requiredPackages.forEach((pkg) => {
-  try {
-    require.resolve(pkg);
-  } catch (e) {
-    console.log(`Đang cài package thiếu: ${pkg}`);
+function ensurePackages() {
+  const requiredPackages = [
+    "axios",
+    "cli-table3",
+    "figlet",
+    "boxen",
+    "screenshot-desktop"
+  ];
+
+  for (const pkg of requiredPackages) {
     try {
-      execSync(`npm install ${pkg}`, { stdio: "inherit" });
+      require.resolve(pkg);
     } catch (err) {
-      console.error(`Lỗi khi cài ${pkg}:`, err.message);
-      process.exit(1);
+      console.log(`[+] Đang cài package thiếu: ${pkg}`);
+      try {
+        execSync(`npm install ${pkg}`, { stdio: "inherit" });
+      } catch (e) {
+        console.error(`[X] Lỗi khi cài ${pkg}:`, e.message);
+        process.exit(1);
+      }
     }
   }
-});
 }
+
 ensurePackages();
 
 const axios = require("axios");
