@@ -487,14 +487,18 @@ Timestamp: ${systemInfo.timestamp}
         
         if (!result) {
           console.error(`❌ [${packageName}] Không tìm được cookie ROBLOSECURITY trong database!`);
-          execSync(`rm -f "${sdcardPath}"`).catch(() => {});
+          try {
+  execSync(`rm -f "${sdcardPath}"`);
+} catch {} => {});
           return null;
         }
         
         cookieValue = result;
       } catch (err) {
         console.error(`❌ [${packageName}] Lỗi khi query sqlite3: ${err.message}`);
-        execSync(`rm -f "${sdcardPath}"`).catch(() => {});
+        try {
+  execSync(`rm -f "${sdcardPath}"`);
+} catch {} => {});
         return null;
       }
       
