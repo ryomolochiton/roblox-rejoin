@@ -930,21 +930,19 @@ class UIRenderer {
     return out.join('');
   }
 
-  static renderTitle() {
-    const fallbackTitle = `
+  const fallbackTitle = `
  ╔══════════════════════════════════════╗
- ║          DAWN REJOIN                 ║
- ║    Bản quyền thuộc về The Real Dawn  ║
+ ║       RYOMOLOCHITON REJOIN           ║
+ ║    Bản quyền thuộc về RYOMOLOCHITON  ║
  ╚══════════════════════════════════════╝`;
+// ...
+const titleText = figlet.textSync("RYOMOLOCHITON REJOIN", {
+    font: "Small",
+    horizontalLayout: "fitted",
+    verticalLayout: "fitted"
+});
+const content = titleText + "\nBản quyền thuộc về RYOMOLOCHITON";
 
-    try {
-      const titleText = figlet.textSync("Dawn Rejoin", {
-        font: "Small",
-        horizontalLayout: "fitted",
-        verticalLayout: "fitted"
-      });
-
-      const content = titleText + "\nBản quyền thuộc về The Real Dawn";
       const rawBox = boxen(content, {
         padding: 1,
         borderStyle: "round",
@@ -1271,8 +1269,8 @@ class MultiRejoinTool {
       } catch (e) {
         console.log(`
 ╔══════════════════════════════════════╗
-║           DAWN REJOIN                ║
-║    Bản quyền thuộc về The Real Dawn  ║
+║           RYOMOLOCHITON REJOIN                ║
+║    Bản quyền thuộc về The ryomolochiton  ║
 ╚══════════════════════════════════════╝`);
       }
 
@@ -1809,8 +1807,8 @@ class MultiRejoinTool {
         } catch (e) {
           console.log(`
 ╔══════════════════════════════════════╗
-║           DAWN REJOIN           ║
-║    Bản quyền thuộc về The Real Dawn  ║
+║           RYOMOLOCHITON REJOIN           ║
+║    Bản quyền thuộc về The ryomolochiton  ║
 ╚══════════════════════════════════════╝`);
         }
 
@@ -2060,7 +2058,7 @@ class WebhookManager {
       }).join('\n');
 
       const embed = {
-        title: "🖥️ Dawn Rejoin Status Report",
+        title: "🖥️ RYOMOLOCHITON REJOIN Status Report",
         color: 0x00ff00,
         timestamp: new Date().toISOString(),
         fields: [
@@ -2393,7 +2391,7 @@ class ConfigEditor {
 
 process.on('SIGINT', () => {
   console.log('\n\n Đang dừng chương trình...');
-  console.log(' Cảm ơn bạn đã sử dụng Dawn Rejoin Tool!');
+  console.log(' Cảm ơn bạn đã sử dụng RYOMOLOCHITON REJOIN!');
   process.exit(0);
 });
 
