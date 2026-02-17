@@ -735,15 +735,8 @@ class GameSelector {
       "1": ["126884695634066", "Grow-a-Garden"],
       "2": ["2753915549", "Blox-Fruits"],
       "3": ["6284583030", "Pet-Simulator-X"],
-      "4": ["126244816328678", "DIG"],
-      "5": ["116495829188952", "Dead-Rails-Alpha"],
-      "6": ["8737602449", "PLS-DONATE"],
-      "7": ["920587237", "Adopt Me!"],
-      "8": ["79546208627805", "99 Night In The Forests"],
-      "9": ["109983668079237", "Steal-a-Brainrot"],
-      "10": ["127742093697776", "Plants-Vs-Brainrots"],
-      "11": ["121864768012064", "Fish-It"],
-      "12": ["16732694052", "Fisch"],
+      "4": ["1537690962", "Bee-Swarm-Simulator"],
+      "5": ["16146832113", "Anime-Vanguards"],
       "0": ["custom", "Tùy chỉnh"],
     };
   }
