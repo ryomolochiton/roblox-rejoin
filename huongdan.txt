@@ -1,1 +1,0 @@
-termux-setup-storage && mv /sdcard/Download/loader.sh ~/ && sed -i 's/\r$//' ~/loader.sh && chmod +x ~/loader.sh
