@@ -923,12 +923,13 @@ class UIRenderer {
     return out.join('');
   }
 
-  const fallbackTitle = `
+  static renderTitle() {
+    const fallbackTitle = `
  ╔══════════════════════════════════════╗
  ║       RYOMOLOCHITON REJOIN           ║
  ║    Bản quyền thuộc về RYOMOLOCHITON  ║
  ╚══════════════════════════════════════╝`;
-// ...
+    try {
 const titleText = figlet.textSync("RYOMOLOCHITON REJOIN", {
     font: "Small",
     horizontalLayout: "fitted",
