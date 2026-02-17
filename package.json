@@ -1,10 +1,9 @@
 {
   "name": "roblox-rejoin",
   "version": "1.0.0",
-  "description": "Hello Roblox!",
+  "description": "��H\u0000e\u0000l\u0000l\u0000o\u0000\r\u0000 \u0000R\u0000o\u0000b\u0000l\u0000o\u0000x\u0000!\u0000\r\u0000 \u0000",
   "main": "rejoin.js",
-  "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 1"
+  "scripts": {                                                            "test": "echo \"Error: no test specified\" && exit 1"
   },
   "repository": {
     "type": "git",
@@ -13,7 +12,7 @@
   "keywords": [],
   "author": "",
   "license": "ISC",
-  "type": "module",
+  "type": "commonjs",
   "bugs": {
     "url": "https://github.com/ryomolochiton/roblox-rejoin/issues"
   },
