@@ -1,22 +1,23 @@
 {
   "name": "roblox-rejoin",
   "version": "1.0.0",
-  "description": "��H\u0000e\u0000l\u0000l\u0000o\u0000\r\u0000 \u0000R\u0000o\u0000b\u0000l\u0000o\u0000x\u0000!\u0000\r\u0000 \u0000",
+  "description": "Hello Roblox!",
   "main": "rejoin.js",
-  "scripts": {                                                            "test": "echo \"Error: no test specified\" && exit 1"
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
   },
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/NhinQuanhLanCuoi9999/roblox-rejoin.git"
+    "url": "git+https://github.com/buithanhquang052008-cloud/roblox-rejoin.git"
   },
   "keywords": [],
   "author": "",
   "license": "ISC",
-  "type": "commonjs",
+  "type": "module",
   "bugs": {
-    "url": "https://github.com/NhinQuanhLanCuoi9999/roblox-rejoin/issues"
+    "url": "https://github.com/buithanhquang052008-cloud/roblox-rejoin/issues"
   },
-  "homepage": "https://github.com/NhinQuanhLanCuoi9999/roblox-rejoin#readme",
+  "homepage": "https://github.com/buithanhquang052008-cloud/roblox-rejoin#readme",
   "dependencies": {
     "axios": "^1.11.0",
     "boxen": "^8.0.1",
