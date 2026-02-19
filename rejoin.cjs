@@ -817,13 +817,14 @@ class StatusHandler {
 
 
     if (presence.userPresenceType === 1) {
-      return {
-        status: "Online nhưng không trong game",
-        info: "User online nhưng không trong game.",
+    return {
+        status: "Online (Web/App)",
+        info: "Phát hiện user đang online nhưng chưa vào game. Đang tiến hành khởi chạy...",
         shouldLaunch: true,
-        rejoinOnly: true
-      };
-    }
+        rejoinOnly: false // Nên để false nếu bạn muốn nó thực sự mở game mới thay vì chỉ "rejoin"
+    };
+}
+
 
 
     if (presence.userPresenceType !== 2) {
