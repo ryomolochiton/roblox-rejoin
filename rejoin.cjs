@@ -821,7 +821,7 @@ class StatusHandler {
         status: "Online (Web/App)",
         info: "Phát hiện user đang online nhưng chưa vào game. Đang tiến hành khởi chạy...",
         shouldLaunch: true,
-        rejoinOnly: false // Nên để false nếu bạn muốn nó thực sự mở game mới thay vì chỉ "rejoin"
+        rejoinOnly: true // Nên để false nếu bạn muốn nó thực sự mở game mới thay vì chỉ "rejoin"
     };
 }
 
