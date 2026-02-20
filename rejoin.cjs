@@ -91,29 +91,51 @@ class Utils {
     }
   }
 
-static async launch(placeId, linkCode = null, packageName) {
 
-  const url = linkCode
-    ? `roblox://placeID=${placeId}&linkCode=${linkCode}`
-    : `roblox://placeID=${placeId}`;
 
-  console.log(`[${packageName}] 🔥 Force stopping...`);
 
-  try { execSync(`am force-stop ${packageName}`); } catch {}
-  try { execSync(`am kill ${packageName}`); } catch {}
+  static async launch(placeId, linkCode = null, packageName) {
+    const url = linkCode
+      ? `roblox://placeID=${placeId}&linkCode=${linkCode}`
+      : `roblox://placeID=${placeId}`;
 
-  await new Promise(r => setTimeout(r, 2500));
+    console.log(` [${packageName}] Đang mở: ${url}`);
+    if (linkCode) console.log(` [${packageName}] Đã join bằng linkCode: ${linkCode}`);
 
-  const command = `am start -a android.intent.action.VIEW -d "${url}"`;
 
-  try {
-    execSync(command);
-    console.log(`[+] [${packageName}] 💥 Force Rejoin OK`);
-  } catch (e) {
-    console.error(`Launch failed: ${e.message}`);
+    let activity;
+    const prefix = this.loadPackagePrefixConfig();
+    const customActivity = this.loadActivityConfig();
+
+
+    if (customActivity) {
+      activity = customActivity;
+      console.log(` [${packageName}] Sử dụng activity tùy chỉnh: ${activity}`);
+    } else {
+
+      if (packageName.startsWith(`${prefix}.client.`)) {
+
+
+        activity = `${prefix}.client.ActivityProtocolLaunch`;
+      } else if (packageName === `${prefix}.client`) {
+
+        activity = `${prefix}.client.ActivityProtocolLaunch`;
+      } else {
+
+        activity = `${prefix}.client.ActivityProtocolLaunch`;
+      }
+      console.log(` [${packageName}] Sử dụng activity mặc định: ${activity}`);
+    }
+
+    const command = `am start -n ${packageName}/${activity} -a android.intent.action.VIEW -d "${url}" --activity-clear-top`;
+
+    try {
+      execSync(command, { stdio: 'pipe' });
+      console.log(`[+] [${packageName}] Launch command executed!`);
+    } catch (e) {
+      console.error(`[-] [${packageName}] Launch failed: ${e.message}`);
+    }
   }
-}
-    
 
   static ask(rl, msg) {
     return new Promise((r) => rl.question(msg, r));
@@ -795,14 +817,13 @@ class StatusHandler {
 
 
     if (presence.userPresenceType === 1) {
-    return {
-        status: "Online (Web/App)",
-        info: "Phát hiện user đang online nhưng chưa vào game. Đang tiến hành khởi chạy...",
+      return {
+        status: "Online nhưng không trong game",
+        info: "User online nhưng không trong game.",
         shouldLaunch: true,
-        rejoinOnly: true // Nên để false nếu bạn muốn nó thực sự mở game mới thay vì chỉ "rejoin"
-    };
-}
-
+        rejoinOnly: true
+      };
+    }
 
 
     if (presence.userPresenceType !== 2) {
