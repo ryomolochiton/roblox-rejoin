@@ -738,6 +738,7 @@ class GameSelector {
       "4": ["1537690962", "Bee-Swarm-Simulator"],
       "5": ["16146832113", "Anime-Vanguards"],
       "6": ["4520749081", "King-Legacy"],
+      "7": ["4996049426", "All-Star-Tower-Defense"],
       "0": ["custom", "Tùy chỉnh"],
     };
   }
