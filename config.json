@@ -1,0 +1,12 @@
+{
+  "cooldownSec": 90,
+  "maxRetries": 5,
+  "requestTimeoutMs": 12000,
+  "reloadCookieEachCycle": true,
+  "webhookEnabled": false,
+  "webhookUrl": "",
+  "userId": "",
+  "cookiePath": "",
+  "packages": {},
+  "autoexec": ""
+}
