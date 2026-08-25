@@ -1,0 +1,10 @@
+node_modules/
+package-lock.json
+.tmp/
+cookie.txt
+config.json
+*.log
+*.db
+*.db-wal
+*.db-shm
+.DS_Store
