@@ -983,6 +983,7 @@ class RobloxUser {
     this.verified = false;
     this.lastError = null;
     this.lastCheckedAt = null;
+    this._csrf = null;
   }
 
   get headers() {
@@ -1039,12 +1040,50 @@ class RobloxUser {
     }
   }
 
-  /** Lấy thông tin hiển thị thêm (ngày tạo, mô tả). Không bắt buộc. */
-  async fetchProfile() {
-    if (!this.userId) return null;
+  /** Lấy X-CSRF-TOKEN (Roblox trả token kèm phản hồi 403 của POST rỗng). */
+  async _csrfToken() {
+    if (this._csrf) return this._csrf;
+    if (!this.cookie) return null;
     try {
-      const res = await getJSON(`https://users.roblox.com/v1/users/${this.userId}`, { retries: 1 });
-      return res.ok ? res.json() : null;
+      const res = await request('https://auth.roblox.com/v2/logout', {
+        method: 'POST',
+        headers: { ...this.headers, 'Content-Length': '0' },
+        timeout: 12000,
+        retries: 0,
+      });
+      this._csrf = (res.headers && res.headers['x-csrf-token']) || null;
+      return this._csrf;
+    } catch (_) {
+      return null;
+    }
+  }
+
+  /**
+   * Lấy authentication ticket dùng một lần, gắn với cookie của riêng alias này.
+   * Đây là thứ khiến mỗi tài khoản mở đúng phiên của mình.
+   */
+  async getAuthTicket() {
+    if (!this.cookie) return null;
+    const csrf = await this._csrfToken();
+    if (!csrf) return null;
+    try {
+      const res = await request('https://auth.roblox.com/v1/authentication-ticket', {
+        method: 'POST',
+        headers: {
+          ...this.headers,
+          'X-CSRF-TOKEN': csrf,
+          Referer: 'https://www.roblox.com/',
+          Origin: 'https://www.roblox.com',
+          'Content-Length': '0',
+        },
+        timeout: 12000,
+        retries: 0,
+      });
+      if (res.status === 403) {
+        this._csrf = null; // token hết hạn -> lần sau lấy lại
+        return null;
+      }
+      return (res.headers && res.headers['rbx-authentication-ticket']) || null;
     } catch (_) {
       return null;
     }
@@ -1303,7 +1342,7 @@ const ALLOWED = {
   joined: ['waiting', 'error', 'stopped'],
   waiting: ['launching', 'error', 'stopped'],
   error: ['launching', 'fatal', 'stopped', 'waiting'],
-  fatal: ['stopped', 'launching'],
+  fatal: ['stopped'],
   stopped: ['idle', 'launching'],
 };
 
@@ -1386,6 +1425,8 @@ class StatusHandler {
    * @returns {'retry'|'fatal'}
    */
   recordError(message) {
+    // Đã FATAL thì không đếm thêm lỗi, không tăng retries nữa.
+    if (this.state === STATES.FATAL) return 'fatal';
     this.transition(STATES.ERROR, { error: message });
     if (this.retries >= this.maxRetries) {
       this.transition(STATES.FATAL, { error: message });
@@ -1395,10 +1436,13 @@ class StatusHandler {
   }
 
   reset() {
+    const from = this.state;
     this.state = STATES.IDLE;
     this.retries = 0;
     this.lastError = null;
     this.changedAt = Date.now();
+    this.history.push({ from, to: STATES.IDLE, at: this.changedAt, meta: { reason: 'reset' } });
+    if (this.history.length > 100) this.history.shift();
     return this;
   }
 
@@ -2507,10 +2551,26 @@ class MultiRejoinTool {
     return { total: results.length, verified: results.filter(Boolean).length };
   }
 
-  /** Mở Roblox client bằng deep link (không tự động hoá thao tác trong game). */
+  /** Mở Roblox client bằng deep link riêng cho từng tài khoản. */
   async launch(alias) {
-    const url = this.selector.buildLaunchUrl();
-    if (!url) throw new Error('Chưa cấu hình mục tiêu (placeId / private server).');
+    const entry = this.accounts.get(alias);
+    if (!entry) throw new Error(`Không tìm thấy tài khoản "${alias}".`);
+    const { user } = entry;
+
+    const base = this.selector.buildLaunchUrl();
+    if (!base) throw new Error('Chưa cấu hình mục tiêu (placeId / private server).');
+
+    const ticket = await user.getAuthTicket();
+    let url = base;
+    if (ticket) {
+      const sep = base.includes('?') ? '&' : '?';
+      url = `${base}${sep}gameinfo=${encodeURIComponent(ticket)}`;
+    } else {
+      this.logger.warn(
+        `[${alias}] không lấy được auth ticket — client sẽ dùng phiên đang đăng nhập, ` +
+          'không đảm bảo đúng tài khoản.'
+      );
+    }
 
     const platform = process.platform;
     const [cmd, args] =
@@ -2526,19 +2586,21 @@ class MultiRejoinTool {
         resolve();
       });
     });
-    this.logger.debug(`[${alias}] đã gọi ${cmd} với ${url}`);
+    // KHÔNG log `url` vì nó chứa ticket.
+    this.logger.debug(`[${alias}] đã gọi ${cmd}${ticket ? ' (kèm ticket riêng)' : ''}`);
   }
 
   /** Một lượt rejoin cho một tài khoản. */
   async rejoinOnce(alias) {
     const entry = this.accounts.get(alias);
     if (!entry) return;
-    const { status } = entry;
+    const { user, status } = entry;
 
     status.transition(STATES.LAUNCHING);
     try {
       await this.launch(alias);
-      await sleep(1500);
+      const joined = await this.waitForJoin(user);
+      if (!joined) throw new Error('Client không vào được game trong thời gian chờ.');
       status.transition(STATES.JOINED);
     } catch (err) {
       const verdict = status.recordError(err.message);
@@ -2556,6 +2618,29 @@ class MultiRejoinTool {
         );
         await this.interruptibleSleep(wait * 1000);
       }
+    }
+  }
+
+  /** Poll presence tới khi tài khoản thực sự InGame, hoặc hết hạn chờ. */
+  async waitForJoin(user, timeoutMs = 45000, stepMs = 3000) {
+    if (!user || !user.userId) return true; // không có cách kiểm chứng -> giữ hành vi cũ
+    const deadline = Date.now() + timeoutMs;
+    while (Date.now() < deadline && !this.stopRequested) {
+      await sleep(stepMs);
+      const presence = await user.fetchPresence();
+      if (presence && presence.type === 'InGame') return true;
+    }
+    return false;
+  }
+
+  /** Chờ nhưng vẫn nhịp lại theo ui.refreshMs, thoát sớm khi dừng. */
+  async interruptibleSleepWithRender(ms) {
+    const refresh = Math.max(250, Number(this.config.get('ui.refreshMs', 1000)) || 1000);
+    let waited = 0;
+    while (waited < ms && !this.stopRequested) {
+      const step = Math.min(refresh, ms - waited);
+      await sleep(step);
+      waited += step;
     }
   }
 
@@ -2626,6 +2711,19 @@ class MultiRejoinTool {
         await this.rejoinOnce(alias);
       }
 
+      if (this.config.get('rejoin.stopOnFatal', true)) {
+        const fatals = Array.from(this.accounts.values()).filter(
+          (a) => a.status.state === STATES.FATAL
+        );
+        if (fatals.length) {
+          this.ui.fail(
+            'Dừng theo rejoin.stopOnFatal — tài khoản lỗi nặng: ' +
+              fatals.map((a) => a.status.alias).join(', ')
+          );
+          break;
+        }
+      }
+
       const stillActive = Array.from(this.accounts.values()).some((a) => a.status.isActive);
       if (!stillActive) {
         this.ui.fail('Mọi tài khoản đều đã dừng. Kết thúc vòng lặp.');
@@ -2641,7 +2739,7 @@ class MultiRejoinTool {
       const jitter = jitterMax ? Math.floor(Math.random() * jitterMax) : 0;
       const wait = interval + jitter;
       this.ui.info(`Chờ ${Math.round(wait / 1000)}s trước lượt tiếp theo...`);
-      await this.interruptibleSleep(wait);
+      await this.interruptibleSleepWithRender(wait);
     }
 
     this.running = false;
