@@ -232,6 +232,48 @@ class Utils {
 
 
 
+  /**
+   * Env sạch để gọi binary Android (am / pm / monkey / am force-stop).
+   * Termux export LD_PRELOAD + LD_LIBRARY_PATH trỏ vào $PREFIX/lib, khiến
+   * app_process (mà `am` gọi) không link được -> `am start` chết âm thầm,
+   * bot tưởng đã rejoin nhưng thực tế app không hề mở.
+   */
+  static androidEnv() {
+    const env = { ...process.env };
+    delete env.LD_PRELOAD;
+    delete env.LD_LIBRARY_PATH;
+    env.PATH = `/system/bin:/system/xbin:${env.PATH || ""}`;
+    return env;
+  }
+
+  // Nhận diện output lỗi của `am start` (am trả exit code 0 cả khi lỗi)
+  static _amFailed(out) {
+    const s = String(out || "");
+    return /Error:|Exception|Permission Denial|does not exist|not found|Activity class .* does not exist/i.test(s);
+  }
+
+  /** Đóng hẳn app trước khi mở lại (dùng khi app treo / rejoin nhiều lần không lên) */
+  static forceStop(packageName) {
+    const cmds = [
+      `/system/bin/am force-stop ${packageName}`,
+      `su -c 'unset LD_PRELOAD LD_LIBRARY_PATH; /system/bin/am force-stop ${packageName}'`
+    ];
+    for (const c of cmds) {
+      try {
+        execSync(c, { stdio: "pipe", env: Utils.androidEnv(), timeout: 15000 });
+        console.log(`[*] [${packageName}] Đã force-stop app.`);
+        return true;
+      } catch { }
+    }
+    return false;
+  }
+
+  /**
+   * Mở Roblox vào đúng place.
+   * @returns {boolean} true nếu lệnh mở app thực sự thành công.
+   *   QUAN TRỌNG: trước đây hàm này luôn "coi như xong" kể cả khi am lỗi,
+   *   nên StatusHandler bật cooldown dài -> không rejoin nữa.
+   */
   static async launch(placeId, linkCode = null, packageName) {
     const url = linkCode
       ? `roblox://placeID=${placeId}&linkCode=${linkCode}`
@@ -265,14 +307,43 @@ class Utils {
       console.log(` [${packageName}] Sử dụng activity mặc định: ${activity}`);
     }
 
-    const command = `am start -n ${packageName}/${activity} -a android.intent.action.VIEW -d "${url}" --activity-clear-top`;
+    const q = Utils.shq;
+    const base = `am start -n ${packageName}/${activity} -a android.intent.action.VIEW -d ${q(url)} --activity-clear-top`;
 
-    try {
-      execSync(command, { stdio: 'pipe' });
-      console.log(`[+] [${packageName}] Launch command executed!`);
-    } catch (e) {
-      console.error(`[-] [${packageName}] Launch failed: ${e.message}`);
+    // Thử nhiều biến thể: bản thường -> /system/bin -> qua su -> mở bằng URL thuần
+    const attempts = [
+      `/system/bin/${base}`,
+      base,
+      `su -c ${q(`unset LD_PRELOAD LD_LIBRARY_PATH; /system/bin/${base}`)}`,
+      `/system/bin/am start -a android.intent.action.VIEW -d ${q(url)} -p ${packageName}`,
+      `su -c ${q(`unset LD_PRELOAD LD_LIBRARY_PATH; /system/bin/am start -a android.intent.action.VIEW -d ${url} -p ${packageName}`)}`
+    ];
+
+    for (const cmd of attempts) {
+      try {
+        const out = execSync(cmd, {
+          stdio: "pipe",
+          encoding: "utf8",
+          env: Utils.androidEnv(),
+          timeout: 20000
+        });
+
+        // `am` hay trả exit 0 kèm "Error: ..." -> phải soi output
+        if (Utils._amFailed(out)) {
+          console.warn(`[!] [${packageName}] am báo lỗi, thử cách khác: ${String(out).trim().split("\n")[0]}`);
+          continue;
+        }
+
+        console.log(`[+] [${packageName}] Launch command executed!`);
+        return true;
+      } catch (e) {
+        const detail = (e.stderr || e.stdout || e.message || "").toString().trim().split("\n")[0];
+        console.warn(`[!] [${packageName}] Thử launch thất bại: ${detail}`);
+      }
     }
+
+    console.error(`[-] [${packageName}] Launch failed: không mở được app bằng mọi cách.`);
+    return false;
   }
 
   static ask(rl, msg) {
@@ -808,15 +879,30 @@ Timestamp: ${systemInfo.timestamp}
 }
 
 class GameLauncher {
-  static async handleGameLaunch(shouldLaunch, placeId, linkCode, packageName, rejoinOnly = false) {
-    if (shouldLaunch) {
-      console.log(` [${packageName}] Starting launch process...`);
+  /**
+   * @returns {boolean} true nếu app thực sự được mở.
+   * Trước đây hàm này trả về undefined -> caller không biết launch fail
+   * nên vẫn bật cooldown và ngừng rejoin.
+   */
+  static async handleGameLaunch(shouldLaunch, placeId, linkCode, packageName, rejoinOnly = false, forceStop = false) {
+    if (!shouldLaunch) return false;
 
+    console.log(` [${packageName}] Starting launch process...`);
 
-      await Utils.launch(placeId, linkCode, packageName);
-
-      console.log(`[+] [${packageName}] Launch process completed!`);
+    // Rejoin liên tục không lên -> app nhiều khả năng đang treo, kill trước
+    if (forceStop) {
+      console.log(`[*] [${packageName}] Rejoin nhiều lần không vào được -> force-stop rồi mở lại.`);
+      Utils.forceStop(packageName);
+      await new Promise(r => setTimeout(r, 2000));
     }
+
+    const ok = await Utils.launch(placeId, linkCode, packageName);
+
+    console.log(ok
+      ? `[+] [${packageName}] Launch process completed!`
+      : `[-] [${packageName}] Launch process FAILED - sẽ thử lại vòng sau.`);
+
+    return ok;
   }
 }
 
@@ -852,6 +938,7 @@ class RobloxUser {
     // Gọi endpoint chính thức trước (kèm cookie để lấy đủ placeId),
     // nếu lỗi mạng/chặn thì fallback sang roproxy (KHÔNG gửi cookie sang proxy bên thứ 3)
     const body = { userIds: [Number(this.userId) || this.userId] };
+    let lastErr = null;
 
     try {
       const r = await axios.post(
@@ -870,6 +957,7 @@ class RobloxUser {
       const p = r.data?.userPresences?.[0];
       if (p) return p;
     } catch (e) {
+      lastErr = e;
       // rơi xuống fallback
     }
 
@@ -886,10 +974,17 @@ class RobloxUser {
           },
         }
       );
-      return r.data?.userPresences?.[0] || null;
-    } catch {
-      return null;
+      const p = r.data?.userPresences?.[0];
+      if (p) return p;
+    } catch (e) {
+      lastErr = e;
     }
+
+    // Cả 2 endpoint fail: KHÔNG trả null im lặng.
+    // Trả marker để vòng lặp biết đây là lỗi mạng (giữ trạng thái cũ),
+    // khác hẳn với "API trả về offline thật".
+    this.lastPresenceError = lastErr ? (lastErr.message || String(lastErr)) : "unknown";
+    return { __fetchFailed: true, error: this.lastPresenceError };
   }
 }
 
@@ -964,56 +1059,129 @@ class StatusHandler {
     this.joinedAt = 0;
     // Thời gian chờ sau khi mở app để Roblox kịp load, tránh spam rejoin
     this.joinCooldownMs = joinCooldownSec * 1000;
+    // Số lần đã bắn rejoin liên tiếp mà user vẫn chưa vào game
+    this.consecutiveFails = 0;
+    // Lần rejoin gần nhất thành công ở mức "đã mở được app"
+    this.lastLaunchOk = true;
+    // presenceType của lần kiểm tra trước, dùng để phát hiện CHUYỂN trạng thái
+    this.lastPtype = null;
+    // Khoảng nghỉ tối thiểu giữa 2 lần bắn, kể cả khi vừa đổi trạng thái.
+    // Chặn spam nếu presence API nhấp nháy (flapping) giữa 0 và 1.
+    this.minLaunchGapMs = 8000;
   }
 
-  isCoolingDown(now = Date.now()) {
-    return this.hasLaunched && (now - this.joinedAt) < this.joinCooldownMs;
+  /**
+   * Cooldown chỉ dùng để chống spam khi app ĐANG load.
+   * Nếu user Offline hẳn thì app chắc chắn không load -> không chờ,
+   * chỉ giữ 1 khoảng nghỉ ngắn (grace) để am kịp mở app.
+   */
+  cooldownForState(offline) {
+    if (!offline) return this.joinCooldownMs;
+    // Offline: lần bắn đầu chỉ chờ 20s, sau đó tăng dần nếu vẫn không vào được.
+    // Dùng (consecutiveFails - 1) vì updateJoinStatus() đã +1 ngay khi bắn,
+    // nếu không mức 20s sẽ không bao giờ được áp dụng.
+    const base = 20000;
+    const tries = Math.max(0, this.consecutiveFails - 1);
+    const backoff = Math.min(tries, 3) * 10000; // 20s -> 30s -> 40s -> 50s
+    return Math.min(base + backoff, this.joinCooldownMs);
   }
 
-  cooldownLeftSec(now = Date.now()) {
-    return Math.max(0, Math.ceil((this.joinCooldownMs - (now - this.joinedAt)) / 1000));
+  isCoolingDown(now = Date.now(), offline = false) {
+    if (!this.hasLaunched) return false;
+    return (now - this.joinedAt) < this.cooldownForState(offline);
+  }
+
+  cooldownLeftSec(now = Date.now(), offline = false) {
+    return Math.max(0, Math.ceil((this.cooldownForState(offline) - (now - this.joinedAt)) / 1000));
+  }
+
+  /** Đã bắn rejoin nhiều lần mà vẫn không vào được -> nên force-stop app */
+  shouldForceStop() {
+    return this.consecutiveFails >= 2;
+  }
+
+  /**
+   * Trạng thái vừa TỤT khỏi in-game (2 -> 0/1/khác) trong lần kiểm tra này?
+   * Đây là thời điểm phải rejoin NGAY, không chờ cooldown: app đã thoát hẳn
+   * nên chẳng có gì để "chờ load" cả.
+   */
+  isFreshDrop(ptype) {
+    if (this.lastPtype === null) return false;      // lần chạy đầu, chưa có gì để so
+    if (ptype === 2) return false;                  // vẫn đang trong game
+    return this.lastPtype !== ptype;                // trạng thái vừa thay đổi
+  }
+
+  /** Chống spam tối thiểu, dùng cho trường hợp bỏ qua cooldown */
+  withinMinGap(now) {
+    return this.joinedAt > 0 && (now - this.joinedAt) < this.minLaunchGapMs;
   }
 
   analyzePresence(presence, targetRootPlaceId) {
     const now = Date.now();
-    const cooling = this.isCoolingDown(now);
-    const coolMsg = cooling ? ` (đang chờ load ${this.cooldownLeftSec(now)}s)` : "";
 
-    if (!presence || presence.userPresenceType === undefined) {
+    // presenceType 0 = Offline, 1 = Online (ngoài game) -> cả hai đều KHÔNG ở trong game
+    const ptype = presence && presence.userPresenceType !== undefined
+      ? presence.userPresenceType
+      : undefined;
+    const notInGame = ptype === undefined || ptype === 0 || ptype === 1 || ptype !== 2;
+
+    // Vừa chuyển trạng thái (vd: Online[+] -> Offline, hoặc Offline -> Online ngoài game)
+    // => bắn rejoin NGAY, bỏ qua cooldown. Chỉ giữ khoảng nghỉ tối thiểu 8s
+    // để tránh spam khi API nhấp nháy.
+    const freshDrop = this.isFreshDrop(ptype);
+    this.lastPtype = ptype;
+
+    let cooling = this.isCoolingDown(now, notInGame);
+    let coolMsg = cooling ? ` (đang chờ load ${this.cooldownLeftSec(now, notInGame)}s)` : "";
+
+    if (freshDrop && cooling && !this.withinMinGap(now)) {
+      // Trạng thái mới => cooldown cũ không còn ý nghĩa, huỷ luôn
+      cooling = false;
+      coolMsg = " [đổi trạng thái -> rejoin ngay]";
+      this.hasLaunched = false;
+      this.joinedAt = 0;
+    }
+
+    if (ptype === undefined) {
       return {
         status: "Không rõ",
         info: `Không lấy được trạng thái${coolMsg}`,
         shouldLaunch: !cooling,
+        forceStop: !cooling && this.shouldForceStop(),
         rejoinOnly: true
       };
     }
 
 
-    if (presence.userPresenceType === 0) {
+    if (ptype === 0) {
       return {
         status: "Offline",
-        info: `User offline! Tiến hành rejoin!${coolMsg}`,
+        info: `User offline! Tiến hành rejoin ngay!${coolMsg}`,
         shouldLaunch: !cooling,
+        // Offline mà bắn 2 lần không lên -> app treo, phải kill rồi mở lại
+        forceStop: !cooling && this.shouldForceStop(),
         rejoinOnly: true
       };
     }
 
 
-    if (presence.userPresenceType === 1) {
+    if (ptype === 1) {
       return {
         status: "Online nhưng không trong game",
-        info: `User online nhưng không trong game.${coolMsg}`,
+        info: `User online nhưng không trong game. Rejoin ngay!${coolMsg}`,
         shouldLaunch: !cooling,
+        forceStop: !cooling && this.shouldForceStop(),
         rejoinOnly: true
       };
     }
 
 
-    if (presence.userPresenceType !== 2) {
+    if (ptype !== 2) {
       return {
         status: "Không online",
-        info: `User không trong game.${coolMsg}`,
+        info: `User không trong game. Rejoin ngay!${coolMsg}`,
         shouldLaunch: !cooling,
+        forceStop: !cooling && this.shouldForceStop(),
         rejoinOnly: true
       };
     }
@@ -1040,25 +1208,44 @@ class StatusHandler {
         status: "Sai map",
         info: `Sai map (root:${rootId || "?"} / place:${placeId || "?"}). Rejoin đúng map!${coolMsg}`,
         shouldLaunch: !cooling,
+        forceStop: !cooling && this.shouldForceStop(),
         rejoinOnly: true
       };
     }
 
-    // Đã vào đúng game -> reset trạng thái cooldown
+    // Đã vào đúng game -> reset trạng thái cooldown + bộ đếm fail
     this.hasLaunched = false;
+    this.consecutiveFails = 0;
 
     return {
       status: "Online [+]",
       info: "Đang ở đúng game",
       shouldLaunch: false,
+      forceStop: false,
       rejoinOnly: true
     };
   }
 
-  updateJoinStatus(shouldLaunch) {
-    if (shouldLaunch) {
+  /**
+   * @param {boolean} shouldLaunch  có bắn rejoin không
+   * @param {boolean} launchOk      lệnh mở app có thành công không
+   *
+   * Nếu am KHÔNG mở được app thì không bật cooldown dài — phải thử lại
+   * ở vòng kế tiếp, nếu không bot sẽ đứng im dù user vẫn offline.
+   */
+  updateJoinStatus(shouldLaunch, launchOk = true) {
+    if (!shouldLaunch) return;
+
+    this.consecutiveFails++;
+    this.lastLaunchOk = launchOk;
+
+    if (launchOk) {
       this.joinedAt = Date.now();
       this.hasLaunched = true;
+    } else {
+      // Không mở được app -> bỏ cooldown, vòng sau thử lại ngay
+      this.hasLaunched = false;
+      this.joinedAt = 0;
     }
   }
 }
@@ -1912,7 +2099,9 @@ class MultiRejoinTool {
         info: "Đang chuẩn bị...",
         countdown: "00s",
         lastCheck: 0,
-        presenceType: "Unknown"
+        presenceType: "Unknown",
+        // Mặc định coi như chưa ở trong game -> kiểm tra nhanh ngay từ đầu
+        notInGame: true
       });
     }
 
@@ -1955,7 +2144,18 @@ class MultiRejoinTool {
 
       for (const instance of this.instances) {
         const { config, user, statusHandler } = instance;
-        const delayMs = config.delaySec * 1000;
+
+        // delaySec là chu kỳ kiểm tra khi user ĐANG ở trong game.
+        // - Ngoài game/offline: poll dồn dập 5s để rejoin gần như tức thì.
+        // - Trong game: vẫn phải poll đủ dày (trần 30s) thì mới PHÁT HIỆN được
+        //   lúc user rớt ra. Nếu tôn trọng nguyên delaySec=300 thì rớt game
+        //   xong 5 phút sau bot mới biết -> "rejoin ngay" là vô nghĩa.
+        const baseDelayMs = (Number(config.delaySec) || 30) * 1000;
+        const OUT_OF_GAME_POLL_MS = 5000;
+        const IN_GAME_POLL_CAP_MS = 30000;
+        const delayMs = instance.notInGame
+          ? Math.min(OUT_OF_GAME_POLL_MS, baseDelayMs)
+          : Math.min(baseDelayMs, IN_GAME_POLL_CAP_MS);
 
         const timeSinceLastCheck = now - instance.lastCheck;
 
@@ -1967,6 +2167,13 @@ class MultiRejoinTool {
         if (timeSinceLastCheck >= delayMs) {
           const presence = await user.getPresence();
 
+          // Lỗi mạng/API: giữ nguyên trạng thái cũ, KHÔNG coi là offline giả
+          if (presence && presence.__fetchFailed) {
+            instance.status = "Lỗi mạng";
+            instance.info = `Không gọi được presence API: ${presence.error}. Giữ trạng thái, thử lại sau.`;
+            instance.lastCheck = now;
+            continue;
+          }
 
           let presenceTypeDisplay = "Unknown";
           if (presence && presence.userPresenceType !== undefined) {
@@ -1976,20 +2183,28 @@ class MultiRejoinTool {
           const analysis = statusHandler.analyzePresence(presence, config.placeId);
 
           if (analysis.shouldLaunch) {
-            await GameLauncher.handleGameLaunch(
+            const launchOk = await GameLauncher.handleGameLaunch(
               analysis.shouldLaunch,
               config.placeId,
               config.linkCode,
               config.packageName || instance.packageName,
-              true
+              true,
+              analysis.forceStop
             );
-            statusHandler.updateJoinStatus(analysis.shouldLaunch);
+            // Truyền kết quả thật để không bật cooldown khi launch fail
+            statusHandler.updateJoinStatus(analysis.shouldLaunch, launchOk);
+
+            if (!launchOk) {
+              analysis.info = `${analysis.info} [mở app thất bại - thử lại vòng sau]`;
+            }
           }
 
           instance.status = analysis.status;
           instance.info = analysis.info;
           instance.presenceType = presenceTypeDisplay;
           instance.lastCheck = now;
+          // Chưa vào game -> kiểm tra lại nhanh hơn, không chờ hết delaySec
+          instance.notInGame = analysis.shouldLaunch || analysis.status !== "Online [+]";
         }
 
 
