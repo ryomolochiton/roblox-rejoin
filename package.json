@@ -1,26 +1,49 @@
 {
   "name": "roblox-rejoin",
   "version": "1.0.0",
-  "description": "��H\u0000e\u0000l\u0000l\u0000o\u0000\r\u0000 \u0000R\u0000o\u0000b\u0000l\u0000o\u0000x\u0000!\u0000\r\u0000 \u0000",
-  "main": "rejoin.js",
-  "scripts": {                                                            "test": "echo \"Error: no test specified\" && exit 1"
+  "description": "Roblox auto-rejoin tool cho Termux/Android",
+  "main": "rejoin.cjs",
+  "type": "commonjs",
+  "bin": {
+    "roblox-rejoin": "rejoin.cjs"
   },
+  "scripts": {
+    "start": "node rejoin.cjs",
+    "rejoin": "node rejoin.cjs",
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "files": [
+    "rejoin.cjs",
+    "loader.sh",
+    "huongdan.txt",
+    "README.md"
+  ],
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/NhinQuanhLanCuoi9999/roblox-rejoin.git"
+    "url": "git+https://github.com/ryomolochiton/roblox-rejoin.git"
   },
-  "keywords": [],
-  "author": "",
+  "keywords": [
+    "roblox",
+    "rejoin",
+    "termux",
+    "android"
+  ],
+  "author": "ryomolochiton",
   "license": "ISC",
-  "type": "commonjs",
   "bugs": {
-    "url": "https://github.com/NhinQuanhLanCuoi9999/roblox-rejoin/issues"
+    "url": "https://github.com/ryomolochiton/roblox-rejoin/issues"
   },
-  "homepage": "https://github.com/NhinQuanhLanCuoi9999/roblox-rejoin#readme",
+  "homepage": "https://github.com/ryomolochiton/roblox-rejoin#readme",
+  "engines": {
+    "node": ">=18"
+  },
   "dependencies": {
     "axios": "^1.11.0",
-    "boxen": "^8.0.1",
+    "boxen": "5.1.2",
     "cli-table3": "^0.6.5",
     "figlet": "^1.8.2"
+  },
+  "optionalDependencies": {
+    "screenshot-desktop": "^1.15.0"
   }
 }
