@@ -785,19 +785,44 @@ class RobloxUser {
   }
 
   async getPresence() {
+    // Gọi endpoint chính thức trước (kèm cookie để lấy đủ placeId),
+    // nếu lỗi mạng/chặn thì fallback sang roproxy (KHÔNG gửi cookie sang proxy bên thứ 3)
+    const body = { userIds: [Number(this.userId) || this.userId] };
+
     try {
       const r = await axios.post(
-        "https://presence.roproxy.com/v1/presence/users",
-        { userIds: [this.userId] },
+        "https://presence.roblox.com/v1/presence/users",
+        body,
         {
+          timeout: 15000,
           headers: {
             Cookie: this.cookie,
             "User-Agent": "Mozilla/5.0 (Linux; Android 10; Termux)",
+            "Content-Type": "application/json",
             Accept: "application/json",
           },
         }
       );
-      return r.data.userPresences?.[0];
+      const p = r.data?.userPresences?.[0];
+      if (p) return p;
+    } catch (e) {
+      // rơi xuống fallback
+    }
+
+    try {
+      const r = await axios.post(
+        "https://presence.roproxy.com/v1/presence/users",
+        body,
+        {
+          timeout: 15000,
+          headers: {
+            "User-Agent": "Mozilla/5.0 (Linux; Android 10; Termux)",
+            "Content-Type": "application/json",
+            Accept: "application/json",
+          },
+        }
+      );
+      return r.data?.userPresences?.[0] || null;
     } catch {
       return null;
     }
@@ -1842,9 +1867,14 @@ class MultiRejoinTool {
 
   async runMultiInstanceLoop() {
     let renderCounter = 0;
-    let webhookCounter = 0;
     const webhookManager = new WebhookManager();
     const webhookConfig = Utils.loadWebhookConfig();
+
+    // Dùng mốc thời gian thực thay vì đếm vòng lặp (vòng lặp có await nên bị trôi)
+    const webhookIntervalMs = webhookConfig && webhookConfig.intervalMinutes
+      ? webhookConfig.intervalMinutes * 60 * 1000
+      : 0;
+    let nextWebhookAt = webhookIntervalMs ? Date.now() + webhookIntervalMs : 0;
 
     const autoexecManager = new AutoexecManager();
     const autoexecConfig = autoexecManager.loadConfig();
@@ -1905,9 +1935,14 @@ class MultiRejoinTool {
       }
 
 
-      if (webhookConfig && webhookConfig.enabled && webhookCounter % (webhookConfig.intervalMinutes * 60) === 0 && webhookCounter > 0) {
+      if (webhookConfig && webhookConfig.enabled && webhookIntervalMs && Date.now() >= nextWebhookAt) {
         console.log(`\n Đang gửi webhook status...`);
-        await webhookManager.sendStatusWebhook(this.instances, this.startTime);
+        try {
+          await webhookManager.sendStatusWebhook(this.instances, this.startTime);
+        } catch (e) {
+          console.error(`[-] Lỗi gửi webhook: ${e.message}`);
+        }
+        nextWebhookAt = Date.now() + webhookIntervalMs;
       }
 
       if (renderCounter % 5 === 0) {
@@ -1931,13 +1966,13 @@ class MultiRejoinTool {
         }
 
 
-        if (webhookConfig) {
+        if (webhookConfig && webhookConfig.url) {
           const urlParts = webhookConfig.url.split('/');
           const webhookId = urlParts[urlParts.length - 2] || 'unknown';
           const statusText = webhookConfig.enabled ? '[+] Đã bật' : '[-] Đã tắt';
           console.log(`\n Webhook Status: ID ${webhookId} - ${statusText} - [ĐÃ ẨN VÌ LÝ DO BẢO MẬT]`);
-          if (webhookConfig.enabled) {
-            const nextWebhookIn = (webhookConfig.intervalMinutes * 60) - (webhookCounter % (webhookConfig.intervalMinutes * 60));
+          if (webhookConfig.enabled && webhookIntervalMs) {
+            const nextWebhookIn = Math.max(0, Math.ceil((nextWebhookAt - Date.now()) / 1000));
             const minutes = Math.floor(nextWebhookIn / 60);
             const seconds = nextWebhookIn % 60;
             console.log(` Webhook: ${minutes}m ${seconds}s nữa sẽ gửi báo cáo (${webhookConfig.intervalMinutes} phút/lần)`);
@@ -1950,7 +1985,6 @@ class MultiRejoinTool {
       }
 
       renderCounter++;
-      webhookCounter++;
       await new Promise(resolve => setTimeout(resolve, 1000));
     }
   }
