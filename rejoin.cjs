@@ -122,6 +122,51 @@ try {
 }
 
 class Utils {
+  // Bọc chuỗi an toàn cho shell (single-quote escaping)
+  static shq(s) {
+    return "'" + String(s).replace(/'/g, `'\\''`) + "'";
+  }
+
+  // Termux PREFIX
+  static termuxPrefix() {
+    return process.env.PREFIX || "/data/data/com.termux/files/usr";
+  }
+
+  /**
+   * Tìm binary `node` THẬT.
+   *
+   * Lưu ý quan trọng trên Termux/Android:
+   * process.execPath có thể trả về "/apex/com.android.runtime/bin/linker64"
+   * (khi node được nạp qua dynamic linker). Nếu dùng thẳng giá trị đó làm
+   * lệnh chạy thì linker64 sẽ nhận rejoin.cjs làm ELF và báo:
+   *   "has bad ELF magic: 23212f75"   (23 21 2f 75 == "#!/u")
+   * -> Phải chạy: linker64 <node> <script.cjs>, KHÔNG BAO GIỜ là linker64 <script.cjs>
+   */
+  static resolveNodeBinary() {
+    const prefix = Utils.termuxPrefix();
+    const exec = process.execPath || "";
+    const isLinker = /(^|\/)linker(64)?$/.test(exec);
+
+    const candidates = [];
+    if (exec && !isLinker) candidates.push(exec);
+    candidates.push(path.join(prefix, "bin", "node"));
+    candidates.push("/data/data/com.termux/files/usr/bin/node");
+    candidates.push("/usr/bin/node", "/usr/local/bin/node");
+
+    for (const c of candidates) {
+      try {
+        if (c && fs.existsSync(c) && fs.statSync(c).isFile()) return c;
+      } catch { }
+    }
+
+    try {
+      const found = execSync("command -v node", { encoding: "utf8" }).trim();
+      if (found) return found;
+    } catch { }
+
+    return exec || "node";
+  }
+
   static ensureRoot() {
     let uid = "";
     try {
@@ -140,18 +185,37 @@ class Utils {
       process.exit(1);
     }
 
-    // process.execPath chính xác hơn `which node` khi chạy trong Termux
-    const node = process.execPath;
+    const q = Utils.shq;
+    const prefix = Utils.termuxPrefix();
+    const home = process.env.HOME || "/data/data/com.termux/files/home";
+    const node = Utils.resolveNodeBinary();
+    const script = __filename;
+    const args = process.argv.slice(2);
+
+    // Shell của `su` không kế thừa env Termux -> phải export lại,
+    // nếu không node sẽ chết vì thiếu LD_LIBRARY_PATH / PREFIX / TMPDIR.
+    const inner = [
+      `export PREFIX=${q(prefix)}`,
+      `export HOME=${q(home)}`,
+      `export TMPDIR=${q(path.join(prefix, "tmp"))}`,
+      `export LD_LIBRARY_PATH=${q(path.join(prefix, "lib"))}`,
+      `export PATH=${q(path.join(prefix, "bin"))}:$PATH`,
+      `export DAWN_REJOIN_SU=1`,
+      `cd ${q(path.dirname(script))}`,
+      `exec ${q(node)} ${q(script)}${args.length ? " " + args.map(q).join(" ") : ""}`
+    ].join("; ");
+
     console.log("Cần quyền root, chuyển qua su...");
     try {
-      execSync(
-        `su -c "DAWN_REJOIN_SU=1 '${node}' '${__filename}'"`,
-        { stdio: "inherit", env: { ...process.env, DAWN_REJOIN_SU: "1" } }
-      );
+      execSync(`su -c ${q(inner)}`, {
+        stdio: "inherit",
+        env: { ...process.env, DAWN_REJOIN_SU: "1" }
+      });
       process.exit(0);
     } catch (e) {
       console.error(`[-] Không thể chạy với quyền root: ${e.message}`);
-      console.error("[-] Kiểm tra lại quyền su cho Termux (Magisk/KernelSU).");
+      console.error(`[-] node binary dùng để chạy: ${node}`);
+      console.error("[-] Kiểm tra lại quyền su cho Termux (Magisk/KernelSU): thử `su -c id`.");
       process.exit(1);
     }
   }
