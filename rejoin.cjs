@@ -870,19 +870,31 @@ class GameSelector {
 }
 
 class StatusHandler {
-  constructor() {
+  constructor(joinCooldownSec = 90) {
     this.hasLaunched = false;
     this.joinedAt = 0;
+    // Thời gian chờ sau khi mở app để Roblox kịp load, tránh spam rejoin
+    this.joinCooldownMs = joinCooldownSec * 1000;
+  }
+
+  isCoolingDown(now = Date.now()) {
+    return this.hasLaunched && (now - this.joinedAt) < this.joinCooldownMs;
+  }
+
+  cooldownLeftSec(now = Date.now()) {
+    return Math.max(0, Math.ceil((this.joinCooldownMs - (now - this.joinedAt)) / 1000));
   }
 
   analyzePresence(presence, targetRootPlaceId) {
     const now = Date.now();
+    const cooling = this.isCoolingDown(now);
+    const coolMsg = cooling ? ` (đang chờ load ${this.cooldownLeftSec(now)}s)` : "";
 
     if (!presence || presence.userPresenceType === undefined) {
       return {
         status: "Không rõ",
-        info: "Không lấy được trạng thái hoặc thiếu rootPlaceId",
-        shouldLaunch: true,
+        info: `Không lấy được trạng thái${coolMsg}`,
+        shouldLaunch: !cooling,
         rejoinOnly: true
       };
     }
@@ -891,8 +903,8 @@ class StatusHandler {
     if (presence.userPresenceType === 0) {
       return {
         status: "Offline",
-        info: "User offline! Tiến hành rejoin! ",
-        shouldLaunch: true,
+        info: `User offline! Tiến hành rejoin!${coolMsg}`,
+        shouldLaunch: !cooling,
         rejoinOnly: true
       };
     }
@@ -901,8 +913,8 @@ class StatusHandler {
     if (presence.userPresenceType === 1) {
       return {
         status: "Online nhưng không trong game",
-        info: "User online nhưng không trong game.",
-        shouldLaunch: true,
+        info: `User online nhưng không trong game.${coolMsg}`,
+        shouldLaunch: !cooling,
         rejoinOnly: true
       };
     }
@@ -911,22 +923,40 @@ class StatusHandler {
     if (presence.userPresenceType !== 2) {
       return {
         status: "Không online",
-        info: "User không trong game. Đã mở lại game!",
-        shouldLaunch: true,
+        info: `User không trong game.${coolMsg}`,
+        shouldLaunch: !cooling,
         rejoinOnly: true
       };
     }
 
+    // Đang trong game: chấp nhận nếu khớp rootPlaceId HOẶC placeId
+    // (nhiều game có sub-place, chỉ so rootPlaceId sẽ bị rejoin nhầm liên tục)
+    const target = targetRootPlaceId != null ? targetRootPlaceId.toString() : "";
+    const rootId = presence.rootPlaceId != null ? presence.rootPlaceId.toString() : "";
+    const placeId = presence.placeId != null ? presence.placeId.toString() : "";
+    const matched = target && (rootId === target || placeId === target);
 
-    if (!presence.rootPlaceId || presence.rootPlaceId.toString() !== targetRootPlaceId.toString()) {
+    if (!matched) {
+      // Nếu API không trả về place nào (thiếu quyền/cookie) thì không rejoin bừa
+      if (!rootId && !placeId) {
+        return {
+          status: "Trong game",
+          info: "Đang trong game nhưng API không trả về placeId (giữ nguyên)",
+          shouldLaunch: false,
+          rejoinOnly: true
+        };
+      }
+
       return {
         status: "Sai map",
-        info: `User đang trong game nhưng sai rootPlaceId (${presence.rootPlaceId}). Đã rejoin đúng map! `,
-        shouldLaunch: true,
+        info: `Sai map (root:${rootId || "?"} / place:${placeId || "?"}). Rejoin đúng map!${coolMsg}`,
+        shouldLaunch: !cooling,
         rejoinOnly: true
       };
     }
 
+    // Đã vào đúng game -> reset trạng thái cooldown
+    this.hasLaunched = false;
 
     return {
       status: "Online [+]",
@@ -1780,7 +1810,9 @@ class MultiRejoinTool {
       }
 
       const user = new RobloxUser(config.username, config.userId, cookie);
-      const statusHandler = new StatusHandler();
+      // Cooldown mặc định = max(90s, delaySec) để game kịp load trước lần rejoin kế tiếp
+      const cooldownSec = Math.max(90, Number(config.delaySec) || 0);
+      const statusHandler = new StatusHandler(cooldownSec);
 
       this.instances.push({
         packageName,
@@ -1850,11 +1882,11 @@ class MultiRejoinTool {
           const analysis = statusHandler.analyzePresence(presence, config.placeId);
 
           if (analysis.shouldLaunch) {
-            GameLauncher.handleGameLaunch(
+            await GameLauncher.handleGameLaunch(
               analysis.shouldLaunch,
               config.placeId,
               config.linkCode,
-              config.packageName,
+              config.packageName || instance.packageName,
               true
             );
             statusHandler.updateJoinStatus(analysis.shouldLaunch);
