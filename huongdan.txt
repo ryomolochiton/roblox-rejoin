@@ -1,1 +1,26 @@
-termux-setup-storage && mv /sdcard/Download/loader.sh ~/ && sed -i 's/\r$//' ~/loader.sh && chmod +x ~/loader.sh
+HUONG DAN CAI DAT (Termux)
+
+1) Cap quyen storage + dua loader.sh vao home + chay:
+
+termux-setup-storage && mv /sdcard/Download/loader.sh ~/ && sed -i 's/\r$//' ~/loader.sh && chmod +x ~/loader.sh && ~/loader.sh
+
+2) Nhung lan sau chi can go:
+
+loader
+
+(loader.sh se tu copy thanh lenh `loader`, tu pull code moi nhat va chay `node rejoin.cjs`)
+
+3) Cach thu cong (khong dung loader):
+
+pkg update && pkg install git nodejs sqlite -y
+git clone https://github.com/ryomolochiton/roblox-rejoin ~/roblox-rejoin
+cd ~/roblox-rejoin && npm install
+node rejoin.cjs
+# hoac: npm start
+
+GHI CHU
+- File chinh la rejoin.cjs (CommonJS). Khong con dung rejoin.js.
+- Can Node >= 18 va sqlite3 (pkg install sqlite).
+- boxen ghim ban 5.1.2 vi ban >= 6 la ESM-only, require() se loi ERR_REQUIRE_ESM.
+- screenshot-desktop la tuy chon, thieu cung van chay duoc tren Android.
+- Loi "command not found" sau khi cai node: mo lai Termux hoac chay `source ~/.bashrc`.
