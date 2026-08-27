@@ -1,21 +1,36 @@
 #!/usr/bin/env node
 const { execSync, exec } = require("child_process");
 function ensurePackages() {
-  const requiredPackages = ["axios", "cli-table3", "figlet", "boxen", "screenshot-desktop"];
+  // boxen@6+ và screenshot-desktop không bắt buộc trên Android/Termux -> optional
+  const requiredPackages = ["axios", "cli-table3", "figlet"];
+  const optionalPackages = ["boxen@5.1.2", "screenshot-desktop"];
 
-  requiredPackages.forEach((pkg) => {
+  const installPkg = (spec, optional) => {
+    const name = spec.split("@")[0] || spec;
     try {
-      require.resolve(pkg);
-    } catch {
-      console.log(`Đang cài package thiếu: ${pkg}`);
-      try {
-        execSync(`npm install ${pkg}`, { stdio: "inherit" });
-      } catch (e) {
-        console.error(`Lỗi khi cài ${pkg}:`, e.message);
-        process.exit(1);
+      require.resolve(name);
+      return;
+    } catch { }
+
+    console.log(`Đang cài package thiếu: ${spec}`);
+    try {
+      // Cài vào chính thư mục script để tránh lỗi khi chạy bằng su/root ở cwd khác
+      execSync(`npm install --no-audit --no-fund ${spec}`, {
+        stdio: "inherit",
+        cwd: __dirname
+      });
+    } catch (e) {
+      if (optional) {
+        console.warn(`[!] Bỏ qua package tuỳ chọn ${spec}: ${e.message}`);
+        return;
       }
+      console.error(`Lỗi khi cài ${spec}:`, e.message);
+      process.exit(1);
     }
-  });
+  };
+
+  requiredPackages.forEach((pkg) => installPkg(pkg, false));
+  optionalPackages.forEach((pkg) => installPkg(pkg, true));
 }
 ensurePackages();
 
@@ -68,16 +83,35 @@ const screenshot = require("screenshot-desktop");
 
 class Utils {
   static ensureRoot() {
+    let uid = "";
     try {
-      const uid = execSync("id -u").toString().trim();
-      if (uid !== "0") {
-        const node = execSync("which node").toString().trim();
-        console.log("Cần quyền root, chuyển qua su...");
-        execSync(`su -c "${node} ${__filename}"`, { stdio: "inherit" });
-        process.exit(0);
-      }
+      uid = execSync("id -u", { encoding: "utf8" }).trim();
     } catch (e) {
-      console.error("Không thể chạy với quyền root:", e.message);
+      console.warn(`[!] Không xác định được uid: ${e.message}`);
+      return;
+    }
+
+    if (uid === "0") return;
+
+    // Chống lặp vô hạn: nếu đã thử su 1 lần mà vẫn không phải root thì dừng
+    if (process.env.DAWN_REJOIN_SU === "1") {
+      console.error("[-] Đã thử chuyển sang root nhưng vẫn không có quyền root.");
+      console.error("[-] Vui lòng cấp quyền root cho Termux rồi chạy lại.");
+      process.exit(1);
+    }
+
+    // process.execPath chính xác hơn `which node` khi chạy trong Termux
+    const node = process.execPath;
+    console.log("Cần quyền root, chuyển qua su...");
+    try {
+      execSync(
+        `su -c "DAWN_REJOIN_SU=1 '${node}' '${__filename}'"`,
+        { stdio: "inherit", env: { ...process.env, DAWN_REJOIN_SU: "1" } }
+      );
+      process.exit(0);
+    } catch (e) {
+      console.error(`[-] Không thể chạy với quyền root: ${e.message}`);
+      console.error("[-] Kiểm tra lại quyền su cho Termux (Magisk/KernelSU).");
       process.exit(1);
     }
   }
