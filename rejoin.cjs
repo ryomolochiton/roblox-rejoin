@@ -76,10 +76,50 @@ const PREFIX_CONFIG_PATH = path.join(__dirname, "package_prefix_config.json");
 const ACTIVITY_CONFIG_PATH = path.join(__dirname, "activity_config.json");
 const AUTOEXEC_CONFIG_PATH = path.join(__dirname, "autoexec_config.json");
 const util = require("util");
-const figlet = require("figlet");
-const _boxen = require("boxen");
-const boxen = _boxen.default || _boxen;
-const screenshot = require("screenshot-desktop");
+
+// figlet / boxen / screenshot-desktop là tuỳ chọn:
+// boxen >= 6 là ESM-only nên require() sẽ ném ERR_REQUIRE_ESM,
+// screenshot-desktop không hoạt động trên Android. Không được để crash tool.
+let figlet = null;
+try {
+  figlet = require("figlet");
+} catch (e) {
+  console.warn(`[!] Không load được figlet, dùng tiêu đề dự phòng: ${e.message}`);
+}
+
+let boxen = null;
+try {
+  const _boxen = require("boxen");
+  boxen = _boxen.default || _boxen;
+  if (typeof boxen !== "function") boxen = null;
+} catch (e) {
+  boxen = null;
+}
+if (!boxen) {
+  // Fallback tự vẽ khung, không phụ thuộc package ESM
+  boxen = (content, opts = {}) => {
+    const padding = typeof opts.padding === "number" ? opts.padding : 1;
+    const lines = String(content).split("\n");
+    const width = Math.max(...lines.map(l => l.length));
+    const pad = " ".repeat(padding);
+    const top = "╭" + "─".repeat(width + padding * 2) + "╮";
+    const bottom = "╰" + "─".repeat(width + padding * 2) + "╯";
+    const body = lines.map(l => {
+      const space = " ".repeat(width - l.length);
+      return opts.align === "center"
+        ? "│" + pad + " ".repeat(Math.floor(space.length / 2)) + l + " ".repeat(Math.ceil(space.length / 2)) + pad + "│"
+        : "│" + pad + l + space + pad + "│";
+    });
+    return [top, ...body, bottom].join("\n");
+  };
+}
+
+let screenshot = null;
+try {
+  screenshot = require("screenshot-desktop");
+} catch (e) {
+  screenshot = null;
+}
 
 class Utils {
   static ensureRoot() {
@@ -287,6 +327,7 @@ class Utils {
 
 
       try {
+        if (!screenshot) throw new Error("screenshot-desktop không khả dụng");
         const img = await screenshot();
         const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
         const filename = `screenshot_${timestamp}.png`;
@@ -972,6 +1013,7 @@ class UIRenderer {
  ╚══════════════════════════════════════╝`;
 
     try {
+      if (!figlet) return fallbackTitle;
       const titleText = figlet.textSync("Dawn Rejoin", {
         font: "Small",
         horizontalLayout: "fitted",
