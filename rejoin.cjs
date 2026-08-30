@@ -808,6 +808,107 @@ Timestamp: ${systemInfo.timestamp}
     }
   }
 
+  /**
+   * Tên hiển thị chuẩn cho 1 package. Trước đây logic này bị lặp ở 7 chỗ khác
+   * nhau trong UI, mỗi chỗ một kiểu -> sửa 1 chỗ sót 6 chỗ.
+   */
+  static describePackage(packageName, prefix = null) {
+    const p = prefix || Utils.loadPackagePrefixConfig();
+    if (packageName === `${p}.client`) return "Roblox Quốc tế";
+    if (packageName === `${p}.client.vnggames`) return "Roblox VNG";
+    if (packageName === "com.roblox.client") return "Roblox Quốc tế";
+    if (packageName === "com.roblox.client.vnggames") return "Roblox VNG";
+    return `Roblox Custom (${packageName})`;
+  }
+
+  /**
+   * Nhãn NGẮN dùng trong bảng/status ("Global" / "VNG" / tên package).
+   * @param {string} packageName
+   * @param {string} [suffix] khoảng trắng căn lề mà UI cũ đang dùng
+   */
+  static packageLabel(packageName, suffix = "") {
+    const p = Utils.loadPackagePrefixConfig();
+    if (packageName === `${p}.client` || packageName === "com.roblox.client") {
+      return `Global${suffix}`;
+    }
+    if (packageName === `${p}.client.vnggames` || packageName === "com.roblox.client.vnggames") {
+      return `VNG${suffix}`;
+    }
+    return packageName;
+  }
+
+  /**
+   * Quét mọi app KHAI BÁO xử lý được scheme `roblox://`.
+   * Đây là cách duy nhất tìm ra app mod đã đổi tên package hoàn toàn
+   * (vd: zam.hi1) — quét theo prefix sẽ không bao giờ thấy chúng.
+   * @returns {string[]} danh sách package name
+   */
+  static scanRobloxHandlers() {
+    const found = new Set();
+    const SYSTEM_DENY = /^(android$|com\.android\.|com\.google\.android\.|com\.samsung\.|com\.sec\.|com\.miui\.|com\.xiaomi\.|com\.huawei\.|com\.oppo\.|com\.vivo\.|com\.termux)/;
+
+    const cmds = [
+      `/system/bin/cmd package query-activities -a android.intent.action.VIEW -d "roblox://placeID=1"`,
+      `cmd package query-activities -a android.intent.action.VIEW -d "roblox://placeID=1"`,
+      `su -c ${Utils.shq(`unset LD_PRELOAD LD_LIBRARY_PATH; /system/bin/cmd package query-activities -a android.intent.action.VIEW -d 'roblox://placeID=1'`)}`,
+      `/system/bin/pm query-activities -a android.intent.action.VIEW -d "roblox://placeID=1"`
+    ];
+
+    for (const cmd of cmds) {
+      const r = Utils._run(cmd, 20000);
+      if (!r.ok || !r.out.trim()) continue;
+      const m = r.out.match(/[a-zA-Z][\w]*(?:\.[\w]+)+\/[\w.$]+/g) || [];
+      for (const x of m) {
+        const pkg = x.split("/")[0];
+        if (pkg && !SYSTEM_DENY.test(pkg)) found.add(pkg);
+      }
+      if (found.size) break;
+    }
+
+    return [...found];
+  }
+
+  /**
+   * Suy ra prefix chung từ danh sách package.
+   * VD: ["zam.hi1", "zam.hi2"]             -> "zam"
+   *     ["com.roblox.client", "com.roblox.client.vnggames"] -> "com.roblox"
+   *     ["vip.mod.roblox"]                 -> "vip.mod"
+   */
+  static derivePrefix(packages) {
+    const list = (packages || []).filter(Boolean).map(String);
+    if (list.length === 0) return null;
+
+    if (list.length === 1) {
+      const parts = list[0].split(".");
+      if (parts.length <= 1) return list[0];
+      // Bỏ segment cuối (thường là "client" / tên biến thể)
+      return parts.slice(0, -1).join(".");
+    }
+
+    // Nhiều package: lấy phần segment đầu chung nhau
+    const split = list.map((p) => p.split("."));
+    const common = [];
+    for (let i = 0; i < split[0].length; i++) {
+      const seg = split[0][i];
+      if (split.every((parts) => parts[i] === seg)) common.push(seg);
+      else break;
+    }
+
+    if (common.length === 0) return null;
+    // Nếu prefix chung ăn trọn 1 package thì lùi lại 1 segment
+    if (common.length === Math.min(...split.map((s) => s.length)) && common.length > 1) {
+      return common.slice(0, -1).join(".");
+    }
+    return common.join(".");
+  }
+
+  /** Quét handler roblox:// rồi suy ra prefix; null nếu không tìm được. */
+  static autoDetectPrefix() {
+    const handlers = Utils.scanRobloxHandlers();
+    if (!handlers.length) return { prefix: null, packages: [] };
+    return { prefix: Utils.derivePrefix(handlers), packages: handlers };
+  }
+
   static detectAllRobloxPackages() {
     const packages = {};
 
@@ -857,36 +958,42 @@ Timestamp: ${systemInfo.timestamp}
         if (match) {
           matchedCount++;
           const packageName = match[1];
-          let displayName = packageName;
-
-          if (packageName === `${prefix}.client`) {
-            displayName = 'Roblox Quốc tế';
-          } else if (packageName === `${prefix}.client.vnggames`) {
-            displayName = 'Roblox VNG';
-          } else {
-            displayName = `Roblox Custom (${packageName})`;
-          }
-
           packages[packageName] = {
             packageName,
-            displayName
+            displayName: Utils.describePackage(packageName, prefix)
           };
         }
       });
 
-      // Nếu tìm thấy packages nhưng không cái nào khớp prefix
+      // Không package nào khớp prefix -> app mod đã đổi tên hoàn toàn.
+      // Quét theo scheme roblox:// để tìm chúng thay vì bắt user tự sửa prefix.
       if (foundAny && matchedCount === 0) {
-        console.log(`\x1b[33m[!] CẢNH BÁO: Tìm thấy packages hệ thống nhưng không cái nào bắt đầu bằng "${prefix}"\x1b[0m`);
-        console.log(`[!] Có vẻ bạn đang dùng Roblox mod (ví dụ: vip.xxx).`);
-        console.log(`[!] Vui lòng vào mục "4. Chỉnh prefix package" để đổi lại cho đúng.`);
+        console.log(`\x1b[33m[!] Không có package nào bắt đầu bằng "${prefix}" — đang tự dò app xử lý roblox://\x1b[0m`);
 
-        // Gợi ý 3 package đầu tiên tìm được để user biết prefix là gì
-        const samples = lines
-          .filter(l => l.includes('package:'))
-          .slice(0, 3)
-          .map(l => l.replace('package:', '').trim());
-        if (samples.length > 0) {
-          console.log(`[*] Gợi ý các package tìm thấy: \x1b[32m${samples.join(', ')}\x1b[0m`);
+        const handlers = Utils.scanRobloxHandlers();
+        if (handlers.length > 0) {
+          for (const packageName of handlers) {
+            packages[packageName] = {
+              packageName,
+              displayName: Utils.describePackage(packageName, prefix)
+            };
+          }
+          const derived = Utils.derivePrefix(handlers);
+          console.log(`[+] Tự nhận diện được ${handlers.length} app Roblox: \x1b[32m${handlers.join(', ')}\x1b[0m`);
+          if (derived && derived !== prefix) {
+            console.log(`[*] Prefix gợi ý: \x1b[32m${derived}\x1b[0m — vào mục "4. Chỉnh prefix package" > "3. Tự động nhận diện prefix" để lưu lại.`);
+          }
+        } else {
+          console.log(`[!] Có vẻ bạn đang dùng Roblox mod (ví dụ: vip.xxx) nhưng không dò được qua roblox://.`);
+          console.log(`[!] Vui lòng vào mục "4. Chỉnh prefix package" để đổi lại cho đúng.`);
+
+          const samples = lines
+            .filter(l => l.includes('package:'))
+            .slice(0, 3)
+            .map(l => l.replace('package:', '').trim());
+          if (samples.length > 0) {
+            console.log(`[*] Gợi ý các package tìm thấy: \x1b[32m${samples.join(', ')}\x1b[0m`);
+          }
         }
       }
     } catch (e) {
@@ -1650,15 +1757,7 @@ class UIRenderer {
     });
 
     instances.forEach(instance => {
-      let packageDisplay;
-      const prefix = Utils.loadPackagePrefixConfig();
-      if (instance.packageName === `${prefix}.client`) {
-        packageDisplay = 'Global';
-      } else if (instance.packageName === `${prefix}.client.vnggames`) {
-        packageDisplay = 'VNG';
-      } else {
-        packageDisplay = instance.packageName;
-      }
+      const packageDisplay = Utils.packageLabel(instance.packageName);
 
       const rawUsername = instance.config.username || instance.user.username || 'Unknown';
       const username = Utils.maskSensitiveInfo(rawUsername);
@@ -1698,15 +1797,7 @@ class UIRenderer {
 
     let index = 1;
     for (const [packageName, config] of Object.entries(configs)) {
-      let packageDisplay;
-      const prefix = Utils.loadPackagePrefixConfig();
-      if (packageName === `${prefix}.client`) {
-        packageDisplay = 'Global';
-      } else if (packageName === `${prefix}.client.vnggames`) {
-        packageDisplay = 'VNG';
-      } else {
-        packageDisplay = packageName;
-      }
+      const packageDisplay = Utils.packageLabel(packageName);
 
 
       const maskedUsername = Utils.maskSensitiveInfo(config.username);
@@ -2108,9 +2199,10 @@ class MultiRejoinTool {
     console.log("\n Chọn hành động:");
     console.log("1. ✏️ Thay đổi prefix");
     console.log("2.  Đặt lại về mặc định (com.roblox)");
-    console.log("3. ⏭️ Quay lại menu chính");
+    console.log("3. 🔍 Tự động nhận diện prefix (quét app xử lý roblox://)");
+    console.log("4. ⏭️ Quay lại menu chính");
 
-    const choice = await Utils.ask(rl, "\nNhập lựa chọn (1-3): ");
+    const choice = await Utils.ask(rl, "\nNhập lựa chọn (1-4): ");
 
     if (choice.trim() === "1") {
       console.log("\n✏️ Thay đổi prefix package Roblox");
@@ -2133,6 +2225,27 @@ class MultiRejoinTool {
       console.log("[+] Đã đặt lại prefix về mặc định: com.roblox");
 
     } else if (choice.trim() === "3") {
+      console.log("\n🔍 Đang quét các app xử lý được scheme roblox:// ...");
+      const { prefix: detected, packages: handlers } = Utils.autoDetectPrefix();
+
+      if (!handlers.length) {
+        console.log("[-] Không tìm thấy app nào khai báo xử lý roblox://.");
+        console.log("[!] Có thể app mod không đăng ký scheme, hãy nhập prefix thủ công (mục 1).");
+      } else {
+        console.log(`[+] Tìm thấy ${handlers.length} app:`);
+        handlers.forEach((p, i) => console.log(`   ${i + 1}. ${p}`));
+        console.log(`\n[*] Prefix suy ra: \x1b[32m${detected}\x1b[0m`);
+
+        const ok = (await Utils.ask(rl, `Lưu prefix "${detected}"? (y/n): `)).trim().toLowerCase();
+        if (ok === "y" || ok === "yes" || ok === "") {
+          Utils.savePackagePrefixConfig(detected);
+          console.log(`[+] Đã cập nhật prefix thành: ${detected}`);
+        } else {
+          console.log("[*] Đã huỷ, giữ nguyên prefix cũ.");
+        }
+      }
+
+    } else if (choice.trim() === "4") {
 
       console.log("\n Đang quay lại menu chính...");
       await new Promise(resolve => setTimeout(resolve, 2000));
@@ -2161,7 +2274,9 @@ class MultiRejoinTool {
       console.log(`\n Activity tùy chỉnh hiện tại: ${currentActivity}`);
       console.log(`⚠️  Đang sử dụng activity tùy chỉnh thay vì activity mặc định!`);
     } else {
-      console.log(`\n Activity hiện tại: Sử dụng activity mặc định (${currentPrefix}.client.ActivityProtocolLaunch)`);
+      console.log(`\n Activity hiện tại: TỰ ĐỘNG DÒ (khuyến nghị)`);
+      console.log(`   Bot sẽ tự tìm activity thật của từng app qua resolve-activity/dumpsys,`);
+      console.log(`   thử lần lượt rồi nhớ activity chạy được. Chỉ đặt tay khi tự dò thất bại.`);
     }
 
     console.log("\n Chọn hành động:");
@@ -2194,8 +2309,7 @@ class MultiRejoinTool {
     } else if (choice.trim() === "2") {
       if (currentActivity) {
         Utils.saveActivityConfig(null);
-        console.log("[+] Đã đặt lại về activity mặc định!");
-        console.log(` Activity mặc định: ${currentPrefix}.client.ActivityProtocolLaunch`);
+        console.log("[+] Đã đặt lại về chế độ tự động dò activity!");
       } else {
         console.log("ℹ️ Đã đang sử dụng activity mặc định!");
       }
@@ -2250,15 +2364,7 @@ class MultiRejoinTool {
     let index = 1;
     const packageList = [];
     for (const [packageName, config] of Object.entries(configs)) {
-      let packageDisplay;
-      const prefix = Utils.loadPackagePrefixConfig();
-      if (packageName === `${prefix}.client`) {
-        packageDisplay = 'Global ';
-      } else if (packageName === `${prefix}.client.vnggames`) {
-        packageDisplay = 'VNG ';
-      } else {
-        packageDisplay = packageName;
-      }
+      const packageDisplay = Utils.packageLabel(packageName, ' ');
 
 
       const maskedUsername = Utils.maskSensitiveInfo(config.username);
@@ -2693,15 +2799,7 @@ class WebhookManager {
 
 
       const packageList = instances.map(instance => {
-        let packageDisplay;
-        const prefix = Utils.loadPackagePrefixConfig();
-        if (instance.packageName === `${prefix}.client`) {
-          packageDisplay = 'Global ';
-        } else if (instance.packageName === `${prefix}.client.vnggames`) {
-          packageDisplay = 'VNG ';
-        } else {
-          packageDisplay = instance.packageName;
-        }
+        const packageDisplay = Utils.packageLabel(instance.packageName, ' ');
         return `${packageDisplay}: ${instance.status}`;
       }).join('\n');
 
@@ -2776,15 +2874,7 @@ class ConfigEditor {
       const configList = [];
       for (const [packageName, config] of Object.entries(this.configs)) {
         try {
-          let packageDisplay;
-          const prefix = Utils.loadPackagePrefixConfig();
-          if (packageName === `${prefix}.client`) {
-            packageDisplay = 'Global ';
-          } else if (packageName === `${prefix}.client.vnggames`) {
-            packageDisplay = 'VNG ';
-          } else {
-            packageDisplay = packageName;
-          }
+          const packageDisplay = Utils.packageLabel(packageName, ' ');
 
 
           const maskedUsername = Utils.maskSensitiveInfo(config.username);
@@ -2851,15 +2941,7 @@ class ConfigEditor {
           console.log(UIRenderer.renderTitle());
           console.log(`\n✏️ Chỉnh sửa config cho ${packageName}`);
 
-          let packageDisplay;
-          const prefix = Utils.loadPackagePrefixConfig();
-          if (packageName === `${prefix}.client`) {
-            packageDisplay = 'Global ';
-          } else if (packageName === `${prefix}.client.vnggames`) {
-            packageDisplay = 'VNG ';
-          } else {
-            packageDisplay = packageName;
-          }
+          const packageDisplay = Utils.packageLabel(packageName, ' ');
 
           console.log(` Package: ${packageDisplay}`);
           console.log(` Username: ${Utils.maskSensitiveInfo(config.username)}`);
@@ -2983,15 +3065,7 @@ class ConfigEditor {
       let index = 1;
       for (const [packageName, config] of Object.entries(this.configs)) {
         try {
-          let packageDisplay;
-          const prefix = Utils.loadPackagePrefixConfig();
-          if (packageName === `${prefix}.client`) {
-            packageDisplay = 'Global ';
-          } else if (packageName === `${prefix}.client.vnggames`) {
-            packageDisplay = 'VNG ';
-          } else {
-            packageDisplay = packageName;
-          }
+          const packageDisplay = Utils.packageLabel(packageName, ' ');
 
 
           const maskedUsername = Utils.maskSensitiveInfo(config.username);
