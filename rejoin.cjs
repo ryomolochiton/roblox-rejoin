@@ -318,9 +318,198 @@ class Utils {
     return false;
   }
 
+  /** Chạy 1 lệnh shell, trả về {ok, out}. Không ném exception. */
+  static _run(cmd, timeout = 15000) {
+    try {
+      const out = execSync(cmd, {
+        stdio: "pipe",
+        encoding: "utf8",
+        env: Utils.androidEnv(),
+        timeout
+      });
+      return { ok: true, out: String(out || "") };
+    } catch (e) {
+      const out = ((e.stdout || "") + "\n" + (e.stderr || "") + "\n" + (e.message || "")).toString();
+      return { ok: false, out };
+    }
+  }
+
+  /** App có đang chạy không (pidof / ps). */
+  static isAppRunning(packageName) {
+    const probes = [
+      `/system/bin/pidof ${packageName}`,
+      `pidof ${packageName}`,
+      `su -c ${Utils.shq(`unset LD_PRELOAD LD_LIBRARY_PATH; /system/bin/pidof ${packageName}`)}`,
+      `/system/bin/ps -A -o NAME | grep -x ${Utils.shq(packageName)}`
+    ];
+    for (const p of probes) {
+      const r = Utils._run(p, 8000);
+      if (r.ok && r.out.trim()) return true;
+    }
+    return false;
+  }
+
+  static _loadActivityCache() {
+    try {
+      if (fs.existsSync(LAUNCH_ACTIVITY_CACHE_PATH)) {
+        return JSON.parse(fs.readFileSync(LAUNCH_ACTIVITY_CACHE_PATH, "utf8")) || {};
+      }
+    } catch (_) { }
+    return {};
+  }
+
+  static _saveActivityCache(packageName, activity) {
+    try {
+      const cache = Utils._loadActivityCache();
+      cache[packageName] = activity;
+      fs.writeFileSync(LAUNCH_ACTIVITY_CACHE_PATH, JSON.stringify(cache, null, 2));
+    } catch (e) {
+      console.warn(`[!] Không lưu được activity cache: ${e.message}`);
+    }
+  }
+
+  /**
+   * Dò activity thật sự dùng để mở deep-link roblox://.
+   * Trước đây code ghép cứng `${prefix}.client.ActivityProtocolLaunch` — với app
+   * mod (đổi tên package/hệ activity) activity này KHÔNG tồn tại, `am start`
+   * luôn báo "Activity class does not exist" -> bot không bao giờ join được.
+   *
+   * @returns {string[]} danh sách activity ứng viên, xếp theo độ tin cậy giảm dần.
+   */
+  static resolveLaunchActivities(packageName) {
+    const found = new Map(); // activity -> score
+    const add = (act, score) => {
+      if (!act) return;
+      let a = String(act).trim();
+      if (!a) return;
+      // chuẩn hoá "pkg/.Foo" -> "pkg.Foo"
+      if (a.includes("/")) {
+        const [p, c] = a.split("/");
+        a = c.startsWith(".") ? `${p}${c}` : c;
+      } else if (a.startsWith(".")) {
+        a = `${packageName}${a}`;
+      }
+      if (!a.includes(".")) return;
+      const prev = found.get(a) || 0;
+      if (score > prev) found.set(a, score);
+    };
+
+    const scoreOf = (act) => {
+      const l = act.toLowerCase();
+      if (l.includes("protocollaunch")) return 100;
+      if (l.includes("protocol")) return 90;
+      if (l.includes("deeplink") || l.includes("deep_link")) return 80;
+      if (l.includes("launch")) return 70;
+      if (l.includes("splash")) return 60;
+      if (l.includes("main")) return 50;
+      return 30;
+    };
+
+    // 1) Activity đã cache (lần trước chạy được)
+    const cached = Utils._loadActivityCache()[packageName];
+    if (cached) add(cached, 1000);
+
+    // 2) Activity user cấu hình tay
+    const custom = Utils.loadActivityConfig();
+    if (custom) add(custom, 900);
+
+    // 3) resolve-activity cho scheme roblox://
+    const resolvers = [
+      `/system/bin/cmd package resolve-activity --brief -a android.intent.action.VIEW -d "roblox://placeID=1" ${packageName}`,
+      `su -c ${Utils.shq(`unset LD_PRELOAD LD_LIBRARY_PATH; /system/bin/cmd package resolve-activity --brief -a android.intent.action.VIEW -d 'roblox://placeID=1' ${packageName}`)}`,
+      `/system/bin/cmd package resolve-activity --brief ${packageName}`
+    ];
+    for (const cmd of resolvers) {
+      const r = Utils._run(cmd, 12000);
+      if (!r.ok) continue;
+      for (const line of r.out.split("\n")) {
+        const t = line.trim();
+        if (t.includes("/") && t.startsWith(packageName)) add(t, 850);
+      }
+    }
+
+    // 4) query-activities: liệt kê mọi activity nhận scheme roblox://
+    const queries = [
+      `/system/bin/cmd package query-activities -a android.intent.action.VIEW -d "roblox://placeID=1"`,
+      `su -c ${Utils.shq(`unset LD_PRELOAD LD_LIBRARY_PATH; /system/bin/cmd package query-activities -a android.intent.action.VIEW -d 'roblox://placeID=1'`)}`
+    ];
+    for (const cmd of queries) {
+      const r = Utils._run(cmd, 15000);
+      if (!r.ok) continue;
+      const re = new RegExp(`${packageName.replace(/\./g, "\\.")}/[\\w.$]+`, "g");
+      const m = r.out.match(re);
+      if (m) for (const x of m) add(x, 800);
+    }
+
+    // 5) dumpsys package: quét activity có trong manifest
+    const dumps = [
+      `/system/bin/dumpsys package ${packageName}`,
+      `su -c ${Utils.shq(`unset LD_PRELOAD LD_LIBRARY_PATH; /system/bin/dumpsys package ${packageName}`)}`
+    ];
+    for (const cmd of dumps) {
+      const r = Utils._run(cmd, 20000);
+      if (!r.ok || !r.out.trim()) continue;
+      const re = new RegExp(`${packageName.replace(/\./g, "\\.")}/[\\w.$]+`, "g");
+      const m = r.out.match(re);
+      if (m) for (const x of new Set(m)) {
+        const cls = x.split("/")[1] || "";
+        add(x, scoreOf(cls));
+      }
+      break;
+    }
+
+    // 6) Fallback theo prefix (giữ hành vi cũ làm phương án cuối)
+    const prefix = Utils.loadPackagePrefixConfig();
+    add(`${prefix}.client.ActivityProtocolLaunch`, 20);
+    add(`${packageName}.ActivityProtocolLaunch`, 15);
+    add(`${packageName}.client.ActivityProtocolLaunch`, 10);
+
+    return [...found.entries()]
+      .sort((a, b) => b[1] - a[1])
+      .map(([act]) => act)
+      .slice(0, 8);
+  }
+
+  /**
+   * App đang TẮT HẲN: bắn thẳng deep-link thường thất bại vì process chưa dựng.
+   * Mở app bằng intent LAUNCHER (hoặc monkey) trước, chờ process lên rồi mới join.
+   * @returns {Promise<boolean>} true nếu process đã chạy.
+   */
+  static async coldStart(packageName, maxWaitMs = 12000) {
+    console.log(`[*] [${packageName}] App đang tắt -> cold start trước khi join.`);
+    const q = Utils.shq;
+    const starters = [
+      `/system/bin/monkey -p ${packageName} -c android.intent.category.LAUNCHER 1`,
+      `/system/bin/cmd package resolve-activity --brief ${packageName}`, // no-op an toàn
+      `/system/bin/am start -a android.intent.action.MAIN -c android.intent.category.LAUNCHER -p ${packageName}`,
+      `su -c ${q(`unset LD_PRELOAD LD_LIBRARY_PATH; /system/bin/monkey -p ${packageName} -c android.intent.category.LAUNCHER 1`)}`,
+      `su -c ${q(`unset LD_PRELOAD LD_LIBRARY_PATH; /system/bin/am start -a android.intent.action.MAIN -c android.intent.category.LAUNCHER -p ${packageName}`)}`
+    ];
+
+    for (const cmd of starters) {
+      if (cmd.includes("resolve-activity")) continue;
+      const r = Utils._run(cmd, 20000);
+      if (r.ok && !Utils._amFailed(r.out)) break;
+    }
+
+    // chờ process dựng lên, poll mỗi giây
+    const deadline = Date.now() + maxWaitMs;
+    while (Date.now() < deadline) {
+      if (Utils.isAppRunning(packageName)) {
+        const left = Math.max(0, deadline - Date.now());
+        console.log(`[+] [${packageName}] App đã lên (còn dư ${Math.round(left / 1000)}s), chờ 3s cho ổn định.`);
+        await new Promise((r) => setTimeout(r, 3000));
+        return true;
+      }
+      await new Promise((r) => setTimeout(r, 1000));
+    }
+    console.warn(`[!] [${packageName}] Chờ ${Math.round(maxWaitMs / 1000)}s mà app vẫn chưa lên, vẫn thử bắn deep-link.`);
+    return false;
+  }
+
   /**
    * Mở Roblox vào đúng place.
-   * @returns {boolean} true nếu lệnh mở app thực sự thành công.
+   * @returns {Promise<boolean>} true nếu lệnh mở app thực sự thành công.
    *   QUAN TRỌNG: trước đây hàm này luôn "coi như xong" kể cả khi am lỗi,
    *   nên StatusHandler bật cooldown dài -> không rejoin nữa.
    */
@@ -332,44 +521,27 @@ class Utils {
     console.log(` [${packageName}] Đang mở: ${url}`);
     if (linkCode) console.log(` [${packageName}] Đã join bằng linkCode: ${linkCode}`);
 
-
-    let activity;
-    const prefix = this.loadPackagePrefixConfig();
-    const customActivity = this.loadActivityConfig();
-
-
-    if (customActivity) {
-      activity = customActivity;
-      console.log(` [${packageName}] Sử dụng activity tùy chỉnh: ${activity}`);
-    } else {
-
-      if (packageName.startsWith(`${prefix}.client.`)) {
-
-
-        activity = `${prefix}.client.ActivityProtocolLaunch`;
-      } else if (packageName === `${prefix}.client`) {
-
-        activity = `${prefix}.client.ActivityProtocolLaunch`;
-      } else {
-
-        activity = `${prefix}.client.ActivityProtocolLaunch`;
-      }
-      console.log(` [${packageName}] Sử dụng activity mặc định: ${activity}`);
+    // App tắt hẳn -> phải cold start trước, nếu không deep-link sẽ rơi vào hư không
+    if (!Utils.isAppRunning(packageName)) {
+      await Utils.coldStart(packageName);
     }
 
     const q = Utils.shq;
-    const base = `am start -n ${packageName}/${activity} -a android.intent.action.VIEW -d ${q(url)} --activity-clear-top`;
+    const activities = Utils.resolveLaunchActivities(packageName);
+    console.log(` [${packageName}] Activity ứng viên: ${activities.slice(0, 3).join(", ")}${activities.length > 3 ? " ..." : ""}`);
 
-    // Thử nhiều biến thể: bản thường -> /system/bin -> qua su -> mở bằng URL thuần
-    const attempts = [
-      `/system/bin/${base}`,
-      base,
-      `su -c ${q(`unset LD_PRELOAD LD_LIBRARY_PATH; /system/bin/${base}`)}`,
-      `/system/bin/am start -a android.intent.action.VIEW -d ${q(url)} -p ${packageName}`,
-      `su -c ${q(`unset LD_PRELOAD LD_LIBRARY_PATH; /system/bin/am start -a android.intent.action.VIEW -d ${url} -p ${packageName}`)}`
-    ];
+    // Ưu tiên mở đích danh activity; nếu tất cả hỏng thì mở bằng URL thuần (-p)
+    const attempts = [];
+    for (const activity of activities) {
+      const base = `am start -n ${packageName}/${activity} -a android.intent.action.VIEW -d ${q(url)} --activity-clear-top`;
+      attempts.push({ activity, cmd: `/system/bin/${base}` });
+      attempts.push({ activity, cmd: `su -c ${q(`unset LD_PRELOAD LD_LIBRARY_PATH; /system/bin/${base}`)}` });
+    }
+    attempts.push({ activity: null, cmd: `/system/bin/am start -a android.intent.action.VIEW -d ${q(url)} -p ${packageName}` });
+    attempts.push({ activity: null, cmd: `su -c ${q(`unset LD_PRELOAD LD_LIBRARY_PATH; /system/bin/am start -a android.intent.action.VIEW -d ${url} -p ${packageName}`)}` });
+    attempts.push({ activity: null, cmd: `/system/bin/am start -a android.intent.action.VIEW -d ${q(url)}` });
 
-    for (const cmd of attempts) {
+    for (const { activity, cmd } of attempts) {
       try {
         const out = execSync(cmd, {
           stdio: "pipe",
@@ -380,15 +552,20 @@ class Utils {
 
         // `am` hay trả exit 0 kèm "Error: ..." -> phải soi output
         if (Utils._amFailed(out)) {
-          console.warn(`[!] [${packageName}] am báo lỗi, thử cách khác: ${String(out).trim().split("\n")[0]}`);
+          console.warn(`[!] [${packageName}] am báo lỗi${activity ? ` (${activity})` : ""}, thử cách khác: ${String(out).trim().split("\n")[0]}`);
           continue;
         }
 
-        console.log(`[+] [${packageName}] Launch command executed!`);
+        if (activity) {
+          Utils._saveActivityCache(packageName, activity);
+          console.log(`[+] [${packageName}] Launch OK qua activity: ${activity}`);
+        } else {
+          console.log(`[+] [${packageName}] Launch OK qua deep-link thuần.`);
+        }
         return true;
       } catch (e) {
         const detail = (e.stderr || e.stdout || e.message || "").toString().trim().split("\n")[0];
-        console.warn(`[!] [${packageName}] Thử launch thất bại: ${detail}`);
+        console.warn(`[!] [${packageName}] Thử launch thất bại${activity ? ` (${activity})` : ""}: ${detail}`);
       }
     }
 
@@ -1117,13 +1294,14 @@ class StatusHandler {
    */
   cooldownForState(offline) {
     if (!offline) return this.joinCooldownMs;
-    // Offline: lần bắn đầu chỉ chờ 20s, sau đó tăng dần nếu vẫn không vào được.
-    // Dùng (consecutiveFails - 1) vì updateJoinStatus() đã +1 ngay khi bắn,
-    // nếu không mức 20s sẽ không bao giờ được áp dụng.
-    const base = 20000;
+    // Offline: app đang TẮT nên phải cold start + load Roblox từ đầu — riêng việc
+    // này đã mất 40-70s trên máy yếu. Cooldown cũ 20s là quá ngắn: bot bắn đè
+    // liên tục lúc app đang khởi động, Roblox bị reset màn hình loading -> không
+    // bao giờ vào được game. Nâng nền lên 90s và backoff thêm.
+    const base = 90000;
     const tries = Math.max(0, this.consecutiveFails - 1);
-    const backoff = Math.min(tries, 3) * 10000; // 20s -> 30s -> 40s -> 50s
-    return Math.min(base + backoff, this.joinCooldownMs);
+    const backoff = Math.min(tries, 3) * 15000; // 90s -> 105s -> 120s -> 135s
+    return base + backoff;
   }
 
   isCoolingDown(now = Date.now(), offline = false) {
@@ -1135,9 +1313,13 @@ class StatusHandler {
     return Math.max(0, Math.ceil((this.cooldownForState(offline) - (now - this.joinedAt)) / 1000));
   }
 
-  /** Đã bắn rejoin nhiều lần mà vẫn không vào được -> nên force-stop app */
+  /**
+   * Đã bắn rejoin nhiều lần mà vẫn không vào được -> nên force-stop app.
+   * Ngưỡng cũ là 2: quá nhạy, app mới khởi động (còn đang load) đã bị kill,
+   * tạo vòng lặp mở-giết vô tận. Nâng lên 4.
+   */
   shouldForceStop() {
-    return this.consecutiveFails >= 2;
+    return this.consecutiveFails >= 4;
   }
 
   /**
@@ -1148,6 +1330,9 @@ class StatusHandler {
   isFreshDrop(ptype) {
     if (this.lastPtype === null) return false;      // lần chạy đầu, chưa có gì để so
     if (ptype === 2) return false;                  // vẫn đang trong game
+    // 0 -> 1 KHÔNG phải "rớt game": đó là app vừa được bật lên và đang load
+    // (Offline -> Online ngoài game). Bắn rejoin đè lúc này sẽ reset màn loading.
+    if (this.lastPtype === 0 && ptype === 1) return false;
     return this.lastPtype !== ptype;                // trạng thái vừa thay đổi
   }
 
