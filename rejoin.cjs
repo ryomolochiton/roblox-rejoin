@@ -70,12 +70,62 @@ const fs = require("fs");
 const path = require("path");
 const os = require("os");
 const Table = require("cli-table3");
-const CONFIG_PATH = path.join(__dirname, "multi_configs.json");
-const WEBHOOK_CONFIG_PATH = path.join(__dirname, "webhook_config.json");
-const PREFIX_CONFIG_PATH = path.join(__dirname, "package_prefix_config.json");
-const ACTIVITY_CONFIG_PATH = path.join(__dirname, "activity_config.json");
-const AUTOEXEC_CONFIG_PATH = path.join(__dirname, "autoexec_config.json");
 const util = require("util");
+
+/**
+ * Thư mục lưu cấu hình NGOÀI repo.
+ * Loader chạy `git reset --hard` + `git clean -fd` mỗi lần update, nên mọi file
+ * config nằm trong repo đều bị xoá sạch -> user mất hết setting.
+ * Đưa ra ~/.roblox-rejoin (override được bằng biến môi trường ROBLOX_REJOIN_HOME).
+ */
+const CONFIG_DIR = (() => {
+  const envDir = process.env.ROBLOX_REJOIN_HOME;
+  if (envDir && envDir.trim()) return path.resolve(envDir.trim());
+  return path.join(os.homedir() || __dirname, ".roblox-rejoin");
+})();
+
+try {
+  fs.mkdirSync(CONFIG_DIR, { recursive: true });
+} catch (e) {
+  console.error(`[-] Không tạo được thư mục config ${CONFIG_DIR}: ${e.message}`);
+}
+
+const CONFIG_FILENAMES = [
+  "multi_configs.json",
+  "webhook_config.json",
+  "package_prefix_config.json",
+  "activity_config.json",
+  "autoexec_config.json",
+  "launch_activity_cache.json",
+];
+
+/** Chuyển config cũ (nằm trong repo) sang CONFIG_DIR, chạy 1 lần duy nhất. */
+function migrateLegacyConfigs() {
+  if (path.resolve(CONFIG_DIR) === path.resolve(__dirname)) return;
+  for (const name of CONFIG_FILENAMES) {
+    const oldPath = path.join(__dirname, name);
+    const newPath = path.join(CONFIG_DIR, name);
+    try {
+      if (fs.existsSync(oldPath) && !fs.existsSync(newPath)) {
+        fs.copyFileSync(oldPath, newPath);
+        console.log(`[+] Đã chuyển config "${name}" sang ${CONFIG_DIR}`);
+        try { fs.renameSync(oldPath, `${oldPath}.migrated`); } catch (_) {}
+      }
+    } catch (e) {
+      console.error(`[-] Không migrate được "${name}": ${e.message}`);
+    }
+  }
+}
+migrateLegacyConfigs();
+
+const cfgPath = (name) => path.join(CONFIG_DIR, name);
+
+const CONFIG_PATH = cfgPath("multi_configs.json");
+const WEBHOOK_CONFIG_PATH = cfgPath("webhook_config.json");
+const PREFIX_CONFIG_PATH = cfgPath("package_prefix_config.json");
+const ACTIVITY_CONFIG_PATH = cfgPath("activity_config.json");
+const AUTOEXEC_CONFIG_PATH = cfgPath("autoexec_config.json");
+const LAUNCH_ACTIVITY_CACHE_PATH = cfgPath("launch_activity_cache.json");
 
 // figlet / boxen / screenshot-desktop là tuỳ chọn:
 // boxen >= 6 là ESM-only nên require() sẽ ném ERR_REQUIRE_ESM,

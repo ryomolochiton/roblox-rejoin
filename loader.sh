@@ -10,6 +10,13 @@ W="$D"
 ENTRY="rejoin.cjs"
 L="/data/data/com.termux/files/usr/bin/loader"
 
+# Thu muc config nam NGOAI repo -> khong bi git reset/clean xoa mat
+ROBLOX_REJOIN_HOME="${ROBLOX_REJOIN_HOME:-$HOME/.roblox-rejoin}"
+export ROBLOX_REJOIN_HOME
+mkdir -p "$ROBLOX_REJOIN_HOME"
+
+CFGS="multi_configs.json webhook_config.json package_prefix_config.json activity_config.json autoexec_config.json launch_activity_cache.json"
+
 # tu cai chinh no thanh lenh `loader`
 [ ! -f "$L" ] && cp "$0" "$L" && sed -i 's/\r$//' "$L" && chmod +x "$L"
 
@@ -26,8 +33,18 @@ else
   CUR=$(git remote get-url origin 2>/dev/null)
   [ "$CUR" != "$R" ] && git remote set-url origin "$R"
   git fetch --all --prune || exit 1
+
+  # backup config con sot lai trong repo (ban cu) truoc khi reset/clean
+  for f in $CFGS; do
+    [ -f "$D/$f" ] && [ ! -f "$ROBLOX_REJOIN_HOME/$f" ] && cp -f "$D/$f" "$ROBLOX_REJOIN_HOME/$f" 2>/dev/null
+  done
+
+  EXCL="-e node_modules"
+  for f in $CFGS; do EXCL="$EXCL -e $f"; done
+
   git reset --hard origin/main
-  git clean -fd -e node_modules
+  # shellcheck disable=SC2086
+  git clean -fd $EXCL
 fi
 
 # node
