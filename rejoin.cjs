@@ -577,6 +577,179 @@ class Utils {
     return new Promise((r) => rl.question(msg, r));
   }
 
+  /**
+   * Phân tích link người dùng dán vào.
+   * Hỗ trợ 2 dạng:
+   *  1) Link ĐÃ chuyển hướng:
+   *     https://www.roblox.com/games/2753915549/Blox-Fruits?privateServerLinkCode=7745...
+   *  2) Link CHƯA chuyển hướng (share link):
+   *     https://www.roblox.com/share?code=639f43b65925484c842425b544167a2f&type=Server
+   *     (cũng nhận ro.blox.com/Ebh5?..., type=ExperienceInvite, hoặc chỉ dán code 32 ký tự)
+   *
+   * @returns {{kind:"direct"|"share", placeId?:string, linkCode?:string, code?:string, type?:string}|null}
+   */
+  static parseGameLink(raw) {
+    const link = (raw || "").trim();
+    if (!link) return null;
+
+    // Dạng 1: đã có placeId + linkCode ngay trong URL
+    const direct = link.match(/\/games\/(\d+)[^?]*\?[^#]*?(?:privateServerLinkCode|linkCode)=([\w-]+)/i);
+    if (direct) {
+      return { kind: "direct", placeId: direct[1], linkCode: direct[2] };
+    }
+    // roblox://placeID=...&linkCode=...
+    const deep = link.match(/place(?:ID|Id|id)=(\d+)[\s\S]*?linkCode=([\w-]+)/);
+    if (deep) {
+      return { kind: "direct", placeId: deep[1], linkCode: deep[2] };
+    }
+
+    // Dạng 2: share link chưa chuyển hướng
+    const shareCode = link.match(/[?&]code=([\w-]+)/i);
+    if (shareCode && /roblox\.com\/share|ro\.blox\.com|share\?/i.test(link)) {
+      const t = link.match(/[?&]type=([\w-]+)/i);
+      return { kind: "share", code: shareCode[1], type: t ? t[1] : "Server" };
+    }
+
+    // Chỉ dán riêng code (32 ký tự hex) -> mặc định coi là share link type=Server
+    if (/^[a-f0-9]{32}$/i.test(link)) {
+      return { kind: "share", code: link, type: "Server" };
+    }
+
+    return null;
+  }
+
+  static _robloxHeaders(cookie, extra = {}) {
+    return {
+      "User-Agent": "Mozilla/5.0 (Linux; Android 10; Termux)",
+      Accept: "application/json",
+      "Content-Type": "application/json",
+      ...(cookie ? { Cookie: cookie } : {}),
+      ...extra,
+    };
+  }
+
+  /** Lấy X-CSRF-TOKEN (Roblox trả token trong header của response 403). */
+  static async _getCsrfToken(cookie) {
+    try {
+      await axios.post("https://auth.roblox.com/v2/logout", {}, {
+        headers: Utils._robloxHeaders(cookie),
+        timeout: 10000,
+        validateStatus: () => true,
+      });
+    } catch (e) {
+      const tok = e.response && (e.response.headers["x-csrf-token"] || e.response.headers["X-CSRF-TOKEN"]);
+      if (tok) return tok;
+    }
+    return null;
+  }
+
+  /**
+   * Đổi share code -> { placeId, linkCode } bằng API resolve-link của Roblox.
+   * Cần cookie đăng nhập (share link chỉ resolve được khi đã auth).
+   */
+  static async resolveShareLink(code, type = "Server", cookie = null) {
+    if (!cookie) {
+      console.log("[-] Không có cookie để giải share link (cần đăng nhập Roblox).");
+      return null;
+    }
+
+    const linkTypes = [];
+    const t = (type || "").toLowerCase();
+    if (t === "server") linkTypes.push("Server", "ExperienceInvite");
+    else if (t === "experienceinvite") linkTypes.push("ExperienceInvite", "Server");
+    else linkTypes.push("Server", "ExperienceInvite");
+
+    let csrf = await Utils._getCsrfToken(cookie);
+
+    for (const linkType of linkTypes) {
+      for (let attempt = 0; attempt < 2; attempt++) {
+        try {
+          const res = await axios.post(
+            "https://apis.roblox.com/sharelinks/v1/resolve-link",
+            { linkId: code, linkType },
+            {
+              headers: Utils._robloxHeaders(cookie, csrf ? { "X-CSRF-TOKEN": csrf } : {}),
+              timeout: 15000,
+            }
+          );
+
+          const data = res.data || {};
+          const invite =
+            data.privateServerInviteData ||
+            data.experienceInviteData ||
+            data.inviteData ||
+            {};
+
+          const placeId = invite.placeId || invite.universePlaceId || data.placeId;
+          const linkCode = invite.linkCode || invite.privateServerLinkCode || null;
+
+          if (placeId) {
+            if (invite.status && String(invite.status).toLowerCase() !== "valid") {
+              console.log(`[!] Share link trạng thái: ${invite.status}`);
+            }
+            return { placeId: String(placeId), linkCode: linkCode ? String(linkCode) : null };
+          }
+        } catch (e) {
+          const status = e.response && e.response.status;
+          const newCsrf = e.response && e.response.headers && e.response.headers["x-csrf-token"];
+          if (status === 403 && newCsrf && newCsrf !== csrf) {
+            csrf = newCsrf; // thử lại ngay với token mới
+            continue;
+          }
+          if (status === 400 || status === 404) break; // sai linkType -> thử linkType kế tiếp
+          console.log(`[-] Lỗi resolve share link: ${status || ""} ${e.message}`);
+          break;
+        }
+        break;
+      }
+    }
+
+    // Fallback: đi theo redirect của trang share (một số link trả Location chứa privateServerLinkCode)
+    try {
+      const res = await axios.get(`https://www.roblox.com/share?code=${encodeURIComponent(code)}&type=${encodeURIComponent(type || "Server")}`, {
+        headers: Utils._robloxHeaders(cookie, { Accept: "text/html" }),
+        maxRedirects: 0,
+        timeout: 15000,
+        validateStatus: (s) => s >= 200 && s < 400,
+      });
+      const loc = (res.headers && res.headers.location) || "";
+      const parsed = Utils.parseGameLink(loc);
+      if (parsed && parsed.kind === "direct") {
+        return { placeId: parsed.placeId, linkCode: parsed.linkCode };
+      }
+    } catch (e) {
+      const loc = e.response && e.response.headers && e.response.headers.location;
+      const parsed = loc ? Utils.parseGameLink(loc) : null;
+      if (parsed && parsed.kind === "direct") {
+        return { placeId: parsed.placeId, linkCode: parsed.linkCode };
+      }
+    }
+
+    return null;
+  }
+
+  /**
+   * Nhận link bất kỳ (đã chuyển hướng hoặc share link) -> { placeId, linkCode }.
+   * Trả null nếu không hợp lệ / không giải được.
+   */
+  static async resolveGameLink(raw, cookie = null) {
+    const parsed = Utils.parseGameLink(raw);
+    if (!parsed) return null;
+
+    if (parsed.kind === "direct") {
+      return { placeId: parsed.placeId, linkCode: parsed.linkCode };
+    }
+
+    console.log(`[*] Link chưa chuyển hướng, đang giải share code (${parsed.type})...`);
+    const resolved = await Utils.resolveShareLink(parsed.code, parsed.type, cookie);
+    if (!resolved) {
+      console.log("[-] Không giải được share link. Hãy mở link trên trình duyệt rồi dán link đã chuyển hướng.");
+      return null;
+    }
+    console.log(`[+] Đã giải: placeId=${resolved.placeId}${resolved.linkCode ? `, linkCode=${resolved.linkCode}` : " (server công khai)"}`);
+    return resolved;
+  }
+
   static saveMultiConfigs(configs) {
     try {
       fs.writeFileSync(CONFIG_PATH, JSON.stringify(configs, null, 2));
@@ -1331,7 +1504,11 @@ class GameSelector {
     };
   }
 
-  async chooseGame(rl) {
+  /**
+   * @param {readline.Interface} rl
+   * @param {string|null} cookie Cookie ROBLOSECURITY, dùng để giải share link chưa chuyển hướng.
+   */
+  async chooseGame(rl, cookie = null) {
     console.log(`\n[*] Chọn game:`);
     for (let k in this.GAMES) {
       console.log(`${k}. ${this.GAMES[k][1]} (${this.GAMES[k][0]})`);
@@ -1340,25 +1517,26 @@ class GameSelector {
     const ans = (await Utils.ask(rl, "Nhập số: ")).trim();
 
     if (ans === "0") {
-      const sub = (await Utils.ask(rl, "0.1 ID thủ công | 0.2 Link private redirect: ")).trim();
+      const sub = (await Utils.ask(rl, "0.1 ID thủ công | 0.2 Link private server: ")).trim();
       if (sub === "1") {
         const pid = (await Utils.ask(rl, "Nhập Place ID: ")).trim();
         return { placeId: pid, name: "Tùy chỉnh", linkCode: null };
       }
       if (sub === "2") {
-        console.log("\n Dán link redirect sau khi vào private server.");
-        console.log("VD: https://www.roblox.com/games/2753915549/Blox-Fruits?privateServerLinkCode=77455530946706396026289495938493");
+        console.log("\n Dán link private server (chấp nhận cả 2 dạng):");
+        console.log(" - Đã chuyển hướng: https://www.roblox.com/games/2753915549/Blox-Fruits?privateServerLinkCode=7745553094670639602628");
+        console.log(" - Chưa chuyển hướng: https://www.roblox.com/share?code=639f43b65925484c842425b544167a2f&type=Server");
         while (true) {
-          const link = await Utils.ask(rl, "\nDán link redirect đã chuyển hướng: ");
-          const m = link.match(/\/games\/(\d+)[^?]*\?[^=]*=([\w-]+)/);
-          if (!m) {
-            console.log(`[-] Link không hợp lệ!`);
+          const link = await Utils.ask(rl, "\nDán link: ");
+          const resolved = await Utils.resolveGameLink(link, cookie);
+          if (!resolved) {
+            console.log(`[-] Link không hợp lệ hoặc không giải được!`);
             continue;
           }
           return {
-            placeId: m[1],
-            name: "Private Server",
-            linkCode: m[2],
+            placeId: resolved.placeId,
+            name: resolved.linkCode ? "Private Server" : "Tùy chỉnh",
+            linkCode: resolved.linkCode,
           };
         }
       }
@@ -2107,7 +2285,7 @@ class MultiRejoinTool {
       console.log(` User ID: ${Utils.maskSensitiveInfo(userId)}`);
 
       const selector = new GameSelector();
-      const game = await selector.chooseGame(rl);
+      const game = await selector.chooseGame(rl, cookie);
 
       let delaySec;
       while (true) {
@@ -2965,7 +3143,7 @@ class ConfigEditor {
             switch (editChoice.trim()) {
               case "1":
                 const selector = new GameSelector();
-                const game = await selector.chooseGame(rl);
+                const game = await selector.chooseGame(rl, Utils.getRobloxCookie(packageName));
                 config.placeId = game.placeId;
                 config.gameName = game.name;
                 config.linkCode = game.linkCode;
@@ -2992,19 +3170,20 @@ class ConfigEditor {
                 break;
 
               case "3":
-                console.log("\n Dán link redirect sau khi vào private server.");
-                console.log("VD: https://www.roblox.com/games/2753915549/Blox-Fruits?privateServerLinkCode=77455530946706396026289495938493");
+                console.log("\n Dán link private server (chấp nhận cả 2 dạng):");
+                console.log(" - Đã chuyển hướng: https://www.roblox.com/games/2753915549/Blox-Fruits?privateServerLinkCode=7745553094670639602628");
+                console.log(" - Chưa chuyển hướng: https://www.roblox.com/share?code=639f43b65925484c842425b544167a2f&type=Server");
                 while (true) {
                   try {
-                    const link = await Utils.ask(rl, "\nDán link redirect đã chuyển hướng: ");
-                    const m = link.match(/\/games\/(\d+)[^?]*\?[^=]*=([\w-]+)/);
-                    if (!m) {
-                      console.log(`[-] Link không hợp lệ!`);
+                    const link = await Utils.ask(rl, "\nDán link: ");
+                    const resolved = await Utils.resolveGameLink(link, Utils.getRobloxCookie(packageName));
+                    if (!resolved) {
+                      console.log(`[-] Link không hợp lệ hoặc không giải được!`);
                       continue;
                     }
-                    config.placeId = m[1];
-                    config.gameName = "Private Server ";
-                    config.linkCode = m[2];
+                    config.placeId = resolved.placeId;
+                    config.gameName = resolved.linkCode ? "Private Server " : "Tùy chỉnh";
+                    config.linkCode = resolved.linkCode;
                     console.log(`[+] Đã cập nhật link code!`);
                     break;
                   } catch (error) {
