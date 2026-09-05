@@ -97,7 +97,6 @@ const CONFIG_FILENAMES = [
   "activity_config.json",
   "autoexec_config.json",
   "launch_activity_cache.json",
-  "antilag_config.json",
 ];
 
 /** Chuyển config cũ (nằm trong repo) sang CONFIG_DIR, chạy 1 lần duy nhất. */
@@ -127,7 +126,6 @@ const PREFIX_CONFIG_PATH = cfgPath("package_prefix_config.json");
 const ACTIVITY_CONFIG_PATH = cfgPath("activity_config.json");
 const AUTOEXEC_CONFIG_PATH = cfgPath("autoexec_config.json");
 const LAUNCH_ACTIVITY_CACHE_PATH = cfgPath("launch_activity_cache.json");
-const ANTILAG_CONFIG_PATH = cfgPath("antilag_config.json");
 
 // figlet / boxen / screenshot-desktop là tuỳ chọn:
 // boxen >= 6 là ESM-only nên require() sẽ ném ERR_REQUIRE_ESM,
@@ -147,59 +145,20 @@ try {
 } catch (e) {
   boxen = null;
 }
-/**
- * Bề rộng HIỂN THỊ của chuỗi: bỏ qua mã màu ANSI và tính emoji/ký tự CJK là 2 ô.
- * Không có hàm này thì khung vẽ quanh chuỗi có màu sẽ bị lệch mép phải.
- */
-const visibleWidth = (str) => {
-  const plain = String(str).replace(/\x1b\[[0-9;]*m/g, "");
-  let w = 0;
-  for (const ch of plain) {
-    const cp = ch.codePointAt(0);
-    if (cp === 0xfe0f || (cp >= 0x300 && cp <= 0x36f)) continue; // variation selector / dấu tổ hợp
-    const wide =
-      (cp >= 0x1100 && cp <= 0x115f) ||
-      (cp >= 0x2e80 && cp <= 0xa4cf) ||
-      (cp >= 0xac00 && cp <= 0xd7a3) ||
-      (cp >= 0xf900 && cp <= 0xfaff) ||
-      (cp >= 0xff00 && cp <= 0xff60) ||
-      (cp >= 0x1f300 && cp <= 0x1f9ff);
-    w += wide ? 2 : 1;
-  }
-  return w;
-};
-
 if (!boxen) {
   // Fallback tự vẽ khung, không phụ thuộc package ESM
-  const BORDERS = {
-    round: ["╭", "╮", "╰", "╯", "─", "│"],
-    single: ["┌", "┐", "└", "┘", "─", "│"],
-    double: ["╔", "╗", "╚", "╝", "═", "║"],
-    bold: ["┏", "┓", "┗", "┛", "━", "┃"],
-  };
-  const BORDER_COLORS = {
-    cyan: "\x1b[36m", green: "\x1b[32m", yellow: "\x1b[33m",
-    red: "\x1b[31m", blue: "\x1b[34m", magenta: "\x1b[35m", gray: "\x1b[90m",
-  };
-
   boxen = (content, opts = {}) => {
     const padding = typeof opts.padding === "number" ? opts.padding : 1;
-    const [tl, tr, bl, br, h, v] = BORDERS[opts.borderStyle] || BORDERS.round;
-    const bc = BORDER_COLORS[opts.borderColor] || "";
-    const rc = bc ? "\x1b[0m" : "";
-    const paint = (s) => (bc ? bc + s + rc : s);
-
     const lines = String(content).split("\n");
-    const width = Math.max(...lines.map(visibleWidth));
+    const width = Math.max(...lines.map(l => l.length));
     const pad = " ".repeat(padding);
-    const top = paint(tl + h.repeat(width + padding * 2) + tr);
-    const bottom = paint(bl + h.repeat(width + padding * 2) + br);
-    const body = lines.map((l) => {
-      const space = " ".repeat(Math.max(0, width - visibleWidth(l)));
-      const inner = opts.align === "center"
-        ? " ".repeat(Math.floor(space.length / 2)) + l + " ".repeat(Math.ceil(space.length / 2))
-        : l + space;
-      return paint(v) + pad + inner + pad + paint(v);
+    const top = "╭" + "─".repeat(width + padding * 2) + "╮";
+    const bottom = "╰" + "─".repeat(width + padding * 2) + "╯";
+    const body = lines.map(l => {
+      const space = " ".repeat(width - l.length);
+      return opts.align === "center"
+        ? "│" + pad + " ".repeat(Math.floor(space.length / 2)) + l + " ".repeat(Math.ceil(space.length / 2)) + pad + "│"
+        : "│" + pad + l + space + pad + "│";
     });
     return [top, ...body, bottom].join("\n");
   };
@@ -375,20 +334,6 @@ class Utils {
     }
   }
 
-  /**
-   * Chạy lệnh: thử quyền thường trước, thất bại thì rơi xuống `su -c`.
-   * Bắt buộc unset LD_PRELOAD/LD_LIBRARY_PATH khi qua su, nếu không binary
-   * Android sẽ không link được (xem androidEnv()).
-   */
-  static _runRoot(cmd, timeout = 20000) {
-    const direct = Utils._run(cmd, timeout);
-    if (direct.ok) return direct;
-    return Utils._run(
-      `su -c ${Utils.shq(`unset LD_PRELOAD LD_LIBRARY_PATH; ${cmd}`)}`,
-      timeout
-    );
-  }
-
   /** App có đang chạy không (pidof / ps). */
   static isAppRunning(packageName) {
     const probes = [
@@ -421,20 +366,6 @@ class Utils {
     } catch (e) {
       console.warn(`[!] Không lưu được activity cache: ${e.message}`);
     }
-  }
-
-  /**
-   * Activity cache hỏng (app update / đổi manifest) -> xoá để lần sau quét lại.
-   * Không xoá thì bot cứ bắn vào activity chết mãi mãi.
-   */
-  static _clearActivityCache(packageName) {
-    try {
-      const cache = Utils._loadActivityCache();
-      if (!(packageName in cache)) return;
-      delete cache[packageName];
-      fs.writeFileSync(LAUNCH_ACTIVITY_CACHE_PATH, JSON.stringify(cache, null, 2));
-      console.log(`[*] [${packageName}] Đã xoá activity cache, lần sau sẽ dò lại.`);
-    } catch (_) { }
   }
 
   /**
@@ -481,17 +412,6 @@ class Utils {
     // 2) Activity user cấu hình tay
     const custom = Utils.loadActivityConfig();
     if (custom) add(custom, 900);
-
-    // === FIX LAG ===
-    // Nếu đã biết activity chạy được thì DỪNG NGAY ở đây.
-    // Các bước 3-5 phía dưới gọi `dumpsys package` + `query-activities` (mỗi lệnh
-    // vài giây CPU, timeout tới 20s) và trước đây chạy lại ở MỌI lần rejoin ->
-    // máy giật lag, join bị trễ hàng chục giây. Giờ chỉ quét khi chưa có cache.
-    if (cached) {
-      const quick = [cached];
-      if (custom && custom !== cached) quick.push(custom);
-      return quick;
-    }
 
     // 3) resolve-activity cho scheme roblox://
     const resolvers = [
@@ -640,8 +560,6 @@ class Utils {
           Utils._saveActivityCache(packageName, activity);
           console.log(`[+] [${packageName}] Launch OK qua activity: ${activity}`);
         } else {
-          // Activity đã cache không dùng được nữa -> xoá để lần sau quét lại
-          Utils._clearActivityCache(packageName);
           console.log(`[+] [${packageName}] Launch OK qua deep-link thuần.`);
         }
         return true;
@@ -651,8 +569,6 @@ class Utils {
       }
     }
 
-    // Mọi cách đều fail -> cache activity chắc chắn sai, xoá đi để vòng sau dò lại
-    Utils._clearActivityCache(packageName);
     console.error(`[-] [${packageName}] Launch failed: không mở được app bằng mọi cách.`);
     return false;
   }
@@ -1475,7 +1391,7 @@ class GameLauncher {
    * Trước đây hàm này trả về undefined -> caller không biết launch fail
    * nên vẫn bật cooldown và ngừng rejoin.
    */
-  static async handleGameLaunch(shouldLaunch, placeId, linkCode, packageName, rejoinOnly = false, forceStop = false, antiLag = null) {
+  static async handleGameLaunch(shouldLaunch, placeId, linkCode, packageName, rejoinOnly = false, forceStop = false) {
     if (!shouldLaunch) return false;
 
     console.log(` [${packageName}] Starting launch process...`);
@@ -1485,10 +1401,6 @@ class GameLauncher {
       console.log(`[*] [${packageName}] Rejoin nhiều lần không vào được -> force-stop rồi mở lại.`);
       Utils.forceStop(packageName);
       await new Promise(r => setTimeout(r, 2000));
-
-      // App vừa bị kill = thời điểm AN TOÀN NHẤT để dọn cache: cache phình to
-      // chính là lý do app treo/load mãi không xong ở những lần rejoin trước.
-      if (antiLag) await antiLag.cleanForRelaunch(packageName);
     }
 
     const ok = await Utils.launch(placeId, linkCode, packageName);
@@ -1709,7 +1621,7 @@ class StatusHandler {
     return this.lastPtype !== ptype;                // trạng thái vừa thay đổi
   }
 
-  /** Chống spam tối thi��u, dùng cho trường hợp bỏ qua cooldown */
+  /** Chống spam tối thiểu, dùng cho trường hợp bỏ qua cooldown */
   withinMinGap(now) {
     return this.joinedAt > 0 && (now - this.joinedAt) < this.minLaunchGapMs;
   }
@@ -1849,12 +1761,6 @@ class StatusHandler {
 }
 
 class UIRenderer {
-  /**
-   * CPU tính theo CHÊNH LỆCH giữa 2 lần đo. Công thức cũ lấy tổng tích luỹ từ
-   * lúc boot máy nên sau vài giờ con số gần như đứng im -> nhìn không biết máy
-   * đang lag hay không. RAM lấy từ /proc/meminfo (MemAvailable) vì os.freemem()
-   * trên Android bỏ sót phần cache có thể thu hồi.
-   */
   static getSystemStats() {
     const cpus = os.cpus();
     const idle = cpus.reduce((acc, cpu) => acc + cpu.times.idle, 0);
@@ -1862,28 +1768,18 @@ class UIRenderer {
       return acc + cpu.times.user + cpu.times.nice + cpu.times.sys + cpu.times.irq + cpu.times.idle;
     }, 0);
 
-    let cpuUsage;
-    const prev = UIRenderer._cpuSample;
-    if (prev && total > prev.total) {
-      const idleDelta = idle - prev.idle;
-      const totalDelta = total - prev.total;
-      cpuUsage = Math.max(0, Math.min(100, 100 - (idleDelta / totalDelta) * 100)).toFixed(1);
-    } else if (total > 0) {
-      cpuUsage = (100 - (idle / total) * 100).toFixed(1);
-    } else {
-      // os.cpus() trả mảng rỗng trên một số ROM/container -> tránh in ra "NaN"
-      cpuUsage = "0.0";
-    }
-    UIRenderer._cpuSample = { idle, total };
+    const cpuUsage = (100 - (idle / total) * 100).toFixed(1);
 
-    const mem = AntiLagManager.memInfo();
-    const usedGB = ((mem.total - mem.avail) / (1024 ** 3)).toFixed(2);
-    const totalGB = (mem.total / (1024 ** 3)).toFixed(2);
+    const totalMem = os.totalmem();
+    const freeMem = os.freemem();
+    const usedMem = totalMem - freeMem;
+
+    const totalGB = (totalMem / (1024 ** 3)).toFixed(2);
+    const usedGB = (usedMem / (1024 ** 3)).toFixed(2);
 
     return {
       cpuUsage,
-      ramUsage: `${usedGB}GB/${totalGB}GB`,
-      ramFreePercent: mem.freePercent
+      ramUsage: `${usedGB}GB/${totalGB}GB`
     };
   }
 
@@ -1967,179 +1863,6 @@ class UIRenderer {
     }
   }
 
-  /** Thanh tiến trình RAM có màu (xanh/vàng/đỏ theo mức trống). */
-  static ramBar(freePercent, width = 22) {
-    const p = Math.max(0, Math.min(100, Number(freePercent) || 0));
-    const filled = Math.round((p / 100) * width);
-    const color = p >= 50 ? "\x1b[32m" : p >= 25 ? "\x1b[33m" : "\x1b[31m";
-    const bar = "█".repeat(filled) + "░".repeat(Math.max(0, width - filled));
-    return `${color}${bar}\x1b[0m ${p.toFixed(1)}%`;
-  }
-
-  /**
-   * MB -> MB/GB/TB. `totalFreedMb` cộng dồn mãi nên sau vài ngày chạy sẽ thành
-   * số 7-8 chữ số, in thô ra là dòng dài hơn khung -> khung vỡ.
-   */
-  static _fmtSize(mb) {
-    const v = Math.max(0, Number(mb) || 0);
-    if (v >= 1024 * 1024) return `${(v / 1048576).toFixed(1)}TB`;
-    if (v >= 1024) return `${(v / 1024).toFixed(1)}GB`;
-    return `${Math.round(v)}MB`;
-  }
-
-  /**
-   * Cắt chuỗi theo bề rộng HIỂN THỊ nhưng giữ nguyên mã màu ANSI.
-   * `substring()` sẽ cắt giữa mã màu (còn `\x1b[3` treo lơ lửng) và tính sai
-   * bề rộng, nên phải tự đi từng ký tự.
-   */
-  static _clip(str, width) {
-    const s = String(str);
-    const max = Math.max(1, Math.floor(width));
-    if (visibleWidth(s) <= max) return s;
-
-    let out = "";
-    let w = 0;
-    let i = 0;
-    const limit = Math.max(1, max - 1); // chừa 1 ô cho dấu "…"
-    while (i < s.length) {
-      if (s[i] === "\x1b") {
-        const m = /^\x1b\[[0-9;]*m/.exec(s.slice(i));
-        if (m) {
-          out += m[0];
-          i += m[0].length;
-          continue;
-        }
-      }
-      const ch = String.fromCodePoint(s.codePointAt(i));
-      const cw = visibleWidth(ch);
-      if (w + cw > limit) break;
-      out += ch;
-      w += cw;
-      i += ch.length;
-    }
-    return `${out}…\x1b[0m`;
-  }
-
-  /**
-   * Bề rộng nội dung còn lại sau khi trừ viền + padding của boxen.
-   * Termux dọc trên điện thoại chỉ ~32-45 cột, panel cố định 50 cột sẽ bị
-   * terminal tự xuống dòng và khung vẽ vỡ hoàn toàn -> phải co theo cột thật.
-   */
-  static _innerWidth(fallback = 56) {
-    const cols = Number(process.stdout.columns) || fallback;
-    return Math.max(24, cols - 4); // 2 viền + 2 padding
-  }
-
-  /** Panel trạng thái Anti-Lag gọn, có màu và viền. */
-  static renderAntiLagPanel(config, mem, lastSummary) {
-    const dim = (s) => `\x1b[90m${s}\x1b[0m`;
-    const cyan = (s) => `\x1b[36m${s}\x1b[0m`;
-    const yn = (v) => (v ? "\x1b[32m✓\x1b[0m" : "\x1b[90m✗\x1b[0m");
-
-    const inner = this._innerWidth();
-    const tight = inner < 46;               // Termux dọc
-    const labelW = tight ? 12 : 15;         // = nhãn dài nhất + 1, để cột giá trị thẳng
-    // Căn nhãn theo bề rộng HIỂN THỊ, không theo độ dài chuỗi có mã màu.
-    const row = (label, value) =>
-      dim(label + " ".repeat(Math.max(1, labelW - visibleWidth(label)))) + value;
-
-    // Thanh RAM lấy phần còn lại sau nhãn và "100.0%", tối thiểu 6 ô.
-    const barWidth = Math.max(6, Math.min(20, inner - labelW - 8));
-    const rows = [
-      row("Trạng thái", config.enabled ? "\x1b[32m● ĐANG BẬT\x1b[0m" : "\x1b[31m○ ĐANG TẮT\x1b[0m"),
-      row("Mức dọn", cyan(config.level) + (tight ? "" : " " + dim("(light·medium·deep)"))),
-      row("Chu kỳ auto", cyan(config.intervalMinutes + " phút")),
-      row("RAM trống", this.ramBar(mem.freePercent, barWidth)),
-      row("Ngưỡng dọn", cyan(config.lowRamPercent + "%") + (tight ? "" : " " + dim("RAM trống"))),
-      "",
-    ];
-
-    // Hàng 3 công tắc: rộng thì 1 dòng, hẹp thì tách ra cho khỏi tràn.
-    if (tight) {
-      rows.push(
-        row("Mở lại", yn(config.cleanOnRelaunch)) + dim("  CPU ") + yn(config.perfTweaks),
-        row("Tắt anim", yn(config.noAnimation))
-      );
-    } else {
-      rows.push(
-        row("Dọn khi mở lại", yn(config.cleanOnRelaunch)) +
-        dim("   Ưu tiên CPU ") + yn(config.perfTweaks) +
-        dim("   Tắt anim ") + yn(config.noAnimation)
-      );
-    }
-
-    rows.push(
-      row("Tổng đã dọn", cyan((config.totalRuns || 0) + " lần") + dim(" · ") + cyan(this._fmtSize(config.totalFreedMb)))
-    );
-
-    if (lastSummary) {
-      const time = new Date(lastSummary.at).toLocaleTimeString();
-      const gain = this._fmtSize(lastSummary.ramGainMb);
-      const freed = this._fmtSize(lastSummary.freedMb);
-      rows.push("");
-      if (tight) {
-        rows.push(
-          row("Lần cuối", dim(time)),
-          `  \x1b[32m+${gain}\x1b[0m` + dim(` · ${freed}`)
-        );
-      } else {
-        rows.push(
-          row("Lần cuối", dim(time)) +
-          ` \x1b[32m+${gain}\x1b[0m` + dim(` · ${freed} cache`)
-        );
-      }
-    }
-
-    const title = "\x1b[1m\x1b[36m🧹 ANTI-LAG\x1b[0m" + (tight ? "" : " " + dim("· auto dọn cache & RAM"));
-    // Chốt chặn cuối: bất kể nội dung dài thế nào, không dòng nào được vượt
-    // khung. Thiếu bước này thì chỉ cần 1 con số to là khung vỡ.
-    const content = [title, "", ...rows]
-      .map((line) => this._clip(line, inner))
-      .join("\n");
-    try {
-      return "\n" + boxen(content, { padding: 1, borderStyle: "round", borderColor: "cyan" });
-    } catch {
-      return "\n" + content + "\n";
-    }
-  }
-
-  /** Danh sách hành động của menu Anti-Lag, gom nhóm cho dễ nhìn. */
-  static renderAntiLagMenu(config) {
-    const dim = (s) => `\x1b[90m${s}\x1b[0m`;
-    const key = (n) => `\x1b[36m${n}\x1b[0m`;
-    const head = (s) => `\x1b[1m\x1b[33m${s}\x1b[0m`;
-
-    // Nhãn dài + ghi chú sẽ tràn ở Termux dọc -> hẹp thì bỏ ghi chú, rút nhãn.
-    const inner = this._innerWidth();
-    const tight = inner < 42;
-    const item = (n, label, note) =>
-      ` ${key(String(n).padStart(2))}${dim(" │ ")}${label}${note && !tight ? " " + dim(note) : ""}`;
-    const pick = (long, short) => (tight ? short : long);
-
-    const lines = [
-      head("CẤU HÌNH"),
-      item(1, config.enabled ? "Tắt anti-lag" : "Bật anti-lag", config.enabled ? "(đang bật)" : "(đang tắt)"),
-      item(2, "Đổi mức dọn", `(${config.level})`),
-      item(3, pick("Đổi chu kỳ tự động", "Đổi chu kỳ"), `(${config.intervalMinutes} phút)`),
-      item(4, pick("Đổi ngưỡng RAM thấp", "Đổi ngưỡng RAM"), `(${config.lowRamPercent}%)`),
-      "",
-      head("HÀNH ĐỘNG"),
-      item(5, "\x1b[32mDọn ngay bây giờ\x1b[0m"),
-      item(6, pick("Ưu tiên CPU cho Roblox", "Ưu tiên CPU"), config.perfTweaks ? "(đang bật)" : "(đang tắt)"),
-      item(7, pick("Animation hệ thống", "Animation"), config.noAnimation ? "(đang tắt)" : "(đang bật)"),
-      item(8, pick("Tối ưu ART cho Roblox", "Tối ưu ART"), "(chạy lâu)"),
-      "",
-      item(9, dim("Đặt lại mặc định")),
-      item(0, dim("Quay lại menu chính")),
-    ].map((line) => this._clip(line, inner));
-
-    try {
-      return boxen(lines.join("\n"), { padding: 1, borderStyle: "round", borderColor: "gray" });
-    } catch {
-      return "\n" + lines.join("\n") + "\n";
-    }
-  }
-
   static calculateOptimalColumnWidths() {
     const terminalWidth = process.stdout.columns || 120;
     const availableWidth = terminalWidth - 10;
@@ -2192,10 +1915,7 @@ class UIRenderer {
       uptimeText = ` | Uptime: ${hours}h ${minutes}m ${seconds}s`;
     }
 
-    const freeTxt = typeof stats.ramFreePercent === "number"
-      ? ` (trống ${stats.ramFreePercent.toFixed(0)}%)`
-      : "";
-    const cpuRamLine = `CPU: ${stats.cpuUsage}% | RAM: ${stats.ramUsage}${freeTxt} | Instances: ${instances.length}${uptimeText}`;
+    const cpuRamLine = `CPU: ${stats.cpuUsage}% | RAM: ${stats.ramUsage} | Instances: ${instances.length}${uptimeText}`;
 
     const table = new Table({
       head: ["Package", "User", "Status", "Info", "Time", "Delay"],
@@ -2401,534 +2121,11 @@ class AutoexecManager {
   }
 }
 
-/**
- * ===================== ANTI-LAG / AUTO CLEAN CACHE =====================
- * Chạy bot 24/7 thì máy sẽ ì dần: cache Roblox phình ra vài GB, RAM bị app nền
- * ăn hết, tool tự sinh rác (screenshot webhook, temp script, cookies_temp).
- * Module này xử lý đúng 4 việc:
- *   1. Dọn CACHE app Roblox — TUYỆT ĐỐI không đụng vào file Cookies,
- *      vì mất cookie là tool hết lấy được presence và bạn bị đăng xuất.
- *   2. Trả RAM về hệ thống: pm trim-caches, drop_caches, compact_memory.
- *      KHÔNG kill app nào — kill sẽ làm clone Roblox bị văng và phải rejoin.
- *   3. Xoá file rác do chính tool sinh ra.
- *   4. Ưu tiên CPU + chống Doze cho app Roblox, hạ ưu tiên tiến trình tool.
- *
- * 3 mức dọn:
- *   light  - chỉ rác của tool + trim-caches (an toàn tuyệt đối, nhanh)
- *   medium - + cache app Roblox + giải phóng RAM   (mặc định)
- *   deep   - + cache asset `files/http` (Roblox sẽ tải lại asset, vào game lần
- *            đầu chậm hơn nhưng lấy lại nhiều GB nhất)
- */
-const ANTILAG_DEFAULTS = {
-  enabled: true,
-  level: "medium",        // light | medium | deep
-  intervalMinutes: 30,    // chu kỳ dọn tự động khi đang auto rejoin
-  lowRamPercent: 18,      // RAM trống tụt dưới mức này -> dọn khẩn cấp
-  cleanOnRelaunch: true,  // dọn cache ngay sau force-stop, trước khi mở lại app
-  trimAppCaches: true,    // pm trim-caches
-  dropCaches: true,       // sync + drop_caches + compact_memory (cần root)
-  cleanTempFiles: true,   // xoá screenshot/temp/log rác của tool
-  perfTweaks: true,       // ưu tiên CPU + chống Doze cho Roblox
-  noAnimation: false,     // tắt animation hệ thống (áp dụng khi bật)
-  lastRunAt: 0,
-  totalRuns: 0,
-  totalFreedMb: 0,
-};
-
-class AntiLagManager {
-  constructor() {
-    this.config = this.loadConfig();
-    this.lastRunAt = this.config.lastRunAt || 0;
-    this.lastSummary = null;
-    this.running = false;
-  }
-
-  /** Dùng chung 1 instance để webhook/UI đọc được cùng số liệu. */
-  static shared() {
-    if (!AntiLagManager._shared) AntiLagManager._shared = new AntiLagManager();
-    return AntiLagManager._shared;
-  }
-
-  loadConfig() {
-    let saved = {};
-    try {
-      if (fs.existsSync(ANTILAG_CONFIG_PATH)) {
-        saved = JSON.parse(fs.readFileSync(ANTILAG_CONFIG_PATH, "utf8")) || {};
-      }
-    } catch {
-      saved = {};
-    }
-    return { ...ANTILAG_DEFAULTS, ...saved };
-  }
-
-  saveConfig(patch = {}) {
-    this.config = { ...this.config, ...patch };
-    try {
-      fs.writeFileSync(ANTILAG_CONFIG_PATH, JSON.stringify(this.config, null, 2));
-    } catch (e) {
-      console.error(`[-] Không lưu được antilag config: ${e.message}`);
-    }
-    return this.config;
-  }
-
-  // ---------------------------------------------------------------- helpers
-
-  /** RAM thật của máy (os.freemem() trên Android không phản ánh MemAvailable). */
-  static memInfo() {
-    try {
-      const raw = fs.readFileSync("/proc/meminfo", "utf8");
-      const pick = (key) => {
-        const m = raw.match(new RegExp(`^${key}:\\s+(\\d+)\\s*kB`, "m"));
-        return m ? Number(m[1]) * 1024 : 0;
-      };
-      const total = pick("MemTotal") || os.totalmem();
-      const avail = pick("MemAvailable") || pick("MemFree") || os.freemem();
-      return { total, avail, freePercent: total ? (avail / total) * 100 : 0 };
-    } catch {
-      const total = os.totalmem();
-      const avail = os.freemem();
-      return { total, avail, freePercent: total ? (avail / total) * 100 : 0 };
-    }
-  }
-
-  static fmtMb(kb) {
-    const mb = kb / 1024;
-    return mb >= 1024 ? `${(mb / 1024).toFixed(2)}GB` : `${Math.round(mb)}MB`;
-  }
-
-  static _sizeKb(target) {
-    const r = Utils._runRoot(`du -sk ${Utils.shq(target)}`, 15000);
-    const m = String(r.out || "").trim().match(/(^|\n)\s*(\d+)\s/);
-    return m ? Number(m[2]) : 0;
-  }
-
-  /**
-   * Chốt chặn an toàn cho `rm -rf`. Một lỗi ở đây là mất data/đăng xuất,
-   * nên whitelist rất chặt: chỉ cho phép thư mục cache trong sandbox của app.
-   */
-  static isSafeCachePath(p, packageName) {
-    if (!p || typeof p !== "string") return false;
-    const norm = p.replace(/\/+$/, "");
-    if (norm.length < 15) return false;                 // chặn "/", "/data", "/sdcard"
-    if (norm.includes("*") || norm.includes("..")) return false;
-    if (/cookies|shared_prefs|databases|local storage/i.test(norm)) return false;
-    if (norm === `/data/data/${packageName}`) return false;
-    if (norm === `/data/data/${packageName}/files`) return false;
-    return /^(\/data\/data\/|\/sdcard\/Android\/data\/|\/storage\/emulated\/0\/Android\/data\/)/.test(norm);
-  }
-
-  appCachePaths(packageName, deep = false) {
-    const base = `/data/data/${packageName}`;
-    const list = [
-      `${base}/cache`,
-      `${base}/code_cache`,
-      `${base}/app_webview/Default/Cache`,
-      `${base}/app_webview/Default/Code Cache`,
-      `${base}/app_webview/Default/GPUCache`,
-      `${base}/app_webview/Default/Service Worker/CacheStorage`,
-      `${base}/app_webview/Default/Service Worker/ScriptCache`,
-      `${base}/app_webview/Default/blob_storage`,
-      `/sdcard/Android/data/${packageName}/cache`,
-      `/storage/emulated/0/Android/data/${packageName}/cache`,
-    ];
-    if (deep) {
-      // Cache asset của Roblox — nặng nhất (thường 1-3GB), xoá xong vào game
-      // lần đầu sẽ tải lại nên chỉ chạy ở mức deep.
-      list.push(
-        `${base}/files/http`,
-        `${base}/files/logs`,
-        `${base}/files/appData/logs`,
-        `${base}/no_backup/http`
-      );
-    }
-    return list.filter((p) => AntiLagManager.isSafeCachePath(p, packageName));
-  }
-
-  // ------------------------------------------------------------- thao tác
-
-  /** Xoá NỘI DUNG các thư mục cache (giữ thư mục để app không lỗi quyền). */
-  cleanAppCache(packageName, opts = {}) {
-    const deep = !!opts.deep;
-    let freedKb = 0;
-    let paths = 0;
-
-    for (const p of this.appCachePaths(packageName, deep)) {
-      const before = AntiLagManager._sizeKb(p);
-      if (!before) continue;
-      Utils._runRoot(`rm -rf ${Utils.shq(p)}/* ${Utils.shq(p)}/.[!.]*`, 30000);
-      const after = AntiLagManager._sizeKb(p);
-      const diff = Math.max(0, before - after);
-      if (diff > 0) {
-        freedKb += diff;
-        paths++;
-      }
-    }
-    return { freedKb, paths };
-  }
-
-  /** File rác do chính tool sinh ra (screenshot webhook, temp script, cookies_temp). */
-  cleanToolJunk(deep = false) {
-    const JUNK = /^(screenshot_.*\.(png|jpg)|system_info_.*\.txt|temp_script_.*\.txt|.*\.migrated)$/i;
-    const targets = [
-      { dir: __dirname, re: JUNK },
-      { dir: CONFIG_DIR, re: JUNK },
-      { dir: "/sdcard", re: /^cookies_temp_\d+\.db$/i },
-    ];
-    // Giữ file mới < 5 phút: webhook có thể đang upload ảnh vừa chụp
-    const MIN_AGE_MS = 5 * 60 * 1000;
-    let files = 0;
-    let kb = 0;
-
-    for (const { dir, re } of targets) {
-      let entries = [];
-      try {
-        entries = fs.readdirSync(dir);
-      } catch {
-        continue;
-      }
-      for (const name of entries) {
-        if (!re.test(name)) continue;
-        const full = path.join(dir, name);
-        try {
-          const st = fs.statSync(full);
-          if (!st.isFile()) continue;
-          if (Date.now() - st.mtimeMs < MIN_AGE_MS) continue;
-          kb += Math.round(st.size / 1024);
-          fs.unlinkSync(full);
-          files++;
-        } catch { }
-      }
-    }
-
-    if (deep) {
-      const tmp = path.join(Utils.termuxPrefix(), "tmp");
-      Utils._run(`find ${Utils.shq(tmp)} -type f -mmin +60 -delete`, 20000);
-      Utils._run(`npm cache clean --force`, 60000);
-    }
-
-    return { files, kb };
-  }
-
-  /**
-   * Trả RAM về hệ thống mà KHÔNG kill bất kỳ app nào.
-   *
-   * Trước đây hàm này gọi `am kill-all`, nhưng lệnh đó giết MỌI tiến trình nền
-   * — gồm cả các clone Roblox đang chạy nền của chính tool — nên mỗi lần dọn
-   * định kỳ là hàng loạt clone bị văng và phải rejoin. Nay chỉ dùng các cơ chế
-   * không xâm phạm tiến trình: trim cache của hệ thống và drop page cache.
-   * Không có root thì lặng lẽ bỏ qua phần cần root.
-   */
-  freeMemory() {
-    const done = [];
-
-    if (this.config.trimAppCaches !== false) {
-      if (Utils._runRoot(`/system/bin/pm trim-caches 32G`, 30000).ok) done.push("trim cache hệ thống");
-    }
-
-    if (this.config.dropCaches !== false) {
-      const a = Utils._runRoot(`sync; echo 3 > /proc/sys/vm/drop_caches`, 20000);
-      const b = Utils._runRoot(`echo 1 > /proc/sys/vm/compact_memory`, 20000);
-      if (a.ok || b.ok) done.push("drop_caches");
-    }
-
-    try {
-      if (typeof global.gc === "function") global.gc();
-    } catch { }
-
-    return done;
-  }
-
-  /** Ưu tiên CPU + chống Doze/standby bóp app Roblox (nguồn gây giật & rớt game). */
-  prioritizeRoblox(packages = []) {
-    const done = [];
-    for (const pkg of packages) {
-      Utils._runRoot(`/system/bin/dumpsys deviceidle whitelist +${pkg}`, 10000);
-      Utils._runRoot(`/system/bin/cmd appops set ${pkg} RUN_IN_BACKGROUND allow`, 10000);
-      Utils._runRoot(`/system/bin/am set-standby-bucket ${pkg} active`, 10000);
-
-      const probe = Utils._runRoot(`/system/bin/pidof ${pkg}`, 8000);
-      const pid = String(probe.out || "").trim().split(/\s+/)[0];
-      if (/^\d+$/.test(pid) && Utils._runRoot(`renice -n -10 -p ${pid}`, 8000).ok) {
-        done.push(`ưu tiên CPU ${Utils.packageLabel(pkg)}`);
-      }
-    }
-    return done;
-  }
-
-  /** Hạ ưu tiên chính tool để nhường CPU cho game (không cần root). */
-  static lowerOwnPriority() {
-    try {
-      if (typeof os.setPriority === "function") {
-        os.setPriority(process.pid, 5);
-        return true;
-      }
-    } catch { }
-    return Utils._run(`renice -n 5 -p ${process.pid}`, 5000).ok;
-  }
-
-  /** Tắt/bật animation hệ thống — cách nhanh nhất để bớt giật trên máy yếu. */
-  setAnimationScale(value) {
-    const keys = ["window_animation_scale", "transition_animation_scale", "animator_duration_scale"];
-    let ok = 0;
-    for (const k of keys) {
-      if (Utils._runRoot(`/system/bin/settings put global ${k} ${value}`, 10000).ok) ok++;
-    }
-    return ok > 0;
-  }
-
-  /** Biên dịch AOT app Roblox (chạy lâu, chỉ gọi từ menu). */
-  compileForSpeed(packages = []) {
-    const results = [];
-    for (const pkg of packages) {
-      console.log(`[*] Đang tối ưu ART cho ${pkg} (có thể mất vài phút)...`);
-      const r = Utils._runRoot(`/system/bin/cmd package compile -m speed -f ${pkg}`, 420000);
-      const ok = r.ok && !/Error|Failure/i.test(r.out || "");
-      console.log(ok ? `[+] Đã tối ưu ${pkg}` : `[-] Không tối ưu được ${pkg}`);
-      results.push({ pkg, ok });
-    }
-    return results;
-  }
-
-  // -------------------------------------------------------------- chu trình
-
-  /**
-   * @param {string[]} packages danh sách package Roblox đang chạy
-   * @param {{level?:string, reason?:string, quiet?:boolean, skipAppCacheFor?:string[]}} opts
-   */
-  async runCycle(packages = [], opts = {}) {
-    if (this.running) return this.lastSummary;
-    this.running = true;
-
-    const quiet = !!opts.quiet;
-    const level = opts.level || this.config.level || "medium";
-    const reason = opts.reason || "thủ công";
-    const skip = new Set(opts.skipAppCacheFor || []);
-    const log = (m) => { if (!quiet) console.log(m); };
-
-    const t0 = Date.now();
-    const before = AntiLagManager.memInfo();
-    const actions = [];
-    let freedKb = 0;
-
-    log(`\n🧹 [Anti-Lag] Bắt đầu dọn — mức "${level}" (${reason})...`);
-
-    try {
-      if (this.config.cleanTempFiles !== false) {
-        const junk = this.cleanToolJunk(level === "deep");
-        if (junk.files) {
-          freedKb += junk.kb;
-          actions.push(`${junk.files} file rác`);
-          log(`   • Xoá ${junk.files} file rác (${AntiLagManager.fmtMb(junk.kb)})`);
-        }
-      }
-
-      if (level !== "light") {
-        for (const pkg of packages) {
-          // Đang trong game -> KHÔNG đụng cache app đó, tránh làm game khựng
-          if (skip.has(pkg)) {
-            log(`   • Bỏ qua cache ${Utils.packageLabel(pkg)} (đang trong game)`);
-            continue;
-          }
-          const res = this.cleanAppCache(pkg, { deep: level === "deep" });
-          if (res.freedKb) {
-            freedKb += res.freedKb;
-            actions.push(`cache ${Utils.packageLabel(pkg)}`);
-            log(`   • Dọn cache ${Utils.packageLabel(pkg)}: ${AntiLagManager.fmtMb(res.freedKb)}`);
-          }
-        }
-      }
-
-      const memActions = this.freeMemory();
-      for (const a of memActions) {
-        actions.push(a);
-        log(`   • ${a}`);
-      }
-
-      if (this.config.perfTweaks !== false && packages.length) {
-        for (const a of this.prioritizeRoblox(packages)) actions.push(a);
-      }
-    } catch (e) {
-      log(`[-] [Anti-Lag] Lỗi trong lúc dọn: ${e.message}`);
-    }
-
-    let summary = this.lastSummary;
-    try {
-      const after = AntiLagManager.memInfo();
-      summary = {
-        at: Date.now(),
-        level,
-        reason,
-        freedMb: Math.round(freedKb / 1024),
-        ramGainMb: Math.max(0, Math.round((after.avail - before.avail) / (1024 * 1024))),
-        ramFreePercent: after.freePercent,
-        durationMs: Date.now() - t0,
-        actions,
-      };
-
-      this.lastRunAt = summary.at;
-      this.lastSummary = summary;
-      this.saveConfig({
-        lastRunAt: summary.at,
-        totalRuns: (this.config.totalRuns || 0) + 1,
-        totalFreedMb: (this.config.totalFreedMb || 0) + summary.freedMb,
-      });
-
-      log(
-        `[+] [Anti-Lag] Xong trong ${(summary.durationMs / 1000).toFixed(1)}s — ` +
-        `giải phóng ${AntiLagManager.fmtMb(freedKb)} bộ nhớ, +${summary.ramGainMb}MB RAM ` +
-        `(RAM trống: ${after.freePercent.toFixed(1)}%)`
-      );
-    } finally {
-      // Bắt buộc phải nhả cờ ở finally: một lỗi ngoài dự tính ở đoạn tổng kết
-      // sẽ khoá `running` = true mãi mãi và anti-lag không bao giờ chạy lại.
-      this.running = false;
-    }
-
-    return summary;
-  }
-
-  /** Dọn nhanh ngay trước khi mở lại app (thời điểm an toàn nhất: app vừa bị kill). */
-  async cleanForRelaunch(packageName) {
-    if (!this.config.enabled || this.config.cleanOnRelaunch === false) return null;
-    try {
-      const res = this.cleanAppCache(packageName, { deep: false });
-      if (this.config.dropCaches !== false) {
-        Utils._runRoot(`sync; echo 3 > /proc/sys/vm/drop_caches`, 15000);
-      }
-      if (res.freedKb) {
-        console.log(`🧹 [Anti-Lag] Dọn ${AntiLagManager.fmtMb(res.freedKb)} cache của ${Utils.packageLabel(packageName)} trước khi mở lại.`);
-      }
-      return res;
-    } catch (e) {
-      console.warn(`[!] [Anti-Lag] Không dọn được trước khi mở lại: ${e.message}`);
-      return null;
-    }
-  }
-
-  /** Có nên chạy dọn ngay bây giờ không (định kỳ hoặc RAM tụt thấp). */
-  shouldRun(nextCleanAt) {
-    if (!this.config.enabled || this.running) return null;
-    const now = Date.now();
-    if (nextCleanAt && now >= nextCleanAt) return "định kỳ";
-    const mem = AntiLagManager.memInfo();
-    const lowLimit = Number(this.config.lowRamPercent) || 0;
-    if (lowLimit > 0 && mem.freePercent <= lowLimit && now - this.lastRunAt > 2 * 60 * 1000) {
-      return `RAM thấp (${mem.freePercent.toFixed(1)}%)`;
-    }
-    return null;
-  }
-
-  statusLine(nextCleanAt = 0) {
-    const mem = AntiLagManager.memInfo();
-    const state = this.config.enabled ? "\x1b[32mBẬT\x1b[0m" : "\x1b[31mTẮT\x1b[0m";
-    let line = `🧹 Anti-Lag: ${state} | Mức: ${this.config.level} | RAM trống: ${mem.freePercent.toFixed(1)}%`;
-
-    if (this.config.enabled && nextCleanAt) {
-      const left = Math.max(0, Math.ceil((nextCleanAt - Date.now()) / 1000));
-      line += ` | Dọn kế tiếp: ${Math.floor(left / 60)}m ${left % 60}s`;
-    }
-    if (this.lastSummary) {
-      line += `\n   ↳ Lần cuối ${new Date(this.lastSummary.at).toLocaleTimeString()}: `
-        + `giải phóng ${AntiLagManager.fmtMb(this.lastSummary.freedMb * 1024)}, `
-        + `+${this.lastSummary.ramGainMb}MB RAM (${this.lastSummary.reason})`;
-    }
-    return line;
-  }
-
-  // ----------------------------------------------------------------- menu
-
-  async setup(rl, packages = []) {
-    while (true) {
-      console.clear();
-      console.log(UIRenderer.renderTitle());
-      const c = this.config;
-      const mem = AntiLagManager.memInfo();
-
-      console.log(UIRenderer.renderAntiLagPanel(c, mem, this.lastSummary));
-      console.log(UIRenderer.renderAntiLagMenu(c));
-
-      const choice = (await Utils.ask(rl, "\nNhập lựa chọn (0-9): ")).trim();
-
-      if (choice === "0") return;
-
-      if (choice === "1") {
-        this.saveConfig({ enabled: !c.enabled });
-        console.log(`[+] Anti-lag đã ${this.config.enabled ? "BẬT" : "TẮT"}.`);
-
-      } else if (choice === "2") {
-        console.log("\n1. light  - chỉ rác của tool + trim cache (an toàn nhất)");
-        console.log("2. medium - + cache app Roblox + giải phóng RAM (khuyến nghị)");
-        console.log("3. deep   - + cache asset (lấy lại nhiều GB, vào game lần đầu chậm hơn)");
-        const lv = (await Utils.ask(rl, "Chọn mức (1-3): ")).trim();
-        const map = { "1": "light", "2": "medium", "3": "deep" };
-        if (map[lv]) {
-          this.saveConfig({ level: map[lv] });
-          console.log(`[+] Đã đổi mức dọn thành: ${map[lv]}`);
-        } else {
-          console.log("[-] Lựa chọn không hợp lệ!");
-        }
-
-      } else if (choice === "3") {
-        const v = parseInt(await Utils.ask(rl, "Chu kỳ dọn (5-240 phút): "), 10);
-        if (v >= 5 && v <= 240) {
-          this.saveConfig({ intervalMinutes: v });
-          console.log(`[+] Đã đặt chu kỳ dọn: ${v} phút`);
-        } else {
-          console.log("[-] Giá trị phải từ 5 đến 240!");
-        }
-
-      } else if (choice === "4") {
-        const v = parseInt(await Utils.ask(rl, "Ngưỡng RAM trống để dọn khẩn cấp (0 = tắt, 10-50%): "), 10);
-        if (v === 0 || (v >= 10 && v <= 50)) {
-          this.saveConfig({ lowRamPercent: v });
-          console.log(`[+] Đã đặt ngưỡng RAM thấp: ${v}%`);
-        } else {
-          console.log("[-] Giá trị phải là 0 hoặc từ 10 đến 50!");
-        }
-
-      } else if (choice === "5") {
-        const pkgs = packages.length ? packages : Object.keys(Utils.loadMultiConfigs());
-        await this.runCycle(pkgs, { reason: "thủ công" });
-
-      } else if (choice === "6") {
-        this.saveConfig({ perfTweaks: !c.perfTweaks });
-        console.log(`[+] Ưu tiên CPU cho Roblox: ${this.config.perfTweaks ? "BẬT" : "TẮT"}`);
-
-      } else if (choice === "7") {
-        const off = !c.noAnimation;
-        const ok = this.setAnimationScale(off ? "0.0" : "1.0");
-        this.saveConfig({ noAnimation: off });
-        console.log(ok
-          ? `[+] Đã ${off ? "TẮT" : "BẬT LẠI"} animation hệ thống.`
-          : `[-] Không đổi được animation (thiếu quyền root/WRITE_SECURE_SETTINGS).`);
-
-      } else if (choice === "8") {
-        const pkgs = packages.length ? packages : Object.keys(Utils.loadMultiConfigs());
-        if (!pkgs.length) {
-          console.log("[-] Chưa có package nào trong config!");
-        } else {
-          this.compileForSpeed(pkgs);
-        }
-
-      } else if (choice === "9") {
-        this.saveConfig({ ...ANTILAG_DEFAULTS });
-        console.log("[+] Đã đặt lại cấu hình anti-lag về mặc định.");
-
-      } else {
-        console.log("[-] Lựa chọn không hợp lệ!");
-      }
-
-      await Utils.ask(rl, "\nNhấn Enter để tiếp tục...");
-    }
-  }
-}
-
 class MultiRejoinTool {
   constructor() {
     this.instances = [];
     this.isRunning = false;
     this.startTime = Date.now();
-    this.antiLag = AntiLagManager.shared();
   }
 
   async start() {
@@ -2970,10 +2167,9 @@ class MultiRejoinTool {
       console.log(UIRenderer._applyMultiColorGradient("5. Chỉnh activity Roblox", goldGradient));
       console.log(UIRenderer._applyMultiColorGradient("6. Cấu hình webhook", goldGradient));
       console.log(UIRenderer._applyMultiColorGradient("7. Cấu hình Autoexec", goldGradient));
-      console.log(UIRenderer._applyMultiColorGradient("8. Fix lag / Anti-lag & Auto dọn cache", goldGradient));
 
       const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
-      const choice = await Utils.ask(rl, "\nChọn option (1-8): ");
+      const choice = await Utils.ask(rl, "\nChọn option (1-7): ");
 
       try {
         if (choice.trim() === "1") {
@@ -2996,9 +2192,6 @@ class MultiRejoinTool {
           rl.close();
         } else if (choice.trim() === "7") {
           await this.setupAutoexec(rl);
-          rl.close();
-        } else if (choice.trim() === "8") {
-          await this.setupAntiLag(rl);
           rl.close();
         } else {
           console.log("[-] Lựa chọn không hợp lệ!");
@@ -3169,15 +2362,6 @@ class MultiRejoinTool {
 
     console.log("\n Đang quay lại menu chính...");
     await new Promise(resolve => setTimeout(resolve, 2000));
-    await this.start();
-  }
-
-  async setupAntiLag(rl) {
-    const packages = Object.keys(Utils.loadMultiConfigs());
-    await this.antiLag.setup(rl, packages);
-
-    console.log("\n Đang quay lại menu chính...");
-    await new Promise(resolve => setTimeout(resolve, 1000));
     await this.start();
   }
 
@@ -3436,31 +2620,6 @@ class MultiRejoinTool {
     }
 
     console.log(`[+] Đã khởi tạo ${this.instances.length} instances!`);
-
-    // === ANTI-LAG lúc khởi động ===
-    const antiLag = this.antiLag || (this.antiLag = AntiLagManager.shared());
-    if (antiLag.config.enabled) {
-      // Tool chạy nền cả ngày -> hạ ưu tiên để game luôn được CPU trước
-      AntiLagManager.lowerOwnPriority();
-
-      const pkgs = this.instances.map(i => i.packageName);
-      if (antiLag.config.noAnimation) antiLag.setAnimationScale("0.0");
-
-      // Dọn 1 lần trước phiên chạy dài, bỏ qua app đang mở để không làm khựng.
-      // runCycle tự gọi prioritizeRoblox ở cuối nên KHÔNG gọi lại ở đây —
-      // mỗi package tốn 4 lệnh root, gọi 2 lần là chờ thêm vài giây vô ích.
-      try {
-        const summary = await antiLag.runCycle(pkgs, {
-          reason: "khởi động",
-          skipAppCacheFor: pkgs.filter(p => Utils.isAppRunning(p))
-        });
-        const tweaks = (summary && summary.actions || []).filter(a => a.startsWith("ưu tiên CPU"));
-        if (tweaks.length) console.log(`[+] [Anti-Lag] ${tweaks.join(", ")}`);
-      } catch (e) {
-        console.error(`[-] [Anti-Lag] Không dọn được lúc khởi động: ${e.message}`);
-      }
-    }
-
     console.log(" Bắt đầu auto rejoin trong 3 giây...");
     await new Promise(resolve => setTimeout(resolve, 3000));
 
@@ -3483,38 +2642,12 @@ class MultiRejoinTool {
     const autoexecConfig = autoexecManager.loadConfig();
     let nextAutoexecCheck = Date.now() + 15 * 60 * 1000;
 
-    // === ANTI-LAG === lịch auto dọn cache/RAM trong lúc bot đang chạy
-    const antiLag = this.antiLag || (this.antiLag = AntiLagManager.shared());
-    let nextCleanAt = antiLag.config.enabled && antiLag.config.intervalMinutes
-      ? Date.now() + Number(antiLag.config.intervalMinutes) * 60 * 1000
-      : 0;
-
     while (this.isRunning) {
       const now = Date.now();
 
       if (autoexecConfig && now >= nextAutoexecCheck) {
         autoexecManager.checkAndFix(autoexecConfig);
         nextAutoexecCheck = now + 15 * 60 * 1000;
-      }
-
-      // Auto dọn cache: theo chu kỳ HOẶC khi RAM trống tụt dưới ngưỡng.
-      // Không dọn khi đang có instance mở app (dọn lúc đó sẽ làm join chậm thêm).
-      const cleanReason = antiLag.shouldRun(nextCleanAt);
-      if (cleanReason && !this.instances.some(i => i.launching)) {
-        const pkgs = this.instances.map(i => i.packageName);
-        const inGame = this.instances.filter(i => !i.notInGame).map(i => i.packageName);
-        try {
-          await antiLag.runCycle(pkgs, {
-            reason: cleanReason,
-            quiet: true,
-            skipAppCacheFor: inGame
-          });
-        } catch (e) {
-          // Dọn cache lỗi thì bỏ qua vòng này, TUYỆT ĐỐI không được làm sập
-          // vòng rejoin — mất rejoin nặng hơn nhiều so với mất một lần dọn.
-          console.error(`[-] [Anti-Lag] Bỏ qua lượt dọn do lỗi: ${e.message}`);
-        }
-        nextCleanAt = Date.now() + (Number(antiLag.config.intervalMinutes) || 30) * 60 * 1000;
       }
 
 
@@ -3559,21 +2692,14 @@ class MultiRejoinTool {
           const analysis = statusHandler.analyzePresence(presence, config.placeId);
 
           if (analysis.shouldLaunch) {
-            instance.launching = true;
-            let launchOk = false;
-            try {
-              launchOk = await GameLauncher.handleGameLaunch(
-                analysis.shouldLaunch,
-                config.placeId,
-                config.linkCode,
-                config.packageName || instance.packageName,
-                true,
-                analysis.forceStop,
-                antiLag
-              );
-            } finally {
-              instance.launching = false;
-            }
+            const launchOk = await GameLauncher.handleGameLaunch(
+              analysis.shouldLaunch,
+              config.placeId,
+              config.linkCode,
+              config.packageName || instance.packageName,
+              true,
+              analysis.forceStop
+            );
             // Truyền kết quả thật để không bật cooldown khi launch fail
             statusHandler.updateJoinStatus(analysis.shouldLaunch, launchOk);
 
@@ -3620,8 +2746,6 @@ class MultiRejoinTool {
         }
 
         console.log(UIRenderer.renderMultiInstanceTable(this.instances, this.startTime));
-
-        console.log("\n" + antiLag.statusLine(nextCleanAt));
 
         if (this.instances.length > 0) {
           console.log("\n Debug (Instance 1):");
@@ -3717,7 +2841,7 @@ class WebhookManager {
       if (webhookUrl.trim() && webhookUrl.includes('discord.com/api/webhooks/')) {
         break;
       }
-      console.log("[-] URL webhook không hợp lệ! Vui l��ng nhập lại.");
+      console.log("[-] URL webhook không hợp lệ! Vui lòng nhập lại.");
     }
 
     let intervalMinutes;
@@ -3857,16 +2981,6 @@ class WebhookManager {
         return `${packageDisplay}: ${instance.status}`;
       }).join('\n');
 
-      // Trạng thái anti-lag để biết máy còn "thở" được không mà không cần mở Termux
-      const antiLag = AntiLagManager.shared();
-      const mem = AntiLagManager.memInfo();
-      const antiLagText = antiLag.config.enabled
-        ? `Bật (${antiLag.config.level})\nRAM trống: ${mem.freePercent.toFixed(1)}%\n`
-          + (antiLag.lastSummary
-            ? `Vừa dọn: ${AntiLagManager.fmtMb(antiLag.lastSummary.freedMb * 1024)}`
-            : "Chưa dọn lần nào")
-        : `Tắt\nRAM trống: ${mem.freePercent.toFixed(1)}%`;
-
       const embed = {
         title: "🖥️ Dawn Rejoin Status Report",
         color: 0x00ff00,
@@ -3890,11 +3004,6 @@ class WebhookManager {
           {
             name: " Active Instances",
             value: `${activePackages}/${instances.length}`,
-            inline: true
-          },
-          {
-            name: "🧹 Anti-Lag",
-            value: antiLagText,
             inline: true
           },
           {
@@ -4189,25 +3298,6 @@ process.on('SIGINT', () => {
 
 
 (async () => {
-  const arg = (process.argv[2] || "").toLowerCase().replace(/^--/, "");
-
-  // `node rejoin.cjs clean [light|medium|deep]` -> dọn cache/RAM rồi thoát.
-  // Dùng cho cron / Termux:Tasker mà không cần mở menu.
-  if (arg === "clean" || arg === "fixlag" || arg === "antilag") {
-    Utils.ensureRoot();
-
-    const antiLag = AntiLagManager.shared();
-    const level = (process.argv[3] || "").toLowerCase();
-    const packages = Object.keys(Utils.loadMultiConfigs());
-
-    await antiLag.runCycle(packages, {
-      reason: "dòng lệnh",
-      level: ["light", "medium", "deep"].includes(level) ? level : undefined,
-      skipAppCacheFor: packages.filter(p => Utils.isAppRunning(p))
-    });
-    process.exit(0);
-  }
-
   const tool = new MultiRejoinTool();
   await tool.start();
 })();
