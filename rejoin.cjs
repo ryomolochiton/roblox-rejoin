@@ -1369,28 +1369,6 @@ Timestamp: ${systemInfo.timestamp}
     }
   }
 
-  static async curlPastebinVisits() {
-    try {
-
-      const res = await axios.get("https://pastebin.com/Q9yk1GNq", {
-        timeout: 5000,
-        headers: {
-          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
-        }
-      });
-      const html = res.data;
-
-      const match = html.match(/<div class="visits"[^>]*>\s*([\d,.]+)\s*<\/div>/);
-      if (match && match[1]) {
-        return match[1].replace(/,/g, '');
-      }
-      return null;
-    } catch (e) {
-
-      return null;
-    }
-  }
-
   static maskSensitiveInfo(text) {
     if (!text || text === 'Unknown') return text;
     const str = text.toString();
@@ -1905,76 +1883,85 @@ class UIRenderer {
   }
 
   static renderTitle() {
-    const fallbackTitle = `
- ╔══════════════════════════════════════╗
- ║          DAWN REJOIN                 ║
- ║    Bản quyền thuộc về The Real Dawn  ║
- ╚══════════════════════════════════════╝`;
+    const colors = [
+      [0, 255, 255],
+      [80, 120, 255],
+      [190, 80, 255],
+      [255, 70, 170]
+    ];
+    const fallbackTitle = "╭────────────────────────────╮\n│        REJOIN TOOL         │\n╰────────────────────────────╯";
 
     try {
-      if (!figlet) return fallbackTitle;
-      const titleText = figlet.textSync("Dawn Rejoin", {
-        font: "Small",
-        horizontalLayout: "fitted",
-        verticalLayout: "fitted"
-      });
+      const titleText = figlet
+        ? figlet.textSync("REJOIN TOOL", {
+            font: "Small",
+            horizontalLayout: "fitted",
+            verticalLayout: "fitted"
+          })
+        : "REJOIN TOOL";
 
-      const content = titleText + "\nBản quyền thuộc về The Real Dawn";
-      const rawBox = boxen(content, {
+      const rawBox = boxen(titleText, {
         padding: 1,
         borderStyle: "round",
-        align: "center",
-
+        align: "center"
       });
 
-      const rainbowColors = [
-        [255, 0, 0],
-        [255, 127, 0],
-        [255, 255, 0],
-        [0, 255, 0],
-        [0, 0, 255],
-        [75, 0, 130],
-        [148, 0, 211]
-      ];
-
-      return rawBox.split('\n').map(line =>
-        this._applyMultiColorGradient(line, rainbowColors)
-      ).join('\n');
-
-    } catch (e) {
-      return fallbackTitle;
+      return rawBox.split("\n").map((line) =>
+        this._applyMultiColorGradient(line, colors)
+      ).join("\n");
+    } catch (_) {
+      return this._applyMultiColorGradient(fallbackTitle, colors);
     }
   }
 
-  static renderMainMenu({ configCount, prefix, webhook, autoexec, visitCount }) {
-    const terminalWidth = process.stdout.columns || 88;
-    const detailWidth = clamp(terminalWidth - 34, 24, 56);
-    const status = [
-      `${configCount} cấu hình`,
-      `prefix: ${prefix || "chưa đặt"}`,
-      `webhook: ${webhook && webhook.enabled ? "bật" : "tắt"}`,
-      `autoexec: ${autoexec ? autoexec.executor : "tắt"}`,
-    ].join("  •  ");
-    const items = [
-      ["1", "Bắt đầu Auto Rejoin", "Giám sát và tự vào lại game"],
-      ["2", "Thiết lập package", "Quét app và thêm tài khoản"],
-      ["3", "Chỉnh sửa cấu hình", "Game, delay và private server"],
-      ["4", "Prefix package", "Tự dò hoặc nhập thủ công"],
-      ["5", "Activity Roblox", "Tự dò hoặc chỉ định activity"],
-      ["6", "Webhook Discord", "Báo cáo trạng thái định kỳ"],
-      ["7", "Autoexec", "Quản lý script executor"],
-      ["8", "Chẩn đoán nhanh", "Root, sqlite, package và activity"],
-      ["9", "Sao lưu cấu hình", "Tạo snapshot an toàn"],
-      ["0", "Thoát", "Dừng công cụ"],
+  static renderMainMenu({ configCount, prefix, webhook, autoexec }) {
+    const cyan = (text) => `\x1b[1;36m${text}\x1b[0m`;
+    const magenta = (text) => `\x1b[1;35m${text}\x1b[0m`;
+    const green = (text) => `\x1b[1;32m${text}\x1b[0m`;
+    const yellow = (text) => `\x1b[1;33m${text}\x1b[0m`;
+    const red = (text) => `\x1b[1;31m${text}\x1b[0m`;
+    const blue = (text) => `\x1b[1;34m${text}\x1b[0m`;
+
+    const terminalWidth = process.stdout.columns || 60;
+    const cellWidth = clamp(Math.floor((terminalWidth - 3) / 2), 23, 34);
+    const makeCell = (key, label, keyColor) => {
+      const maxLabel = Math.max(8, cellWidth - 6);
+      const shortLabel = label.length > maxLabel
+        ? `${label.slice(0, maxLabel - 1)}…`
+        : label;
+      const spacing = " ".repeat(Math.max(0, cellWidth - shortLabel.length - 5));
+      return ` ${keyColor(key)}  ${shortLabel}${spacing}`;
+    };
+
+    const left = [
+      ["01", "Bắt đầu Auto Rejoin", cyan],
+      ["02", "Thiết lập package", cyan],
+      ["03", "Chỉnh sửa cấu hình", cyan],
+      ["04", "Prefix package", cyan],
+      ["05", "Activity Roblox", cyan]
     ];
-    const table = new Table({
-      head: ["Phím", "Chức năng", "Mô tả"],
-      colWidths: [7, 25, detailWidth],
-      wordWrap: true,
-      style: { head: ["cyan"], border: ["gray"], compact: true }
-    });
-    items.forEach((item) => table.push(item));
-    return `\n\x1b[1;33mTRUNG TÂM ĐIỀU KHIỂN\x1b[0m${visitCount ? `  \x1b[90m• ${visitCount} lượt chạy\x1b[0m` : ""}\n\x1b[90m${status}\x1b[0m\n${table.toString()}`;
+    const right = [
+      ["06", "Webhook Discord", magenta],
+      ["07", "Autoexec", magenta],
+      ["08", "Chẩn đoán nhanh", magenta],
+      ["09", "Sao lưu cấu hình", magenta],
+      ["00", "Thoát", red]
+    ];
+
+    const horizontal = "─".repeat(cellWidth);
+    const lines = [blue(`╭${horizontal}┬${horizontal}╮`)];
+    for (let i = 0; i < left.length; i++) {
+      lines.push(
+        `${blue("│")}${makeCell(...left[i])}${blue("│")}${makeCell(...right[i])}${blue("│")}`
+      );
+      if (i < left.length - 1) lines.push(blue(`├${horizontal}┼${horizontal}┤`));
+    }
+    lines.push(blue(`╰${horizontal}┴${horizontal}╯`));
+
+    const statusLine1 = `${green(`CFG ${configCount}`)}  ${blue("│")}  ${cyan("PREFIX")} ${prefix || "chưa đặt"}`;
+    const statusLine2 = `${magenta("WEBHOOK")} ${webhook && webhook.enabled ? green("BẬT") : red("TẮT")}  ${blue("│")}  ${yellow("AUTOEXEC")} ${autoexec ? green(autoexec.executor) : red("TẮT")}`;
+
+    return `\n${cyan("◆ REJOIN TOOL")}\n${statusLine1}\n${statusLine2}\n\n${lines.join("\n")}`;
   }
 
   static calculateOptimalColumnWidths() {
@@ -2249,8 +2236,6 @@ class MultiRejoinTool {
     Utils.enableWakeLock();
 
     const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
-    let visitCount = null;
-    try { visitCount = await Utils.curlPastebinVisits(); } catch (_) { }
 
     const actions = {
       "1": () => this.startAutoRejoin(rl),
@@ -2273,7 +2258,6 @@ class MultiRejoinTool {
           prefix: Utils.loadPackagePrefixConfig(),
           webhook: Utils.loadWebhookConfig(),
           autoexec: new AutoexecManager().loadConfig(),
-          visitCount,
         }));
 
         const choice = (await Utils.ask(rl, "\n  Chọn chức năng [0-9]: ")).trim();
@@ -2861,10 +2845,9 @@ class MultiRejoinTool {
           console.log(UIRenderer.renderTitle());
         } catch (e) {
           console.log(`
-╔══════════════════════════════════════╗
-║           DAWN REJOIN           ║
-║    Bản quyền thuộc về The Real Dawn  ║
-╚══════════════════════════════════════╝`);
+╭────────────────────────────╮
+│        REJOIN TOOL         │
+╰────────────────────────────╯`);
         }
 
         console.log(UIRenderer.renderMultiInstanceTable(this.instances, this.startTime));
@@ -3097,7 +3080,7 @@ class WebhookManager {
       }).join('\n');
 
       const embed = {
-        title: "🖥️ Dawn Rejoin Status Report",
+        title: "REJOIN TOOL Status Report",
         color: 0x00ff00,
         timestamp: new Date().toISOString(),
         fields: [
@@ -3128,7 +3111,7 @@ class WebhookManager {
           }
         ],
         footer: {
-          text: "Dawn Rejoin Tool - The Real Dawn"
+          text: "REJOIN TOOL"
         }
       };
 
@@ -3411,7 +3394,7 @@ function gracefulShutdown(signal = "SIGINT") {
   shuttingDown = true;
   console.log(`\n\n Đang dừng chương trình (${signal})...`);
   Utils.disableWakeLock();
-  console.log(' Đã tắt wake lock. Cảm ơn bạn đã sử dụng Dawn Rejoin Tool!');
+  console.log(' Đã tắt wake lock. REJOIN TOOL đã dừng.');
   process.exit(0);
 }
 process.on('SIGINT', () => gracefulShutdown('SIGINT'));
