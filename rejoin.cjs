@@ -126,6 +126,10 @@ const PREFIX_CONFIG_PATH = cfgPath("package_prefix_config.json");
 const ACTIVITY_CONFIG_PATH = cfgPath("activity_config.json");
 const AUTOEXEC_CONFIG_PATH = cfgPath("autoexec_config.json");
 const LAUNCH_ACTIVITY_CACHE_PATH = cfgPath("launch_activity_cache.json");
+const BACKUP_DIR = cfgPath("backups");
+
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+const clamp = (value, min, max) => Math.max(min, Math.min(max, value));
 
 // figlet / boxen / screenshot-desktop là tuỳ chọn:
 // boxen >= 6 là ESM-only nên require() sẽ ném ERR_REQUIRE_ESM,
@@ -175,6 +179,28 @@ class Utils {
   // Bọc chuỗi an toàn cho shell (single-quote escaping)
   static shq(s) {
     return "'" + String(s).replace(/'/g, `'\\''`) + "'";
+  }
+
+  /** Ghi JSON theo kiểu atomic để tránh hỏng config khi app bị dừng giữa lúc ghi. */
+  static writeJsonAtomic(filePath, value) {
+    const tempPath = `${filePath}.${process.pid}.tmp`;
+    fs.writeFileSync(tempPath, JSON.stringify(value, null, 2), { encoding: "utf8", mode: 0o600 });
+    fs.renameSync(tempPath, filePath);
+  }
+
+  /** Tạo bản sao toàn bộ cấu hình hiện có. */
+  static backupConfigs() {
+    const stamp = new Date().toISOString().replace(/[:.]/g, "-");
+    const destination = path.join(BACKUP_DIR, stamp);
+    fs.mkdirSync(destination, { recursive: true, mode: 0o700 });
+    let copied = 0;
+    for (const name of CONFIG_FILENAMES) {
+      const source = cfgPath(name);
+      if (!fs.existsSync(source)) continue;
+      fs.copyFileSync(source, path.join(destination, name));
+      copied++;
+    }
+    return { destination, copied };
   }
 
   // Termux PREFIX
@@ -279,6 +305,12 @@ class Utils {
     }
   }
 
+  static disableWakeLock() {
+    try {
+      execSync("termux-wake-unlock", { stdio: "ignore", timeout: 5000 });
+    } catch (_) { }
+  }
+
 
 
 
@@ -349,20 +381,28 @@ class Utils {
     return false;
   }
 
+  static _activityCache = null;
+
   static _loadActivityCache() {
+    if (Utils._activityCache) return Utils._activityCache;
     try {
       if (fs.existsSync(LAUNCH_ACTIVITY_CACHE_PATH)) {
-        return JSON.parse(fs.readFileSync(LAUNCH_ACTIVITY_CACHE_PATH, "utf8")) || {};
+        Utils._activityCache = JSON.parse(fs.readFileSync(LAUNCH_ACTIVITY_CACHE_PATH, "utf8")) || {};
+        return Utils._activityCache;
       }
     } catch (_) { }
-    return {};
+    Utils._activityCache = {};
+    return Utils._activityCache;
   }
 
   static _saveActivityCache(packageName, activity) {
     try {
       const cache = Utils._loadActivityCache();
       cache[packageName] = activity;
-      fs.writeFileSync(LAUNCH_ACTIVITY_CACHE_PATH, JSON.stringify(cache, null, 2));
+      Utils._activityCache = cache;
+      const known = Utils._resolvedActivities.get(packageName) || [];
+      Utils._resolvedActivities.set(packageName, [activity, ...known.filter((x) => x !== activity)]);
+      Utils.writeJsonAtomic(LAUNCH_ACTIVITY_CACHE_PATH, cache);
     } catch (e) {
       console.warn(`[!] Không lưu được activity cache: ${e.message}`);
     }
@@ -376,7 +416,12 @@ class Utils {
    *
    * @returns {string[]} danh sách activity ứng viên, xếp theo độ tin cậy giảm dần.
    */
+  static _resolvedActivities = new Map();
+
   static resolveLaunchActivities(packageName) {
+    const memoized = Utils._resolvedActivities.get(packageName);
+    if (memoized && memoized.length) return [...memoized];
+
     const found = new Map(); // activity -> score
     const add = (act, score) => {
       if (!act) return;
@@ -464,10 +509,12 @@ class Utils {
     add(`${packageName}.ActivityProtocolLaunch`, 15);
     add(`${packageName}.client.ActivityProtocolLaunch`, 10);
 
-    return [...found.entries()]
+    const activities = [...found.entries()]
       .sort((a, b) => b[1] - a[1])
       .map(([act]) => act)
       .slice(0, 8);
+    Utils._resolvedActivities.set(packageName, activities);
+    return [...activities];
   }
 
   /**
@@ -631,16 +678,17 @@ class Utils {
   /** Lấy X-CSRF-TOKEN (Roblox trả token trong header của response 403). */
   static async _getCsrfToken(cookie) {
     try {
-      await axios.post("https://auth.roblox.com/v2/logout", {}, {
+      const response = await axios.post("https://auth.roblox.com/v2/logout", {}, {
         headers: Utils._robloxHeaders(cookie),
         timeout: 10000,
+        // Axios không ném lỗi khi đã cho phép mọi status, nên token phải đọc từ response.
         validateStatus: () => true,
       });
+      return response.headers && (response.headers["x-csrf-token"] || response.headers["X-CSRF-TOKEN"]) || null;
     } catch (e) {
       const tok = e.response && (e.response.headers["x-csrf-token"] || e.response.headers["X-CSRF-TOKEN"]);
-      if (tok) return tok;
+      return tok || null;
     }
-    return null;
   }
 
   /**
@@ -752,7 +800,7 @@ class Utils {
 
   static saveMultiConfigs(configs) {
     try {
-      fs.writeFileSync(CONFIG_PATH, JSON.stringify(configs, null, 2));
+      Utils.writeJsonAtomic(CONFIG_PATH, configs);
       console.log(`[+] Đã lưu multi configs tại ${CONFIG_PATH}`);
     } catch (e) {
       console.error(`[-] Không thể lưu configs: ${e.message}`);
@@ -771,7 +819,7 @@ class Utils {
 
   static saveWebhookConfig(config) {
     try {
-      fs.writeFileSync(WEBHOOK_CONFIG_PATH, JSON.stringify(config, null, 2));
+      Utils.writeJsonAtomic(WEBHOOK_CONFIG_PATH, config);
       console.log(`[+] Đã lưu webhook config tại ${WEBHOOK_CONFIG_PATH}`);
     } catch (e) {
       console.error(`[-] Không thể lưu webhook config: ${e.message}`);
@@ -798,7 +846,8 @@ class Utils {
   static savePackagePrefixConfig(prefix) {
     try {
       const config = { prefix: prefix };
-      fs.writeFileSync(PREFIX_CONFIG_PATH, JSON.stringify(config, null, 2));
+      Utils._resolvedActivities?.clear();
+      Utils.writeJsonAtomic(PREFIX_CONFIG_PATH, config);
       console.log(`[+] Đã lưu prefix package: ${prefix}`);
     } catch (e) {
       console.error(`[-] Không thể lưu prefix config: ${e.message}`);
@@ -822,7 +871,8 @@ class Utils {
   static saveActivityConfig(activity) {
     try {
       const config = { activity: activity };
-      fs.writeFileSync(ACTIVITY_CONFIG_PATH, JSON.stringify(config, null, 2));
+      Utils._resolvedActivities?.clear();
+      Utils.writeJsonAtomic(ACTIVITY_CONFIG_PATH, config);
       console.log(`[+] Đã lưu activity: ${activity}`);
     } catch (e) {
       console.error(`[-] Không thể lưu activity config: ${e.message}`);
@@ -916,13 +966,17 @@ Timestamp: ${systemInfo.timestamp}
   }
 
   static deleteScreenshot(filepath) {
+    // Chỉ xóa file tạm do chính tool tạo trong thư mục script.
     try {
-      if (fs.existsSync(filepath)) {
-        fs.unlinkSync(filepath);
-        console.log(`[-] Đã xóa ảnh: ${path.basename(filepath)}`);
+      const resolved = path.resolve(filepath || "");
+      const allowed = path.dirname(resolved) === path.resolve(__dirname)
+        && /^(screenshot_|system_info_).+\.(png|txt)$/i.test(path.basename(resolved));
+      if (allowed && fs.existsSync(resolved)) {
+        fs.unlinkSync(resolved);
+        console.log(`[-] Đã dọn file tạm: ${path.basename(resolved)}`);
       }
     } catch (e) {
-      console.error(`[-] Lỗi khi xóa ảnh: ${e.message}`);
+      console.error(`[-] Lỗi khi dọn file tạm: ${e.message}`);
     }
   }
 
@@ -1570,6 +1624,10 @@ class StatusHandler {
     // Khoảng nghỉ tối thiểu giữa 2 lần bắn, kể cả khi vừa đổi trạng thái.
     // Chặn spam nếu presence API nhấp nháy (flapping) giữa 0 và 1.
     this.minLaunchGapMs = 8000;
+    // Cần hai mẫu ngoài game liên tiếp để lọc nhiễu ngắn từ Presence API.
+    this.pendingState = null;
+    this.pendingStateCount = 0;
+    this.confirmationsRequired = 2;
   }
 
   /**
@@ -1633,7 +1691,29 @@ class StatusHandler {
     const ptype = presence && presence.userPresenceType !== undefined
       ? presence.userPresenceType
       : undefined;
-    const notInGame = ptype === undefined || ptype === 0 || ptype === 1 || ptype !== 2;
+    const notInGame = ptype !== 2;
+
+    // API đôi lúc trả Offline trong một nhịp ngắn. Xác nhận hai mẫu liên tiếp trước
+    // khi rejoin, nhưng cho phép chạy ngay ở lần kiểm tra đầu tiên sau khi khởi động.
+    if (ptype === 2) {
+      this.pendingState = null;
+      this.pendingStateCount = 0;
+    } else if (ptype !== undefined) {
+      if (this.pendingState === ptype) this.pendingStateCount++;
+      else {
+        this.pendingState = ptype;
+        this.pendingStateCount = 1;
+      }
+      if (this.lastPtype !== null && this.pendingStateCount < this.confirmationsRequired) {
+        return {
+          status: "Đang xác nhận",
+          info: "Phát hiện rời game, đang xác nhận lại để tránh rejoin nhầm",
+          shouldLaunch: false,
+          forceStop: false,
+          rejoinOnly: true
+        };
+      }
+    }
 
     // Vừa chuyển trạng thái (vd: Online[+] -> Offline, hoặc Offline -> Online ngoài game)
     // => bắn rejoin NGAY, bỏ qua cooldown. Chỉ giữ khoảng nghỉ tối thiểu 8s
@@ -1655,9 +1735,9 @@ class StatusHandler {
     if (ptype === undefined) {
       return {
         status: "Không rõ",
-        info: `Không lấy được trạng thái${coolMsg}`,
-        shouldLaunch: !cooling,
-        forceStop: !cooling && this.shouldForceStop(),
+        info: "Dữ liệu presence thiếu trạng thái; giữ nguyên để tránh rejoin nhầm",
+        shouldLaunch: false,
+        forceStop: false,
         rejoinOnly: true
       };
     }
@@ -1726,6 +1806,8 @@ class StatusHandler {
     // Đã vào đúng game -> reset trạng thái cooldown + bộ đếm fail
     this.hasLaunched = false;
     this.consecutiveFails = 0;
+    this.pendingState = null;
+    this.pendingStateCount = 0;
 
     return {
       status: "Online [+]",
@@ -1763,12 +1845,13 @@ class StatusHandler {
 class UIRenderer {
   static getSystemStats() {
     const cpus = os.cpus();
+    if (!cpus.length) return { cpuUsage: "0.0", ramUsage: "N/A" };
     const idle = cpus.reduce((acc, cpu) => acc + cpu.times.idle, 0);
     const total = cpus.reduce((acc, cpu) => {
       return acc + cpu.times.user + cpu.times.nice + cpu.times.sys + cpu.times.irq + cpu.times.idle;
     }, 0);
 
-    const cpuUsage = (100 - (idle / total) * 100).toFixed(1);
+    const cpuUsage = total > 0 ? (100 - (idle / total) * 100).toFixed(1) : "0.0";
 
     const totalMem = os.totalmem();
     const freeMem = os.freemem();
@@ -1863,6 +1946,37 @@ class UIRenderer {
     }
   }
 
+  static renderMainMenu({ configCount, prefix, webhook, autoexec, visitCount }) {
+    const terminalWidth = process.stdout.columns || 88;
+    const detailWidth = clamp(terminalWidth - 34, 24, 56);
+    const status = [
+      `${configCount} cấu hình`,
+      `prefix: ${prefix || "chưa đặt"}`,
+      `webhook: ${webhook && webhook.enabled ? "bật" : "tắt"}`,
+      `autoexec: ${autoexec ? autoexec.executor : "tắt"}`,
+    ].join("  •  ");
+    const items = [
+      ["1", "Bắt đầu Auto Rejoin", "Giám sát và tự vào lại game"],
+      ["2", "Thiết lập package", "Quét app và thêm tài khoản"],
+      ["3", "Chỉnh sửa cấu hình", "Game, delay và private server"],
+      ["4", "Prefix package", "Tự dò hoặc nhập thủ công"],
+      ["5", "Activity Roblox", "Tự dò hoặc chỉ định activity"],
+      ["6", "Webhook Discord", "Báo cáo trạng thái định kỳ"],
+      ["7", "Autoexec", "Quản lý script executor"],
+      ["8", "Chẩn đoán nhanh", "Root, sqlite, package và activity"],
+      ["9", "Sao lưu cấu hình", "Tạo snapshot an toàn"],
+      ["0", "Thoát", "Dừng công cụ"],
+    ];
+    const table = new Table({
+      head: ["Phím", "Chức năng", "Mô tả"],
+      colWidths: [7, 25, detailWidth],
+      wordWrap: true,
+      style: { head: ["cyan"], border: ["gray"], compact: true }
+    });
+    items.forEach((item) => table.push(item));
+    return `\n\x1b[1;33mTRUNG TÂM ĐIỀU KHIỂN\x1b[0m${visitCount ? `  \x1b[90m• ${visitCount} lượt chạy\x1b[0m` : ""}\n\x1b[90m${status}\x1b[0m\n${table.toString()}`;
+  }
+
   static calculateOptimalColumnWidths() {
     const terminalWidth = process.stdout.columns || 120;
     const availableWidth = terminalWidth - 10;
@@ -1915,7 +2029,9 @@ class UIRenderer {
       uptimeText = ` | Uptime: ${hours}h ${minutes}m ${seconds}s`;
     }
 
-    const cpuRamLine = `CPU: ${stats.cpuUsage}% | RAM: ${stats.ramUsage} | Instances: ${instances.length}${uptimeText}`;
+    const online = instances.filter((x) => x.status === "Online [+]").length;
+    const rejoins = instances.reduce((sum, x) => sum + (x.rejoinCount || 0), 0);
+    const cpuRamLine = `CPU ${stats.cpuUsage}%  •  RAM ${stats.ramUsage}  •  Online ${online}/${instances.length}  •  Rejoin ${rejoins}${uptimeText}`;
 
     const table = new Table({
       head: ["Package", "User", "Status", "Info", "Time", "Delay"],
@@ -2015,7 +2131,7 @@ class AutoexecManager {
 
   saveConfig(config) {
     try {
-      fs.writeFileSync(AUTOEXEC_CONFIG_PATH, JSON.stringify(config, null, 2));
+      Utils.writeJsonAtomic(AUTOEXEC_CONFIG_PATH, config);
       console.log("[+] Đã lưu cấu hình autoexec.");
     } catch (e) {
       console.error(`[-] Báo lỗi lưu config: ${e.message}`);
@@ -2129,88 +2245,99 @@ class MultiRejoinTool {
   }
 
   async start() {
+    Utils.ensureRoot();
+    Utils.enableWakeLock();
+
+    const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
+    let visitCount = null;
+    try { visitCount = await Utils.curlPastebinVisits(); } catch (_) { }
+
+    const actions = {
+      "1": () => this.startAutoRejoin(rl),
+      "2": () => this.setupPackages(rl),
+      "3": () => this.editConfigs(rl),
+      "4": () => this.configurePackagePrefix(rl),
+      "5": () => this.configureActivity(rl),
+      "6": () => this.setupWebhook(rl),
+      "7": () => this.setupAutoexec(rl),
+      "8": () => this.runDiagnostics(rl),
+      "9": () => this.backupConfigs(rl),
+    };
+
     try {
-      Utils.ensureRoot();
-      Utils.enableWakeLock();
-
-      console.clear();
-      let visitCount = null;
-      try {
-        visitCount = await Utils.curlPastebinVisits();
-      } catch (e) {
-
-        visitCount = null;
-      }
-
-      try {
+      while (!this.isRunning) {
+        console.clear();
         console.log(UIRenderer.renderTitle());
-      } catch (e) {
-        console.log(`
-╔══════════════════════════════════════╗
-║           DAWN REJOIN                ║
-║    Bản quyền thuộc về The Real Dawn  ║
-╚══════════════════════════════════════╝`);
-      }
+        console.log(UIRenderer.renderMainMenu({
+          configCount: Object.keys(Utils.loadMultiConfigs()).length,
+          prefix: Utils.loadPackagePrefixConfig(),
+          webhook: Utils.loadWebhookConfig(),
+          autoexec: new AutoexecManager().loadConfig(),
+          visitCount,
+        }));
 
-      const goldGradient = [[255, 255, 0], [255, 215, 0]];
-
-      if (visitCount) {
-        console.log(`\nTổng lượt chạy: ${visitCount}`);
-        console.log(`discord.gg/37VJXk9hH4`);
-      }
-
-      console.log("\n" + UIRenderer._applyMultiColorGradient("Rejoin Tool", goldGradient));
-      console.log(UIRenderer._applyMultiColorGradient("1. Bắt đầu auto rejoin", goldGradient));
-      console.log(UIRenderer._applyMultiColorGradient("2. Setup packages", goldGradient));
-      console.log(UIRenderer._applyMultiColorGradient("3. Chỉnh sửa config", goldGradient));
-      console.log(UIRenderer._applyMultiColorGradient("4. Chỉnh prefix package Roblox", goldGradient));
-      console.log(UIRenderer._applyMultiColorGradient("5. Chỉnh activity Roblox", goldGradient));
-      console.log(UIRenderer._applyMultiColorGradient("6. Cấu hình webhook", goldGradient));
-      console.log(UIRenderer._applyMultiColorGradient("7. Cấu hình Autoexec", goldGradient));
-
-      const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
-      const choice = await Utils.ask(rl, "\nChọn option (1-7): ");
-
-      try {
-        if (choice.trim() === "1") {
-          await this.startAutoRejoin(rl);
-          rl.close();
-        } else if (choice.trim() === "2") {
-          await this.setupPackages(rl);
-          rl.close();
-        } else if (choice.trim() === "3") {
-          await this.editConfigs(rl);
-          rl.close();
-        } else if (choice.trim() === "4") {
-          await this.configurePackagePrefix(rl);
-          rl.close();
-        } else if (choice.trim() === "5") {
-          await this.configureActivity(rl);
-          rl.close();
-        } else if (choice.trim() === "6") {
-          await this.setupWebhook(rl);
-          rl.close();
-        } else if (choice.trim() === "7") {
-          await this.setupAutoexec(rl);
-          rl.close();
-        } else {
-          console.log("[-] Lựa chọn không hợp lệ!");
-          rl.close();
-
-          await new Promise(resolve => setTimeout(resolve, 1000));
-          await this.start();
+        const choice = (await Utils.ask(rl, "\n  Chọn chức năng [0-9]: ")).trim();
+        if (choice === "0" || choice.toLowerCase() === "q") break;
+        const action = actions[choice];
+        if (!action) {
+          console.log("\n[!] Lựa chọn không hợp lệ.");
+          await sleep(900);
+          continue;
         }
-      } catch (error) {
-        console.log(`[-] Lỗi khi xử lý lựa chọn: ${error.message}`);
-        rl.close();
-        await new Promise(resolve => setTimeout(resolve, 2000));
-        await this.start();
+
+        try {
+          await action();
+        } catch (error) {
+          console.error(`\n[-] Không thể hoàn tất: ${error.message}`);
+          await sleep(1800);
+        }
       }
-    } catch (error) {
-      console.log(`[-] Lỗi nghiêm trọng trong start: ${error.message}`);
-      await new Promise(resolve => setTimeout(resolve, 3000));
-      await this.start();
+    } finally {
+      rl.close();
+      if (!this.isRunning) Utils.disableWakeLock();
     }
+  }
+
+  async runDiagnostics(rl) {
+    console.clear();
+    console.log(UIRenderer.renderTitle());
+    console.log("\n  CHẨN ĐOÁN NHANH\n");
+    const rows = [];
+    const push = (name, ok, detail) => rows.push([ok ? "OK" : "LỖI", name, detail]);
+
+    push("Quyền root", process.getuid ? process.getuid() === 0 : true, process.getuid ? `UID ${process.getuid()}` : "Không xác định");
+    const sqliteCandidates = [
+      path.join(Utils.termuxPrefix(), "bin", "sqlite3"),
+      "/system/bin/sqlite3",
+      "/usr/bin/sqlite3",
+    ];
+    push("sqlite3", sqliteCandidates.some((file) => fs.existsSync(file)), "Đọc cookie Roblox");
+    const detected = Utils.detectAllRobloxPackages();
+    push("Package Roblox", Object.keys(detected).length > 0, `${Object.keys(detected).length} package`);
+    const configs = Utils.loadMultiConfigs();
+    push("Cấu hình", Object.keys(configs).length > 0, `${Object.keys(configs).length} instance`);
+    push("Activity", Object.keys(detected).length === 0 || Object.keys(detected).some((pkg) => Utils.resolveLaunchActivities(pkg).length > 0), "Tự dò/cached");
+
+    const table = new Table({
+      head: ["Trạng thái", "Hạng mục", "Chi tiết"],
+      colWidths: [12, 22, Math.max(24, Math.min(52, (process.stdout.columns || 100) - 40))],
+      wordWrap: true,
+      style: { head: ["cyan"], border: ["gray"] }
+    });
+    rows.forEach((row) => table.push(row));
+    console.log(table.toString());
+    await Utils.ask(rl, "\nNhấn Enter để quay lại menu...");
+  }
+
+  async backupConfigs(rl) {
+    try {
+      const result = Utils.backupConfigs();
+      console.log(`\n[+] Đã sao lưu ${result.copied} file cấu hình.`);
+      console.log(`    ${result.destination}`);
+    } catch (error) {
+      console.error(`\n[-] Sao lưu thất bại: ${error.message}`);
+    }
+    await Utils.ask(rl, "\nNhấn Enter để quay lại menu...");
   }
 
   async setupPackages(rl) {
@@ -2220,7 +2347,6 @@ class MultiRejoinTool {
     if (Object.keys(packages).length === 0) {
       console.log("[-] Không tìm thấy package Roblox nào!");
       await new Promise(resolve => setTimeout(resolve, 2000));
-      await this.start();
       return;
     }
 
@@ -2247,12 +2373,11 @@ class MultiRejoinTool {
 
       if (indices.length === 0) {
         console.log("[-] Lựa chọn không hợp lệ!");
-        await new Promise(resolve => setTimeout(resolve, 1000));
-        await this.setupPackages(rl);
+        await sleep(900);
         return;
       }
 
-      selectedPackages = indices.map(i => packageList[i]);
+      selectedPackages = [...new Map(indices.map(i => [packageList[i].packageName, packageList[i]])).values()];
       console.log(` Sẽ setup các packages:`);
       selectedPackages.forEach((pkg, i) => {
         console.log(`  - ${i + 1}. ${pkg.packageInfo.displayName}`);
@@ -2260,7 +2385,8 @@ class MultiRejoinTool {
     }
 
 
-    const configs = {};
+    // Giữ lại config của các package không được chọn, tránh setup một app làm mất app khác.
+    const configs = Utils.loadMultiConfigs();
 
     for (const { packageName, packageInfo } of selectedPackages) {
       console.clear();
@@ -2315,8 +2441,8 @@ class MultiRejoinTool {
 
 
     console.log("\n Đang quay lại menu chính...");
-    await new Promise(resolve => setTimeout(resolve, 2000));
-    await this.start();
+    await sleep(900);
+    return;
   }
 
   async editConfigs(rl) {
@@ -2325,7 +2451,6 @@ class MultiRejoinTool {
     if (Object.keys(configs).length === 0) {
       console.log("[-] Chưa có config nào! Vui lòng chạy setup packages trước.");
       await new Promise(resolve => setTimeout(resolve, 2000));
-      await this.start();
       return;
     }
 
@@ -2338,11 +2463,11 @@ class MultiRejoinTool {
 
       console.log("\n Đang quay lại menu chính...");
       await new Promise(resolve => setTimeout(resolve, 2000));
-      await this.start();
+      return;
     } else {
 
       await new Promise(resolve => setTimeout(resolve, 2000));
-      await this.start();
+      return;
     }
   }
 
@@ -2352,8 +2477,8 @@ class MultiRejoinTool {
 
 
     console.log("\n Đang quay lại menu chính...");
-    await new Promise(resolve => setTimeout(resolve, 2000));
-    await this.start();
+    await sleep(900);
+    return;
   }
 
   async setupAutoexec(rl) {
@@ -2361,8 +2486,8 @@ class MultiRejoinTool {
     await autoexecManager.setup(rl);
 
     console.log("\n Đang quay lại menu chính...");
-    await new Promise(resolve => setTimeout(resolve, 2000));
-    await this.start();
+    await sleep(900);
+    return;
   }
 
   async configurePackagePrefix(rl) {
@@ -2427,7 +2552,6 @@ class MultiRejoinTool {
 
       console.log("\n Đang quay lại menu chính...");
       await new Promise(resolve => setTimeout(resolve, 2000));
-      await this.start();
       return;
     } else {
       console.log("[-] Lựa chọn không hợp lệ!");
@@ -2435,8 +2559,8 @@ class MultiRejoinTool {
 
 
     console.log("\n Đang quay lại menu chính...");
-    await new Promise(resolve => setTimeout(resolve, 2000));
-    await this.start();
+    await sleep(900);
+    return;
   }
 
   async configureActivity(rl) {
@@ -2496,7 +2620,6 @@ class MultiRejoinTool {
 
       console.log("\n Đang quay lại menu chính...");
       await new Promise(resolve => setTimeout(resolve, 2000));
-      await this.start();
       return;
     } else {
       console.log("[-] Lựa chọn không hợp lệ!");
@@ -2504,8 +2627,8 @@ class MultiRejoinTool {
 
 
     console.log("\n Đang quay lại menu chính...");
-    await new Promise(resolve => setTimeout(resolve, 2000));
-    await this.start();
+    await sleep(900);
+    return;
   }
 
 
@@ -2516,7 +2639,6 @@ class MultiRejoinTool {
     if (Object.keys(configs).length === 0) {
       console.log("[-] Chưa có config nào! Vui lòng chạy setup packages trước.");
       await new Promise(resolve => setTimeout(resolve, 2000));
-      await this.start();
       return;
     }
 
@@ -2527,7 +2649,6 @@ class MultiRejoinTool {
     if (!isValid) {
       console.log("\n Quay lại menu chính sau 5 giây...");
       await new Promise(resolve => setTimeout(resolve, 5000));
-      await this.start();
       return;
     }
 
@@ -2567,12 +2688,11 @@ class MultiRejoinTool {
 
       if (indices.length === 0) {
         console.log("[-] Lựa chọn không hợp lệ!");
-        await new Promise(resolve => setTimeout(resolve, 1000));
-        await this.startAutoRejoin(rl);
+        await sleep(900);
         return;
       }
 
-      selectedPackages = indices.map(i => packageList[i]);
+      selectedPackages = [...new Set(indices.map(i => packageList[i]))];
       console.log(` Sẽ chạy các packages:`);
       selectedPackages.forEach((pkg, i) => {
         console.log(`  - ${i + 1}. ${pkg}`);
@@ -2584,6 +2704,9 @@ class MultiRejoinTool {
   }
 
   async initializeSelectedInstances(selectedPackages, configs) {
+    // Cho phép khởi chạy lại trong cùng process mà không nhân đôi instance cũ.
+    this.instances = [];
+    this.startTime = Date.now();
 
     for (const packageName of selectedPackages) {
       const config = configs[packageName];
@@ -2609,6 +2732,8 @@ class MultiRejoinTool {
         countdown: "00s",
         lastCheck: 0,
         presenceType: "Unknown",
+        networkErrors: 0,
+        rejoinCount: 0,
         // Mặc định coi như chưa ở trong game -> kiểm tra nhanh ngay từ đầu
         notInGame: true
       });
@@ -2651,75 +2776,72 @@ class MultiRejoinTool {
       }
 
 
+      const dueInstances = [];
       for (const instance of this.instances) {
-        const { config, user, statusHandler } = instance;
+        const baseDelayMs = (Number(instance.config.delaySec) || 30) * 1000;
+        const normalDelayMs = instance.notInGame
+          ? Math.min(5000, baseDelayMs)
+          : Math.min(baseDelayMs, 30000);
+        // Khi API lỗi liên tục, tăng nhịp retry 5s -> 10s -> 20s -> tối đa 60s.
+        const delayMs = instance.networkErrors
+          ? Math.max(normalDelayMs, Math.min(60000, 5000 * (2 ** Math.min(instance.networkErrors, 4))))
+          : normalDelayMs;
+        const elapsed = now - instance.lastCheck;
+        instance.countdownSeconds = Math.ceil(Math.max(0, delayMs - elapsed) / 1000);
+        if (elapsed >= delayMs) dueInstances.push(instance);
+        if (!instance.presenceType) instance.presenceType = "Unknown";
+      }
 
-        // delaySec là chu kỳ kiểm tra khi user ĐANG ở trong game.
-        // - Ngoài game/offline: poll dồn dập 5s để rejoin gần như tức thì.
-        // - Trong game: vẫn phải poll đủ dày (trần 30s) thì mới PHÁT HIỆN được
-        //   lúc user rớt ra. Nếu tôn trọng nguyên delaySec=300 thì rớt game
-        //   xong 5 phút sau bot mới biết -> "rejoin ngay" là vô nghĩa.
-        const baseDelayMs = (Number(config.delaySec) || 30) * 1000;
-        const OUT_OF_GAME_POLL_MS = 5000;
-        const IN_GAME_POLL_CAP_MS = 30000;
-        const delayMs = instance.notInGame
-          ? Math.min(OUT_OF_GAME_POLL_MS, baseDelayMs)
-          : Math.min(baseDelayMs, IN_GAME_POLL_CAP_MS);
+      // Các request presence độc lập được chạy đồng thời để nhiều account không chặn nhau.
+      const results = await Promise.allSettled(dueInstances.map(async (instance) => ({
+        instance,
+        presence: await instance.user.getPresence(),
+      })));
 
-        const timeSinceLastCheck = now - instance.lastCheck;
+      for (let i = 0; i < results.length; i++) {
+        const result = results[i];
+        if (result.status === "rejected") {
+          const instance = dueInstances[i];
+          instance.lastCheck = Date.now();
+          instance.networkErrors = (instance.networkErrors || 0) + 1;
+          instance.status = "Lỗi mạng";
+          instance.info = "Presence API gặp lỗi bất ngờ, sẽ tự thử lại.";
+          continue;
+        }
+        const { instance, presence } = result.value;
+        const { config, statusHandler } = instance;
+        instance.lastCheck = Date.now();
 
-
-        const timeLeft = Math.max(0, delayMs - timeSinceLastCheck);
-        instance.countdownSeconds = Math.ceil(timeLeft / 1000);
-
-
-        if (timeSinceLastCheck >= delayMs) {
-          const presence = await user.getPresence();
-
-          // Lỗi mạng/API: giữ nguyên trạng thái cũ, KHÔNG coi là offline giả
-          if (presence && presence.__fetchFailed) {
-            instance.status = "Lỗi mạng";
-            instance.info = `Không gọi được presence API: ${presence.error}. Giữ trạng thái, thử lại sau.`;
-            instance.lastCheck = now;
-            continue;
-          }
-
-          let presenceTypeDisplay = "Unknown";
-          if (presence && presence.userPresenceType !== undefined) {
-            presenceTypeDisplay = presence.userPresenceType.toString();
-          }
-
-          const analysis = statusHandler.analyzePresence(presence, config.placeId);
-
-          if (analysis.shouldLaunch) {
-            const launchOk = await GameLauncher.handleGameLaunch(
-              analysis.shouldLaunch,
-              config.placeId,
-              config.linkCode,
-              config.packageName || instance.packageName,
-              true,
-              analysis.forceStop
-            );
-            // Truyền kết quả thật để không bật cooldown khi launch fail
-            statusHandler.updateJoinStatus(analysis.shouldLaunch, launchOk);
-
-            if (!launchOk) {
-              analysis.info = `${analysis.info} [mở app thất bại - thử lại vòng sau]`;
-            }
-          }
-
-          instance.status = analysis.status;
-          instance.info = analysis.info;
-          instance.presenceType = presenceTypeDisplay;
-          instance.lastCheck = now;
-          // Chưa vào game -> kiểm tra lại nhanh hơn, không chờ hết delaySec
-          instance.notInGame = analysis.shouldLaunch || analysis.status !== "Online [+]";
+        if (presence && presence.__fetchFailed) {
+          instance.networkErrors = (instance.networkErrors || 0) + 1;
+          instance.status = "Lỗi mạng";
+          instance.info = `Presence API lỗi (${instance.networkErrors} lần), tự tăng thời gian thử lại.`;
+          continue;
         }
 
+        instance.networkErrors = 0;
+        instance.presenceType = presence && presence.userPresenceType !== undefined
+          ? String(presence.userPresenceType)
+          : "Unknown";
+        const analysis = statusHandler.analyzePresence(presence, config.placeId);
 
-        if (!instance.presenceType) {
-          instance.presenceType = "Unknown";
+        if (analysis.shouldLaunch) {
+          const launchOk = await GameLauncher.handleGameLaunch(
+            true,
+            config.placeId,
+            config.linkCode,
+            config.packageName || instance.packageName,
+            true,
+            analysis.forceStop
+          );
+          statusHandler.updateJoinStatus(true, launchOk);
+          instance.rejoinCount = (instance.rejoinCount || 0) + (launchOk ? 1 : 0);
+          if (!launchOk) analysis.info += " [mở app thất bại - sẽ thử lại]";
         }
+
+        instance.status = analysis.status;
+        instance.info = analysis.info;
+        instance.notInGame = analysis.status !== "Online [+]";
       }
 
 
@@ -2747,13 +2869,6 @@ class MultiRejoinTool {
 
         console.log(UIRenderer.renderMultiInstanceTable(this.instances, this.startTime));
 
-        if (this.instances.length > 0) {
-          console.log("\n Debug (Instance 1):");
-          console.log(`Package: ${this.instances[0].packageName}`);
-          console.log(`Last Check: ${new Date(this.instances[0].lastCheck).toLocaleTimeString()}`);
-        }
-
-
         if (webhookConfig && webhookConfig.url) {
           const urlParts = webhookConfig.url.split('/');
           const webhookId = urlParts[urlParts.length - 2] || 'unknown';
@@ -2773,7 +2888,7 @@ class MultiRejoinTool {
       }
 
       renderCounter++;
-      await new Promise(resolve => setTimeout(resolve, 1000));
+      await sleep(1000);
     }
   }
 
@@ -3091,8 +3206,8 @@ class ConfigEditor {
 
           if (indices.length === 0) {
             console.log("[-] Lựa chọn không hợp lệ!");
-            await new Promise(resolve => setTimeout(resolve, 1000));
-            return await this.startEdit(rl);
+            await sleep(900);
+            return false;
           }
 
           selectedConfigs = indices.map(i => configList[i]);
@@ -3107,8 +3222,8 @@ class ConfigEditor {
           });
         } catch (error) {
           console.log(`[-] Lỗi khi xử lý lựa chọn: ${error.message}`);
-          await new Promise(resolve => setTimeout(resolve, 1000));
-          return await this.startEdit(rl);
+          await sleep(900);
+          return false;
         }
       }
 
@@ -3290,11 +3405,17 @@ class ConfigEditor {
 }
 
 
-process.on('SIGINT', () => {
-  console.log('\n\n Đang dừng chương trình...');
-  console.log(' Cảm ơn bạn đã sử dụng Dawn Rejoin Tool!');
+let shuttingDown = false;
+function gracefulShutdown(signal = "SIGINT") {
+  if (shuttingDown) return;
+  shuttingDown = true;
+  console.log(`\n\n Đang dừng chương trình (${signal})...`);
+  Utils.disableWakeLock();
+  console.log(' Đã tắt wake lock. Cảm ơn bạn đã sử dụng Dawn Rejoin Tool!');
   process.exit(0);
-});
+}
+process.on('SIGINT', () => gracefulShutdown('SIGINT'));
+process.on('SIGTERM', () => gracefulShutdown('SIGTERM'));
 
 
 (async () => {
