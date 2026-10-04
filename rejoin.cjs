@@ -295,9 +295,6 @@ class Utils {
     } catch (_) { }
   }
 
-
-
-
   /**
    * Env sạch để gọi binary Android (am / pm / monkey / am force-stop).
    * Termux export LD_PRELOAD + LD_LIBRARY_PATH trỏ vào $PREFIX/lib, khiến
@@ -394,9 +391,8 @@ class Utils {
 
   /**
    * Dò activity thật sự dùng để mở deep-link roblox://.
-   * Trước đây code ghép cứng `${prefix}.client.ActivityProtocolLaunch` — với app
-   * mod (đổi tên package/hệ activity) activity này KHÔNG tồn tại, `am start`
-   * luôn báo "Activity class does not exist" -> bot không bao giờ join được.
+   * (Giữ cho mục đích tham khảo; khởi chạy giờ CHỈ dùng activity
+   *  cấu hình tay ở mục 5 hoặc mặc định theo prefix.)
    *
    * @returns {string[]} danh sách activity ứng viên, xếp theo độ tin cậy giảm dần.
    */
@@ -541,8 +537,9 @@ class Utils {
   /**
    * Mở Roblox vào đúng place.
    * @returns {Promise<boolean>} true nếu lệnh mở app thực sự thành công.
-   *   QUAN TRỌNG: trước đây hàm này luôn "coi như xong" kể cả khi am lỗi,
-   *   nên StatusHandler bật cooldown dài -> không rejoin nữa.
+   *
+   * CHỈ mở bằng activity đã cấu hình tay (mục 5) HOẶC mặc định theo prefix.
+   * Không còn tự dò activity, không còn cache, không fallback URL thuần.
    */
   static async launch(placeId, linkCode = null, packageName) {
     const url = linkCode
@@ -558,19 +555,19 @@ class Utils {
     }
 
     const q = Utils.shq;
-    const activities = Utils.resolveLaunchActivities(packageName);
-    console.log(` [${packageName}] Activity ứng viên: ${activities.slice(0, 3).join(", ")}${activities.length > 3 ? " ..." : ""}`);
+    const activity =
+      Utils.loadActivityConfig() ||
+      `${Utils.loadPackagePrefixConfig()}.client.ActivityProtocolLaunch`;
+    const activities = [activity];
+    console.log(` [${packageName}] Đang dùng activity: ${activity}`);
 
-    // Ưu tiên mở đích danh activity; nếu tất cả hỏng thì mở bằng URL thuần (-p)
+    // Chỉ mở bằng activity đã cấu hình / mặc định (không còn fallback URL thuần)
     const attempts = [];
-    for (const activity of activities) {
-      const base = `am start -n ${packageName}/${activity} -a android.intent.action.VIEW -d ${q(url)} --activity-clear-top`;
-      attempts.push({ activity, cmd: `/system/bin/${base}` });
-      attempts.push({ activity, cmd: `su -c ${q(`unset LD_PRELOAD LD_LIBRARY_PATH; /system/bin/${base}`)}` });
+    for (const a of activities) {
+      const base = `am start -n ${packageName}/${a} -a android.intent.action.VIEW -d ${q(url)} --activity-clear-top`;
+      attempts.push({ activity: a, cmd: `/system/bin/${base}` });
+      attempts.push({ activity: a, cmd: `su -c ${q(`unset LD_PRELOAD LD_LIBRARY_PATH; /system/bin/${base}`)}` });
     }
-    attempts.push({ activity: null, cmd: `/system/bin/am start -a android.intent.action.VIEW -d ${q(url)} -p ${packageName}` });
-    attempts.push({ activity: null, cmd: `su -c ${q(`unset LD_PRELOAD LD_LIBRARY_PATH; /system/bin/am start -a android.intent.action.VIEW -d ${url} -p ${packageName}`)}` });
-    attempts.push({ activity: null, cmd: `/system/bin/am start -a android.intent.action.VIEW -d ${q(url)}` });
 
     for (const { activity, cmd } of attempts) {
       try {
@@ -583,24 +580,19 @@ class Utils {
 
         // `am` hay trả exit 0 kèm "Error: ..." -> phải soi output
         if (Utils._amFailed(out)) {
-          console.warn(`[!] [${packageName}] am báo lỗi${activity ? ` (${activity})` : ""}, thử cách khác: ${String(out).trim().split("\n")[0]}`);
+          console.warn(`[!] [${packageName}] am báo lỗi (${activity}), thử cách khác: ${String(out).trim().split("\n")[0]}`);
           continue;
         }
 
-        if (activity) {
-          Utils._saveActivityCache(packageName, activity);
-          console.log(`[+] [${packageName}] Launch OK qua activity: ${activity}`);
-        } else {
-          console.log(`[+] [${packageName}] Launch OK qua deep-link thuần.`);
-        }
+        console.log(`[+] [${packageName}] Launch OK qua activity: ${activity}`);
         return true;
       } catch (e) {
         const detail = (e.stderr || e.stdout || e.message || "").toString().trim().split("\n")[0];
-        console.warn(`[!] [${packageName}] Thử launch thất bại${activity ? ` (${activity})` : ""}: ${detail}`);
+        console.warn(`[!] [${packageName}] Thử launch thất bại (${activity}): ${detail}`);
       }
     }
 
-    console.error(`[-] [${packageName}] Launch failed: không mở được app bằng mọi cách.`);
+    console.error(`[-] [${packageName}] Launch failed: không mở được app bằng activity đã cấu hình. Chạy mục 5 để kiểm tra activity.`);
     return false;
   }
 
@@ -1024,8 +1016,7 @@ Timestamp: ${systemInfo.timestamp}
   }
 
   /**
-   * Tên hiển thị chuẩn cho 1 package. Trước đây logic này bị lặp ở 7 chỗ khác
-   * nhau trong UI, mỗi chỗ một kiểu -> sửa 1 chỗ sót 6 chỗ.
+   * Tên hiển thị chuẩn cho 1 package.
    */
   static describePackage(packageName, prefix = null) {
     const p = prefix || Utils.loadPackagePrefixConfig();
@@ -1039,7 +1030,7 @@ Timestamp: ${systemInfo.timestamp}
   /**
    * Nhãn NGẮN dùng trong bảng/status ("Global" / "VNG" / tên package).
    * @param {string} packageName
-   * @param {string} [suffix] khoảng trắng căn lề mà UI cũ đang dùng
+   * @param {string} [suffix] khoảng trắng căn lề
    */
   static packageLabel(packageName, suffix = "") {
     const p = Utils.loadPackagePrefixConfig();
@@ -1054,8 +1045,7 @@ Timestamp: ${systemInfo.timestamp}
 
   /**
    * Quét mọi app KHAI BÁO xử lý được scheme `roblox://`.
-   * Đây là cách duy nhất tìm ra app mod đã đổi tên package hoàn toàn
-   * (vd: zam.hi1) — quét theo prefix sẽ không bao giờ thấy chúng.
+   * (Dùng cho nhận diện prefix ở mục 4.)
    * @returns {string[]} danh sách package name
    */
   static scanRobloxHandlers() {
@@ -1085,9 +1075,6 @@ Timestamp: ${systemInfo.timestamp}
 
   /**
    * Suy ra prefix chung từ danh sách package.
-   * VD: ["zam.hi1", "zam.hi2"]             -> "zam"
-   *     ["com.roblox.client", "com.roblox.client.vnggames"] -> "com.roblox"
-   *     ["vip.mod.roblox"]                 -> "vip.mod"
    */
   static derivePrefix(packages) {
     const list = (packages || []).filter(Boolean).map(String);
@@ -1293,8 +1280,6 @@ Timestamp: ${systemInfo.timestamp}
     }
   }
 
-
-
   static getRobloxCookie(packageName) {
     console.log(`[*] [${packageName}] Đang lấy cookie ROBLOSECURITY...`);
 
@@ -1404,8 +1389,6 @@ Timestamp: ${systemInfo.timestamp}
 class GameLauncher {
   /**
    * @returns {boolean} true nếu app thực sự được mở.
-   * Trước đây hàm này trả về undefined -> caller không biết launch fail
-   * nên vẫn bật cooldown và ngừng rejoin.
    */
   static async handleGameLaunch(shouldLaunch, placeId, linkCode, packageName, rejoinOnly = false, forceStop = false) {
     if (!shouldLaunch) return false;
@@ -1597,8 +1580,6 @@ class StatusHandler {
 
   /**
    * Đã bắn rejoin nhiều lần mà vẫn không vào được -> nên force-stop app.
-   * Ngưỡng cũ là 2: quá nhạy, app mới khởi động (còn đang load) đã bị kill,
-   * tạo vòng lặp mở-giết vô tận. Nâng lên 4.
    */
   shouldForceStop() {
     return this.consecutiveFails >= 4;
@@ -1678,7 +1659,7 @@ class StatusHandler {
     if (ptype !== 2) {
       return {
         status: "Không online",
-        info: throttled ? "Đã gửi lệnh rejoin, đang chống lặp ngắn" : "User không trong game. Rejoin ngay!",
+        info: throttled ? "Đã gửi lệnh đổi map, đang chống lặp ngắn" : "User không trong game. Rejoin ngay!",
         shouldLaunch: !throttled,
         forceStop: !throttled && this.shouldForceStop(),
         rejoinOnly: true
@@ -1737,103 +1718,174 @@ class StatusHandler {
   }
 }
 
+/**
+ * ================= GIAO DIỆN (MIDNIGHT CYAN) =================
+ * Menu chính luôn chia 2 cột ngang. nội dung dài tự xuống dòng.
+ * Màn hình hẹp (<96 cột): bảng giám sát / danh sách config tự chuyển thành thẻ.
+ */
 class UIRenderer {
-  static getSystemStats() {
-    const cpus = os.cpus();
-    if (!cpus.length) return { cpuUsage: "0.0", ramUsage: "N/A" };
-    const idle = cpus.reduce((acc, cpu) => acc + cpu.times.idle, 0);
-    const total = cpus.reduce((acc, cpu) => {
-      return acc + cpu.times.user + cpu.times.nice + cpu.times.sys + cpu.times.irq + cpu.times.idle;
-    }, 0);
+  static palette = {
+    accent: "1;38;5;87",
+    violet: "1;38;5;147",
+    blue: "1;38;5;75",
+    good: "1;38;5;121",
+    warn: "1;38;5;221",
+    bad: "1;38;5;203",
+    text: "38;5;255",
+    dim: "38;5;245",
+    border: "38;5;63",
+    muted: "38;5;60"
+  };
 
-    const cpuUsage = total > 0 ? (100 - (idle / total) * 100).toFixed(1) : "0.0";
-
-    const totalMem = os.totalmem();
-    const freeMem = os.freemem();
-    const usedMem = totalMem - freeMem;
-
-    const totalGB = (totalMem / (1024 ** 3)).toFixed(2);
-    const usedGB = (usedMem / (1024 ** 3)).toFixed(2);
-
-    return {
-      cpuUsage,
-      ramUsage: `${usedGB}GB/${totalGB}GB`
-    };
-  }
-
-
-  static _ansiColorChar(ch, rgb) {
-    const [r, g, b] = rgb;
-    return `\x1b[38;2;${Math.round(r)};${Math.round(g)};${Math.round(b)}m${ch}\x1b[0m`;
-  }
-
-  static _lerp(a, b, t) {
-    return a + (b - a) * Math.max(0, Math.min(1, t));
-  }
-
-  static _applyMultiColorGradient(text, colors) {
-    if (text.length <= 1) {
-      return text.split('').map(c => this._ansiColorChar(c, colors[0])).join('');
-    }
-
-    const out = [];
-    const numColors = colors.length;
-    const n = text.length;
-
-    text.split('').forEach((ch, idx) => {
-      const segmentIdx = (idx / (n - 1)) * (numColors - 1);
-      const segmentStart = Math.floor(segmentIdx);
-      const segmentEnd = Math.min(segmentStart + 1, numColors - 1);
-
-      const t = segmentIdx - segmentStart;
-      const leftRgb = colors[segmentStart];
-      const rightRgb = colors[segmentEnd];
-
-      const r = this._lerp(leftRgb[0], rightRgb[0], t);
-      const g = this._lerp(leftRgb[1], rightRgb[1], t);
-      const b = this._lerp(leftRgb[2], rightRgb[2], t);
-
-      out.push(this._ansiColorChar(ch, [r, g, b]));
-    });
-
-    return out.join('');
-  }
+  // Map mã màu cũ (1;31, 1;32...) sang theme mới để mọi chỗ gọi cũ vẫn đồng bộ.
+  static legacyColors = {
+    "1;31": "bad",
+    "1;32": "good",
+    "1;33": "warn",
+    "1;34": "blue",
+    "1;35": "violet",
+    "1;36": "accent",
+    "1;37": "text",
+    "2;37": "dim"
+  };
 
   static color(code, text) {
-    return `\x1b[${code}m${text}\x1b[0m`;
+    const value = String(text ?? "");
+    if (
+      process.env.NO_COLOR !== undefined ||
+      (!process.stdout.isTTY && !process.env.FORCE_COLOR)
+    ) {
+      return value;
+    }
+    const key = this.legacyColors[code] || code;
+    const tone = this.palette[key] || key;
+    return `\x1b[${tone}m${value}\x1b[0m`;
   }
 
   static stripAnsi(text) {
-    return String(text).replace(/\x1b\[[0-9;]*m/g, "");
+    return String(text ?? "").replace(/\x1b\[[0-?]*[ -/]*[@-~]/g, "");
+  }
+
+  static _chars(text) {
+    return Array.from(this.stripAnsi(text).normalize("NFC"));
+  }
+
+  static _len(text) {
+    return this._chars(text).length;
+  }
+
+  static _width(max = 94) {
+    return Math.max(33, Math.min(max, (process.stdout.columns || 80) - 1));
   }
 
   static fit(text, width) {
-    const value = String(text ?? "");
-    if (value.length <= width) return value + " ".repeat(width - value.length);
-    return width > 1 ? `${value.slice(0, width - 1)}…` : value.slice(0, width);
+    const size = Math.max(0, Math.floor(Number(width) || 0));
+    if (!size) return "";
+    const chars = this._chars(String(text ?? "").replace(/[\r\n\t]+/g, " "));
+    if (chars.length <= size) {
+      return chars.join("") + " ".repeat(size - chars.length);
+    }
+    return size === 1 ? "…" : chars.slice(0, size - 1).join("") + "…";
   }
 
-  static statusColor(status) {
-    const value = String(status || "Không rõ");
-    if (value === "Online [+]" || value === "Trong game") return this.color("1;32", value);
-    if (value === "Offline" || value === "Sai map") return this.color("1;31", value);
-    if (value === "Lỗi mạng") return this.color("1;33", value);
-    if (value.includes("Khởi tạo") || value === "Đang xác nhận") return this.color("1;36", value);
-    return this.color("1;35", value);
+  static _wrap(text, width) {
+    const limit = Math.max(1, Math.floor(width));
+    const paragraphs = this.stripAnsi(text)
+      .normalize("NFC")
+      .replace(/\t/g, " ")
+      .split(/\r?\n/);
+    const out = [];
+
+    for (const paragraph of paragraphs) {
+      const words = paragraph.trim().split(/\s+/).filter(Boolean);
+      let line = "";
+
+      if (!words.length) {
+        out.push("");
+        continue;
+      }
+
+      for (const word of words) {
+        const candidate = line ? line + " " + word : word;
+        if (this._len(candidate) <= limit) {
+          line = candidate;
+          continue;
+        }
+        if (line) {
+          out.push(line);
+          line = "";
+        }
+        const chars = this._chars(word);
+        while (chars.length > limit) {
+          out.push(chars.splice(0, limit).join(""));
+        }
+        line = chars.join("");
+      }
+
+      if (line) out.push(line);
+    }
+
+    return out.length ? out : [""];
+  }
+
+  static _center(text, width) {
+    const value = this.fit(text, width).trimEnd();
+    const left = Math.max(0, Math.floor((width - this._len(value)) / 2));
+    return this.fit(" ".repeat(left) + value, width);
+  }
+
+  static _panel(title, lines, width = this._width()) {
+    const inner = width - 2;
+    const contentWidth = width - 4;
+    const B = (text) => this.color("border", text);
+
+    const heading = title ? this.fit(" " + title, inner - 2).trimEnd() : "";
+    const prefix = heading ? "─" + heading : "";
+    const top = prefix + "─".repeat(Math.max(0, inner - this._len(prefix)));
+
+    const body = lines.map((line) => {
+      const value = String(line ?? "");
+      return (
+        B("│") + " " + value +
+        " ".repeat(Math.max(0, contentWidth - this._len(value))) +
+        " " + B("│")
+      );
+    });
+
+    return [
+      B("╭" + top + "╮"),
+      ...body,
+      B("╰" + "─".repeat(inner) + "╯")
+    ].join("\n");
+  }
+
+  static renderTitle() {
+    const width = this._width();
+    const contentWidth = width - 4;
+    const subtitle =
+      width >= 60
+        ? "ANDROID  /  MULTI INSTANCE  /  LIVE MONITOR"
+        : "ANDROID / LIVE MONITOR";
+
+    return "\n" + this._panel("CONTROL CENTER", [
+      this.color("accent", this._center("R E J O I N", contentWidth)),
+      this.color("violet", this._center(subtitle, contentWidth))
+    ], width);
   }
 
   static renderSection(title, subtitle = "") {
-    const width = clamp(process.stdout.columns || 72, 34, 88);
-    const innerWidth = width - 2;
-    const line = "─".repeat(innerWidth);
-    const label = `${title.toUpperCase()}${subtitle ? `  /  ${subtitle}` : ""}`;
-    return `\n${this.color("1;36", `┌${line}┐`)}\n${this.color("1;36", "│")}${this.color("1;37", this.fit(label, innerWidth))}${this.color("1;36", "│")}\n${this.color("1;36", `└${line}┘`)}`;
-  }
-
-  static progressBar(value, total, size = 12) {
-    const ratio = total > 0 ? clamp(value / total, 0, 1) : 0;
-    const filled = Math.round(ratio * size);
-    return `${this.color("1;32", "█".repeat(filled))}${this.color("2;37", "░".repeat(size - filled))}`;
+    const width = this._width();
+    const lines = [
+      "",
+      this.color("accent", `  ◆ ${String(title).toUpperCase()}`)
+    ];
+    if (subtitle) {
+      lines.push(
+        ...this._wrap(subtitle, width - 2).map((l) => this.color("dim", `  ${l}`))
+      );
+    }
+    lines.push(this.color("muted", "─".repeat(width)));
+    return lines.join("\n");
   }
 
   static screen(title, subtitle = "") {
@@ -1842,315 +1894,442 @@ class UIRenderer {
     console.log(this.renderSection(title, subtitle));
   }
 
-  static options(items, { footer = "Nhập số để lựa chọn", accent = "1;36" } = {}) {
-    const width = clamp((process.stdout.columns || 72) - 2, 32, 78);
-    const rule = "─".repeat(width);
-    const lines = [this.color(accent, `╭${rule}╮`)];
-    items.forEach((item, index) => {
-      const key = String(item.key);
-      const label = String(item.label || "");
-      const description = String(item.description || "");
-      const labelWidth = Math.max(8, width - key.length - 7);
-      lines.push(`${this.color(accent, "│")} ${this.color(item.color || "1;36", `[${key}]`)} ${this.color("1;37", this.fit(label, labelWidth))}${this.color(accent, "│")}`);
-      if (description) lines.push(`${this.color(accent, "│")}     ${this.color("2;37", this.fit(description, width - 5))}${this.color(accent, "│")}`);
-      if (index < items.length - 1) lines.push(this.color(accent, `├${rule}┤`));
-    });
-    lines.push(this.color(accent, `╰${rule}╯`));
-    if (footer) lines.push(this.color("2;37", footer));
-    return lines.join("\n");
-  }
-
-  static infoCard(rows, title = "THÔNG TIN") {
-    const width = clamp((process.stdout.columns || 72) - 2, 32, 78);
-    const labelWidth = clamp(Math.max(...rows.map(([label]) => String(label).length), 8), 8, 18);
-    const rule = "─".repeat(width);
-    const lines = [this.color("1;34", `╭─ ${title} ${"─".repeat(Math.max(1, width - title.length - 3))}╮`)];
-    for (const [label, value, tone = "1;37"] of rows) {
-      const prefix = `${this.fit(String(label).toUpperCase(), labelWidth)}  `;
-      const available = Math.max(8, width - labelWidth - 3);
-      lines.push(`${this.color("1;34", "│")} ${this.color("2;37", prefix)}${this.color(tone, this.fit(String(value ?? "-"), available))}${this.color("1;34", "│")}`);
-    }
-    lines.push(this.color("1;34", `╰${rule}╯`));
-    return lines.join("\n");
+  static divider(label = "") {
+    const width = this._width();
+    const text = String(label).trim();
+    if (!text) return this.color("muted", "─".repeat(width));
+    const heading = `── ${text.toUpperCase()} `;
+    return this.color(
+      "muted",
+      this.fit(heading + "─".repeat(Math.max(0, width - this._len(heading))), width)
+    );
   }
 
   static prompt(label) {
-    return `\n${this.color("1;36", "›")} ${this.color("1;37", label)} ${this.color("1;36", ":")} `;
+    return `\n${this.color("accent", "  ❯ ")}${this.color("text", label)}${this.color("violet", " : ")}`;
   }
 
   static message(type, text) {
-    const map = {
-      success: ["1;32", "THÀNH CÔNG"],
-      error: ["1;31", "LỖI"],
-      warning: ["1;33", "CẢNH BÁO"],
-      info: ["1;36", "THÔNG TIN"]
+    const styles = {
+      success: ["good", "✓", "THÀNH CÔNG"],
+      error: ["bad", "✕", "LỖI"],
+      warning: ["warn", "!", "CHÚ Ý"],
+      info: ["accent", "•", "THÔNG TIN"]
     };
-    const [color, label] = map[type] || map.info;
-    return `${this.color(color, `[${label}]`)} ${text}`;
+    const [tone, icon, label] = styles[type] || styles.info;
+    return (
+      this.color(tone, `  ${icon} ${label}`) +
+      this.color("muted", "  │  ") +
+      this.color("text", text)
+    );
+  }
+
+  static infoCard(rows, title = "THÔNG TIN") {
+    const width = this._width();
+    const contentWidth = width - 4;
+    const safeRows = Array.isArray(rows) ? rows : [];
+
+    const longestLabel = Math.max(
+      6,
+      ...safeRows.map(([label]) => this._len(label))
+    );
+    const labelWidth = Math.min(
+      longestLabel,
+      16,
+      Math.max(8, Math.floor((contentWidth - 3) / 3))
+    );
+    const valueWidth = contentWidth - labelWidth - 3;
+    const lines = [];
+
+    for (const [label, value, tone = "text"] of safeRows) {
+      const parts = this._wrap(value ?? "-", valueWidth);
+      parts.forEach((part, index) => {
+        const heading = index === 0 ? String(label).toUpperCase() : "";
+        lines.push(
+          this.color("dim", this.fit(heading, labelWidth)) +
+          this.color("muted", " │ ") +
+          this.color(tone, this.fit(part, valueWidth))
+        );
+      });
+    }
+
+    return this._panel(title, lines, width);
+  }
+
+  static options(items, { footer = "Nhập số để lựa chọn", accent = "accent" } = {}) {
+    const width = this._width();
+    const contentWidth = width - 4;
+    const lines = [];
+
+    items.forEach((item, index) => {
+      const badge = `[${item.key}]`;
+      lines.push(
+        this.color(item.color || accent, badge) +
+        " " +
+        this.color(
+          "text",
+          this.fit(item.label || "", Math.max(1, contentWidth - this._len(badge) - 1))
+        )
+      );
+      if (item.description) {
+        lines.push(
+          ...this._wrap(item.description, contentWidth - 2).map(
+            (l) => this.color("dim", `  ${l}`)
+          )
+        );
+      }
+      if (index < items.length - 1) {
+        lines.push(this.color("muted", "─".repeat(contentWidth)));
+      }
+    });
+
+    const panel = this._panel("LỰA CHỌN", lines, width);
+    return footer ? panel + "\n" + this.color("dim", `  ${footer}`) : panel;
   }
 
   static selectionCard(items, title = "ĐÃ CHỌN") {
-    const rows = (items || []).map((item, index) => [
-      String(index + 1).padStart(2, "0"),
-      String(item),
-      "1;32"
-    ]);
-    return rows.length
-      ? this.infoCard(rows, title)
-      : this.message("warning", "Chưa có mục nào được chọn.");
+    if (!items || !items.length) {
+      return this.message("warning", "Chưa có mục nào được chọn.");
+    }
+    return this.infoCard(
+      items.map((item, index) => [
+        String(index + 1).padStart(2, "0"),
+        String(item),
+        "good"
+      ]),
+      title
+    );
   }
 
-  static divider(label = "") {
-    const width = clamp((process.stdout.columns || 72) - 2, 32, 78);
-    const clean = String(label).trim();
-    if (!clean) return this.color("2;37", "─".repeat(width));
-    const tail = Math.max(1, width - clean.length - 3);
-    return this.color("2;37", `── ${clean.toUpperCase()} ${"─".repeat(tail)}`);
+  static progressBar(value, total, size = 14) {
+    const length = Math.max(1, Math.floor(size));
+    const ratio = total > 0 ? clamp(value / total, 0, 1) : 0;
+    const filled = Math.round(ratio * length);
+    return (
+      this.color("accent", "━".repeat(filled)) +
+      this.color("muted", "━".repeat(length - filled))
+    );
   }
 
   static step(current, total, label) {
-    const size = clamp((process.stdout.columns || 60) < 55 ? 10 : 18, 10, 18);
-    return `${this.color("2;37", `BƯỚC ${current}/${total}`)}  ${this.progressBar(current, total, size)}  ${this.color("1;37", label)}`;
+    const size = this._width() < 55 ? 8 : 16;
+    return (
+      this.color("violet", `  ${current}/${total}`) +
+      this.progressBar(current, total, size) +
+      `  ${this.color("text", label)}`
+    );
   }
 
-  static renderTitle() {
-    const colors = [
-      [0, 240, 255],
-      [60, 140, 255],
-      [150, 80, 255],
-      [255, 70, 170]
-    ];
-    const terminalWidth = process.stdout.columns || 72;
-    const compact = terminalWidth < 54;
-
-    try {
-      const titleText = compact
-        ? "REJOIN TOOL"
-        : (figlet ? figlet.textSync("REJOIN", {
-            font: "Small",
-            horizontalLayout: "fitted",
-            verticalLayout: "fitted"
-          }) : "REJOIN TOOL");
-      const subtitle = compact ? "ANDROID CONTROL CENTER" : "ANDROID  •  MULTI INSTANCE  •  LIVE MONITOR";
-      const content = `${titleText}\n${subtitle}`;
-      const rawBox = boxen(content, {
-        padding: 1,
-        borderStyle: "round",
-        align: "center"
-      });
-      return rawBox.split("\n").map((line) => this._applyMultiColorGradient(line, colors)).join("\n");
-    } catch (_) {
-      return this._applyMultiColorGradient("╭────────────────────────────╮\n│        REJOIN TOOL         │\n│   ANDROID CONTROL CENTER   │\n╰────────────────────────────╯", colors);
-    }
-  }
-
+  /** MENU CHÍNH: LUÔN 2 CỘT NGANG (trái 1-4, phải 5-0). */
   static renderMainMenu({ configCount, prefix, webhook, autoexec }) {
-    const c = (code, text) => this.color(code, text);
-    const terminalWidth = process.stdout.columns || 72;
-    const twoColumns = terminalWidth >= 64;
-    const menuItems = [
-      ["1", "Bắt đầu Auto Rejoin", "Theo dõi và tự động vào lại game", "1;36"],
-      ["2", "Thiết lập package", "Quét và thêm tài khoản Roblox", "1;36"],
-      ["3", "Chỉnh sửa cấu hình", "Game, delay và private server", "1;36"],
-      ["4", "Prefix package", "Thiết lập tên package tùy chỉnh", "1;34"],
-      ["5", "Activity Roblox", "Tự dò hoặc cấu hình activity", "1;34"],
-      ["6", "Webhook Discord", "Báo cáo trạng thái định kỳ", "1;35"],
-      ["7", "Autoexec", "Quản lý script executor", "1;35"],
-      ["0", "Thoát chương trình", "Dừng an toàn và tắt wake lock", "1;31"]
+    const width = this._width();
+    const contentWidth = width - 4;
+    const leftWidth = Math.floor((width - 3) / 2);
+    const rightWidth = width - 3 - leftWidth;
+    const showDesc = Math.min(leftWidth, rightWidth) >= 27;
+    const B = (text) => this.color("border", text);
+
+    const leftItems = [
+      ["1", "Chạy Rejoin", "Theo dõi và tự vào lại game", "good"],
+      ["2", "Thiết lập", "Quét và thêm tài khoản", "accent"],
+      ["3", "Cấu hình", "Game, delay, private server", "blue"],
+      ["4", "Prefix", "Tên package Roblox", "violet"]
     ];
 
-    const badge = (label, value, active = true) =>
-      `${c("2;37", label)} ${active ? c("1;32", value) : c("1;31", value)}`;
-    const status = [
-      badge("CFG", String(configCount), configCount > 0),
-      badge("PREFIX", prefix || "CHƯA ĐẶT", Boolean(prefix)),
-      badge("WEBHOOK", webhook && webhook.enabled ? "BẬT" : "TẮT", Boolean(webhook && webhook.enabled)),
-      badge("AUTOEXEC", autoexec ? autoexec.executor : "TẮT", Boolean(autoexec))
+    const rightItems = [
+      ["5", "Activity", "Mặc định hoặc tùy chỉnh", "violet"],
+      ["6", "Webhook", "Báo cáo trạng thái Discord", "accent"],
+      ["7", "Autoexec", "Quản lý script executor", "warn"],
+      ["0", "Thoát", "Dừng tool và tắt wake lock", "bad"]
     ];
 
-    const renderCell = ([key, label, desc, color], width) => {
-      const labelWidth = Math.max(10, width - 6);
-      const descWidth = Math.max(10, width - 5);
-      return [
-        ` ${c(color, ` ${key} `)}  ${c("1;37", this.fit(label, labelWidth))}`,
-        `     ${c("2;37", this.fit(desc, descWidth))}`
-      ];
-    };
+    const meta = [
+      ...this._wrap(
+        `CẤU HÌNH: ${configCount}  /  ${configCount > 0 ? "ĐÃ THIẾT LẬP" : "CHƯA THIẾT LẬP"}`,
+        contentWidth
+      ).map((l) => this.color(configCount > 0 ? "good" : "warn", l)),
+      ...this._wrap(`PREFIX: ${prefix || "com.roblox"}`, contentWidth)
+        .map((l) => this.color("dim", l)),
+      ...this._wrap(
+        `WEBHOOK: ${webhook?.enabled ? "BẬT" : "TẮT"}  /  AUTOEXEC: ${autoexec?.executor || "TẮT"}`,
+        contentWidth
+      ).map((l) => this.color("violet", l))
+    ];
 
-    const lines = [];
-    if (twoColumns) {
-      const cellWidth = clamp(Math.floor((terminalWidth - 3) / 2), 30, 44);
-      const rule = "─".repeat(cellWidth);
-      lines.push(c("1;34", `╭${rule}┬${rule}╮`));
-      for (let i = 0; i < 4; i++) {
-        const left = renderCell(menuItems[i], cellWidth);
-        const right = renderCell(menuItems[i + 4], cellWidth);
-        lines.push(`${c("1;34", "│")}${left[0]}${c("1;34", "│")}${right[0]}${c("1;34", "│")}`);
-        lines.push(`${c("1;34", "│")}${left[1]}${c("1;34", "│")}${right[1]}${c("1;34", "│")}`);
-        if (i < 3) lines.push(c("1;34", `├${rule}┼${rule}┤`));
+    const cell = ([key, label, description, tone], w) => [
+      ` ${this.color(tone, `[${key}]`)} ${this.color("text", this.fit(label, Math.max(1, w - 6)))} `,
+      this.color("dim", ` ${this.fit(description, Math.max(1, w - 2))} `)
+    ];
+
+    const ruleL = "─".repeat(leftWidth);
+    const ruleR = "─".repeat(rightWidth);
+    const lines = [
+      this._panel("TỔNG QUAN", meta, width),
+      "",
+      B(`╭${ruleL}┬${ruleR}╮`)
+    ];
+
+    for (let i = 0; i < leftItems.length; i++) {
+      const l = cell(leftItems[i], leftWidth);
+      const r = cell(rightItems[i], rightWidth);
+      lines.push(`${B("│")}${l[0]}${B("│")}${r[0]}${B("│")}`);
+      if (showDesc) {
+        lines.push(`${B("│")}${l[1]}${B("│")}${r[1]}${B("│")}`);
       }
-      lines.push(c("1;34", `╰${rule}┴${rule}╯`));
-    } else {
-      const cellWidth = clamp(terminalWidth - 2, 30, 48);
-      const rule = "─".repeat(cellWidth);
-      lines.push(c("1;34", `╭${rule}╮`));
-      menuItems.forEach((item, index) => {
-        const cell = renderCell(item, cellWidth);
-        lines.push(`${c("1;34", "│")}${cell[0]}${c("1;34", "│")}`);
-        lines.push(`${c("1;34", "│")}${cell[1]}${c("1;34", "│")}`);
-        if (index < menuItems.length - 1) lines.push(c("1;34", `├${rule}┤`));
-      });
-      lines.push(c("1;34", `╰${rule}╯`));
+      if (i < leftItems.length - 1) {
+        lines.push(B(`├${ruleL}┼${ruleR}┤`));
+      }
     }
 
-    const statusLine = terminalWidth >= 76
-      ? status.join(c("2;37", "  │  "))
-      : `${status.slice(0, 2).join(c("2;37", "  │  "))}\n${status.slice(2).join(c("2;37", "  │  "))}`;
-
-    return `${this.renderSection("Bảng điều khiển", "Trạng thái hệ thống")}\n${statusLine}\n\n${lines.join("\n")}\n${c("2;37", "Dùng phím số để chọn  •  Q hoặc 0 để thoát")}`;
+    lines.push(B(`╰${ruleL}┴${ruleR}╯`));
+    lines.push(this.color("dim", "  Nhập số để chọn • 0 / Q để thoát"));
+    return lines.join("\n");
   }
 
-  static calculateOptimalColumnWidths() {
-    const terminalWidth = process.stdout.columns || 120;
-    const availableWidth = terminalWidth - 10;
+  static _cpuSample = null;
 
-    const minWidths = {
-      package: 15,
-      user: 8,
-      status: 8,
-      info: 15,
-      time: 8,
-      delay: 6
-    };
+  static getSystemStats() {
+    let cpus = [];
+    try {
+      cpus = os.cpus() || [];
+    } catch (_) { }
 
-    const totalMinWidth = Object.values(minWidths).reduce((sum, width) => sum + width, 0);
+    const idle = cpus.reduce((s, c) => s + c.times.idle, 0);
+    const total = cpus.reduce(
+      (s, c) => s + Object.values(c.times).reduce((a, b) => a + b, 0),
+      0
+    );
 
-    if (availableWidth <= totalMinWidth) {
-      return {
-        package: 14,
-        user: 6,
-        status: 6,
-        info: 12,
-        time: 6,
-        delay: 4
-      };
+    const now = Date.now();
+    const prev = this._cpuSample;
+    let usage = prev ? prev.usage : 0;
+
+    if (!prev || now - prev.at >= 1000) {
+      const dTotal = prev ? total - prev.total : total;
+      const dIdle = prev ? idle - prev.idle : idle;
+      if (dTotal > 0) {
+        usage = clamp(100 * (1 - dIdle / dTotal), 0, 100);
+      }
+      this._cpuSample = { idle, total, usage, at: now };
     }
 
-    const extraSpace = availableWidth - totalMinWidth;
+    const totalMem = os.totalmem();
+    const usedMem = Math.max(0, totalMem - os.freemem());
+    const gb = (v) => (v / (1024 ** 3)).toFixed(2);
 
     return {
-      package: minWidths.package + Math.floor(extraSpace * 0.28),
-      user: minWidths.user + Math.floor(extraSpace * 0.18),
-      status: minWidths.status + Math.floor(extraSpace * 0.12),
-      info: minWidths.info + Math.floor(extraSpace * 0.3),
-      time: minWidths.time + Math.floor(extraSpace * 0.06),
-      delay: minWidths.delay + Math.floor(extraSpace * 0.06)
+      cpuUsage: usage.toFixed(1),
+      ramUsage: `${gb(usedMem)} / ${gb(totalMem)} GB`
     };
   }
 
-  static renderMultiInstanceTable(instances, startTime = null) {
-    const stats = this.getSystemStats();
-    const colWidths = this.calculateOptimalColumnWidths();
-    const terminalWidth = process.stdout.columns || 120;
-    const uptimeMs = startTime ? Date.now() - startTime : 0;
-    const hours = Math.floor(uptimeMs / 3600000);
-    const minutes = Math.floor((uptimeMs % 3600000) / 60000);
-    const seconds = Math.floor((uptimeMs % 60000) / 1000);
-    const uptime = `${hours}h ${minutes}m ${seconds}s`;
-    const online = instances.filter((x) => x.status === "Online [+]").length;
-    const errors = instances.filter((x) => x.status === "Lỗi mạng").length;
-    const rejoins = instances.reduce((sum, x) => sum + (x.rejoinCount || 0), 0);
-    const divider = this.color("2;37", "  │  ");
-    const summaryItems = [
-      this.color("1;36", `CPU ${stats.cpuUsage}%`),
-      this.color("1;36", `RAM ${stats.ramUsage}`),
-      this.color("1;32", `ONLINE ${online}/${instances.length}`),
-      this.color(errors ? "1;31" : "2;37", `LỖI ${errors}`),
-      this.color("1;33", `REJOIN ${rejoins}`),
-      this.color("2;37", `UPTIME ${uptime}`)
-    ];
-    const summary = terminalWidth < 76
-      ? `${summaryItems.slice(0, 3).join(divider)}\n${summaryItems.slice(3).join(divider)}`
-      : summaryItems.join(divider);
-    const health = `${this.color("2;37", "SỨC KHỎE ")}${this.progressBar(online, instances.length, terminalWidth < 70 ? 8 : 16)} ${online}/${instances.length}`;
+  static _statusTone(status) {
+    const v = String(status || "");
+    if (v === "Online [+]" || v === "Trong game") return "good";
+    if (v === "Offline" || v === "Sai map") return "bad";
+    if (v === "Lỗi mạng") return "warn";
+    if (v.includes("Khởi tạo") || v === "Đang xác nhận") return "accent";
+    return "violet";
+  }
 
-    if (terminalWidth < 76) {
-      const cards = instances.map((instance, index) => {
-        const rawUsername = instance.config.username || instance.user.username || "Unknown";
-        const username = Utils.maskSensitiveInfo(rawUsername);
-        const delay = this.formatCountdown(Number(instance.countdownSeconds) || 0);
-        return [
-          `${this.color("1;34", `╭─ INSTANCE ${String(index + 1).padStart(2, "0")} `)}${this.color("2;37", "─".repeat(16))}`,
-          `${this.color("1;37", Utils.packageLabel(instance.packageName))}  ${this.color("2;37", username)}`,
-          `${this.statusColor(instance.status)}  ${this.color("1;36", `Kiểm tra: ${delay}`)}`,
-          this.color("2;37", instance.info),
-          this.color("1;34", "╰" + "─".repeat(30))
-        ].join("\n");
-      }).join("\n");
-      return `${summary}\n${health}\n\n${cards}`;
-    }
-
-    const table = new Table({
-      head: ["PACKAGE", "USER", "TRẠNG THÁI", "THÔNG TIN", "CẬP NHẬT", "KIỂM TRA"],
-      colWidths: [colWidths.package, colWidths.user, colWidths.status, colWidths.info, colWidths.time, colWidths.delay],
-      wordWrap: true,
-      chars: { top: "─", "top-mid": "┬", "top-left": "╭", "top-right": "╮", bottom: "─", "bottom-mid": "┴", "bottom-left": "╰", "bottom-right": "╯", left: "│", "left-mid": "├", mid: "─", "mid-mid": "┼", right: "│", "right-mid": "┤", middle: "│" },
-      style: { head: ["cyan"], border: ["blue"], compact: false }
-    });
-
-    instances.forEach((instance) => {
-      const rawUsername = instance.config.username || instance.user.username || "Unknown";
-      table.push([
-        Utils.packageLabel(instance.packageName),
-        Utils.maskSensitiveInfo(rawUsername),
-        this.statusColor(instance.status),
-        instance.info,
-        new Date().toLocaleTimeString(),
-        this.color("1;36", this.formatCountdown(Number(instance.countdownSeconds) || 0))
-      ]);
-    });
-
-    return `${summary}\n${health}\n\n${table.toString()}`;
+  static statusColor(status) {
+    return this.color(this._statusTone(status), String(status || "Không rõ"));
   }
 
   static formatCountdown(seconds) {
-    return seconds >= 60
-      ? `${Math.floor(seconds / 60)}m ${seconds % 60}s`
-      : `${seconds}s`;
+    const n = Number(seconds);
+    const v = Number.isFinite(n) ? Math.max(0, Math.floor(n)) : 0;
+    if (v >= 3600) {
+      return `${Math.floor(v / 3600)}h ${Math.floor((v % 3600) / 60)}m`;
+    }
+    if (v >= 60) {
+      return `${Math.floor(v / 60)}m ${String(v % 60).padStart(2, "0")}s`;
+    }
+    return `${v}s`;
   }
 
-  static displayConfiguredPackages(configs) {
-    const terminalWidth = process.stdout.columns || 90;
-    const wide = terminalWidth >= 76;
+  static _clock(ts) {
+    if (!ts) return "--:--:--";
+    const d = new Date(Number(ts));
+    if (!Number.isFinite(d.getTime())) return "--:--:--";
+    const p = (x) => String(x).padStart(2, "0");
+    return `${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`;
+  }
+
+  static _table(head, rows, weights, width) {
+    const budget = Math.max(30, width - 2 * (head.length + 1));
+    let remaining = budget;
+    const colWidths = weights.map((w, i) => {
+      if (i === weights.length - 1) return Math.max(4, remaining);
+      const size = Math.floor(budget * w);
+      remaining -= size;
+      return size;
+    });
+
+    const useColor =
+      process.env.NO_COLOR === undefined &&
+      (process.stdout.isTTY || Boolean(process.env.FORCE_COLOR));
+
     const table = new Table({
-      head: ["STT", "PACKAGE", "TÀI KHOẢN", "GAME", "NHỊP QUÉT"],
-      colWidths: wide ? [6, 22, 17, 24, 12] : [5, 15, 12, 17, 10],
+      head: head.map((h) => this.color("accent", h)),
+      colWidths,
       wordWrap: true,
-      chars: { top: "─", "top-mid": "┬", "top-left": "╭", "top-right": "╮", bottom: "─", "bottom-mid": "┴", "bottom-left": "╰", "bottom-right": "╯", left: "│", "left-mid": "├", mid: "─", "mid-mid": "┼", right: "│", "right-mid": "┤", middle: "│" },
+      chars: {
+        top: "─", "top-mid": "┬", "top-left": "╭", "top-right": "╮",
+        bottom: "─", "bottom-mid": "┴", "bottom-left": "╰", "bottom-right": "╯",
+        left: "│", "left-mid": "├", mid: "─", "mid-mid": "┼",
+        right: "│", "right-mid": "┤", middle: "│"
+      },
       style: {
-        head: ["cyan"],
-        border: ["blue"]
+        head: [],
+        border: useColor ? ["blue"] : [],
+        "padding-left": 1,
+        "padding-right": 1
       }
     });
 
-    let index = 1;
-    for (const [packageName, config] of Object.entries(configs)) {
-      const packageDisplay = Utils.packageLabel(packageName);
+    rows.forEach((row) => table.push(row));
+    return table.toString();
+  }
 
+  static renderMultiInstanceTable(instances, startTime = null) {
+    const width = this._width(118);
+    const contentWidth = width - 4;
+    const stats = this.getSystemStats();
 
-      const maskedUsername = Utils.maskSensitiveInfo(config.username);
+    const inGame = instances.filter(
+      (x) => x.status === "Online [+]" || x.status === "Trong game"
+    ).length;
+    const errors = instances.filter((x) => x.status === "Lỗi mạng").length;
+    const rejoins = instances.reduce(
+      (s, x) => s + (Number(x.rejoinCount) || 0),
+      0
+    );
 
-      table.push([
-        index.toString(),
-        packageDisplay,
-        maskedUsername,
-        config.gameName || 'Unknown',
-        `${config.delaySec}s`
-      ]);
-      index++;
+    const uptime = startTime
+      ? Math.max(0, Math.floor((Date.now() - startTime) / 1000))
+      : 0;
+    const h = Math.floor(uptime / 3600);
+    const m = Math.floor((uptime % 3600) / 60);
+    const s = uptime % 60;
+
+    const summary = this._panel("SYSTEM / LIVE", [
+      ...this._wrap(
+        `CPU ${stats.cpuUsage}%  •  RAM ${stats.ramUsage}`,
+        contentWidth
+      ).map((l) => this.color("accent", l)),
+      ...this._wrap(
+        `REJOIN ${rejoins}  •  LỖI MẠNG ${errors}`,
+        contentWidth
+      ).map((l) => this.color(errors > 0 ? "warn" : "violet", l)),
+      this.color("dim", `UPTIME ${h}h ${m}m ${s}s`),
+      this.progressBar(
+        inGame,
+        instances.length,
+        Math.min(18, Math.max(6, width - 26))
+      ) + `  ${this.color("good", `${inGame}/${instances.length} trong game`)}`
+    ], width);
+
+    if (!instances.length) {
+      return summary + "\n" + this.message("warning", "Chưa có instance đang chạy.");
     }
 
-    return table.toString();
+    // Màn hình hẹp: dùng thẻ thay vì bảng, tránh tràn cột.
+    if (width < 96) {
+      const cards = instances.map((instance, index) => {
+        const config = instance.config || {};
+        const username =
+          config.username ||
+          (instance.user && instance.user.username) ||
+          "Unknown";
+        return this.infoCard(
+          [
+            ["Package", Utils.packageLabel(instance.packageName), "accent"],
+            ["Tài khoản", Utils.maskSensitiveInfo(username)],
+            ["Trạng thái", instance.status || "Không rõ", this._statusTone(instance.status)],
+            ["Thông tin", instance.info || "-", "dim"],
+            ["Kiểm tra", this.formatCountdown(instance.countdownSeconds), "violet"],
+            ["Cập nhật", this._clock(instance.lastCheck), "dim"],
+            ["Rejoin", String(instance.rejoinCount || 0), "warn"]
+          ],
+          `INSTANCE ${String(index + 1).padStart(2, "0")}`
+        );
+      });
+      return summary + "\n\n" + cards.join("\n\n");
+    }
+
+    const rows = instances.map((instance) => {
+      const username =
+        (instance.config && instance.config.username) ||
+        (instance.user && instance.user.username) ||
+        "Unknown";
+      return [
+        Utils.packageLabel(instance.packageName),
+        Utils.maskSensitiveInfo(username),
+        this.statusColor(instance.status),
+        instance.info || "-",
+        this._clock(instance.lastCheck),
+        this.color("violet", this.formatCountdown(instance.countdownSeconds))
+      ];
+    });
+
+    return (
+      summary +
+      "\n\n" +
+      this._table(
+        ["PACKAGE", "USER", "TRẠNG THÁI", "THÔNG TIN", "CẬP NHẬT", "QUÉT SAU"],
+        rows,
+        [0.18, 0.12, 0.19, 0.27, 0.13, 0.11],
+        width
+      )
+    );
+  }
+
+  static displayConfiguredPackages(configs) {
+    const entries = Object.entries(configs || {});
+    const width = this._width(118);
+
+    if (!entries.length) {
+      return this.message("warning", "Chưa có cấu hình nào.");
+    }
+
+    if (width < 96) {
+      return entries
+        .map(([packageName, config], index) => {
+          const c = config || {};
+          return this.infoCard(
+            [
+              ["Package", Utils.packageLabel(packageName), "accent"],
+              ["Tài khoản", Utils.maskSensitiveInfo(c.username || "Unknown")],
+              ["Game", c.gameName || "Chưa đặt", "violet"],
+              ["Place ID", c.placeId || "-", "dim"],
+              ["Nhịp quét", c.delaySec ? `${c.delaySec} giây` : "Chưa đặt"],
+              ["Server VIP", c.linkCode ? "ĐÃ CẤU HÌNH" : "KHÔNG", c.linkCode ? "good" : "dim"]
+            ],
+            `CẤU HÌNH ${String(index + 1).padStart(2, "0")}`
+          );
+        })
+        .join("\n\n");
+    }
+
+    const rows = entries.map(([packageName, config], index) => {
+      const c = config || {};
+      return [
+        String(index + 1).padStart(2, "0"),
+        Utils.packageLabel(packageName),
+        Utils.maskSensitiveInfo(c.username || "Unknown"),
+        `${c.gameName || "Chưa đặt"}  (${c.placeId || "-"})`,
+        c.delaySec ? `${c.delaySec}s` : "-",
+        this.color(c.linkCode ? "good" : "dim", c.linkCode ? "CÓ" : "KHÔNG")
+      ];
+    });
+
+    return this._table(
+      ["#", "PACKAGE", "TÀI KHOẢN", "GAME / PLACE ID", "NHỊP QUÉT", "VIP"],
+      rows,
+      [0.05, 0.23, 0.17, 0.35, 0.10, 0.10],
+      width
+    );
   }
 }
 
@@ -2512,18 +2691,14 @@ class MultiRejoinTool {
       return;
     }
 
-
-
     const configEditor = new ConfigEditor();
     const success = await configEditor.startEdit(rl);
 
     if (success) {
-
       console.log(UIRenderer.message("info", "Đang quay lại bảng điều khiển..."));
       await new Promise(resolve => setTimeout(resolve, 2000));
       return;
     } else {
-
       await new Promise(resolve => setTimeout(resolve, 2000));
       return;
     }
@@ -2532,7 +2707,6 @@ class MultiRejoinTool {
   async setupWebhook(rl) {
     const webhookManager = new WebhookManager();
     await webhookManager.setupWebhook(rl);
-
 
     console.log(UIRenderer.message("info", "Đang quay lại bảng điều khiển..."));
     await sleep(900);
@@ -2627,7 +2801,6 @@ class MultiRejoinTool {
       }
 
     } else if (choice.trim() === "4") {
-
       console.log(UIRenderer.message("info", "Đang quay lại bảng điều khiển..."));
       await new Promise(resolve => setTimeout(resolve, 2000));
       return;
@@ -2635,89 +2808,84 @@ class MultiRejoinTool {
       console.log(UIRenderer.message("error", "Lựa chọn không hợp lệ."));
     }
 
-
     console.log(UIRenderer.message("info", "Đang quay lại bảng điều khiển..."));
     await sleep(900);
     return;
   }
 
+  /**
+   * MỤC 5 — ACTIVITY ROBLOX
+   * Không còn chế độ tự dò / cache.
+   * Chỉ có 2 chế độ: TÙY CHỈNH (nhập tay) hoặc MẶC ĐỊNH theo prefix.
+   */
   async configureActivity(rl) {
-    UIRenderer.screen("Activity Roblox", "Điểm khởi chạy ứng dụng");
+    while (true) {
+      const prefix = Utils.loadPackagePrefixConfig();
+      const defaultActivity = `${prefix}.client.ActivityProtocolLaunch`;
+      const customActivity = Utils.loadActivityConfig();
+      const effective = customActivity || defaultActivity;
 
-    const currentActivity = Utils.loadActivityConfig();
-    const currentPrefix = Utils.loadPackagePrefixConfig();
-    console.log(UIRenderer.infoCard([
-      ["Chế độ", currentActivity ? "TÙY CHỈNH" : "TỰ ĐỘNG DÒ", currentActivity ? "1;33" : "1;32"],
-      ["Activity", currentActivity || "resolve-activity / dumpsys"],
-      ["Prefix", currentPrefix]
-    ], "CẤU HÌNH ACTIVITY"));
-    if (!currentActivity) {
-      console.log(UIRenderer.message("info", "Chế độ tự động dò được khuyến nghị và sẽ ghi nhớ activity hoạt động."));
-    }
+      UIRenderer.screen("Activity Roblox", "Thiết lập điểm khởi chạy");
 
-    console.log(UIRenderer.options([
-      { key: "1", label: "Thay đổi activity", description: "Nhập tên activity thủ công" },
-      { key: "2", label: "Bật tự động dò", description: "Xóa activity tùy chỉnh", color: "1;32" },
-      { key: "3", label: "Quay lại", description: "Trở về bảng điều khiển", color: "1;31" }
-    ]));
-
-    const choice = await Utils.ask(rl, UIRenderer.prompt("Lựa chọn [1-3]"));
-
-    if (choice.trim() === "1") {
       console.log(UIRenderer.infoCard([
-        ["Ví dụ 1", `${currentPrefix}.client.ActivityProtocolLaunch`],
-        ["Ví dụ 2", `${currentPrefix}.client.vnggames.ActivityProtocolLaunch`],
-        ["Lưu ý", "Activity phải khớp package", "1;33"]
-      ], "NHẬP ACTIVITY THỦ CÔNG"));
+        ["Chế độ", customActivity ? "TÙY CHỈNH" : "MẶC ĐỊNH", customActivity ? "1;33" : "1;32"],
+        ["Prefix", prefix],
+        ["Tự dò", "ĐÃ TẮT", "2;37"]
+      ], "CẤU HÌNH HIỆN TẠI"));
 
-      let newActivity;
-      while (true) {
-        newActivity = await Utils.ask(rl, UIRenderer.prompt("Activity mới"));
-        if (newActivity.trim()) {
-          break;
+      console.log(UIRenderer.message("info", `Activity đang dùng: ${effective}`));
+
+      console.log(UIRenderer.options([
+        { key: "1", label: "Thay đổi activity", description: "Nhập tên class activity thủ công", color: "1;36" },
+        { key: "2", label: "Khôi phục mặc định", description: "Dùng ActivityProtocolLaunch theo prefix", color: "1;32" },
+        { key: "0", label: "Quay lại", description: "Trở về menu chính", color: "1;31" }
+      ], { footer: "Không tự dò • Không dùng cache activity", accent: "1;35" }));
+
+      const choice = (await Utils.ask(rl, UIRenderer.prompt("Lựa chọn [0-2]"))).trim();
+
+      if (choice === "0" || choice.toLowerCase() === "q") {
+        console.log(UIRenderer.message("info", "Đang quay lại bảng điều khiển..."));
+        await sleep(900);
+        return;
+      }
+
+      if (choice === "1") {
+        console.log(UIRenderer.message("info", `Ví dụ: ${defaultActivity}`));
+        let activity = "";
+        while (true) {
+          activity = (await Utils.ask(rl, UIRenderer.prompt("Activity mới"))).trim();
+          if (activity) break;
+          console.log(UIRenderer.message("error", "Activity không được để trống."));
         }
-        console.log(UIRenderer.message("error", "Activity không được để trống."));
+        // Chỉ nhận tên class Java đầy đủ (vd: com.roblox.client.ActivityProtocolLaunch)
+        if (!/^[A-Za-z_$][\w$]*(\.[A-Za-z_$][\w$]*)+$/.test(activity)) {
+          console.log(UIRenderer.message("error", "Tên activity không hợp lệ. Nhập tên class đầy đủ, không có dấu / hoặc khoảng trắng."));
+          await sleep(1600);
+          continue;
+        }
+        const saved = Utils.saveActivityConfig(activity);
+        console.log(UIRenderer.message(
+          saved ? "success" : "error",
+          saved ? `Đã lưu activity: ${activity}` : "Không thể lưu activity."
+        ));
+        await sleep(1400);
+        continue;
       }
 
-      const saved = Utils.saveActivityConfig(newActivity.trim());
-      console.log(UIRenderer.infoCard([
-        ["Chế độ", "TÙY CHỈNH", saved ? "1;33" : "1;31"],
-        ["Activity", newActivity.trim()],
-        ["Phạm vi", "Tất cả package"],
-        ["Kết quả", saved ? "ĐÃ CẬP NHẬT" : "THẤT BẠI", saved ? "1;32" : "1;31"]
-      ], "ACTIVITY ROBLOX"));
-
-    } else if (choice.trim() === "2") {
-      if (currentActivity) {
+      if (choice === "2") {
         const saved = Utils.saveActivityConfig(null);
-        console.log(UIRenderer.infoCard([
-          ["Chế độ", saved ? "TỰ ĐỘNG DÒ" : "TÙY CHỈNH", saved ? "1;32" : "1;31"],
-          ["Activity cũ", currentActivity],
-          ["Kết quả", saved ? "ĐÃ CHUYỂN CHẾ ĐỘ" : "THẤT BẠI", saved ? "1;32" : "1;31"]
-        ], "ACTIVITY ROBLOX"));
-      } else {
-        console.log(UIRenderer.infoCard([
-          ["Chế độ", "TỰ ĐỘNG DÒ", "1;32"],
-          ["Kết quả", "KHÔNG CẦN THAY ĐỔI"]
-        ], "ACTIVITY ROBLOX"));
+        console.log(UIRenderer.message(
+          saved ? "success" : "error",
+          saved ? `Đã khôi phục mặc định: ${defaultActivity}` : "Không thể khôi phục mặc định."
+        ));
+        await sleep(1400);
+        continue;
       }
 
-    } else if (choice.trim() === "3") {
-
-      console.log(UIRenderer.message("info", "Đang quay lại bảng điều khiển..."));
-      await new Promise(resolve => setTimeout(resolve, 2000));
-      return;
-    } else {
-      console.log(UIRenderer.message("error", "Lựa chọn không hợp lệ."));
+      console.log(UIRenderer.message("warning", "Lựa chọn không hợp lệ."));
+      await sleep(900);
     }
-
-
-    console.log(UIRenderer.message("info", "Đang quay lại bảng điều khiển..."));
-    await sleep(900);
-    return;
   }
-
-
 
   async startAutoRejoin(rl) {
     UIRenderer.screen("Khởi động Auto Rejoin", "Chọn instance cần chạy");
@@ -2732,17 +2900,7 @@ class MultiRejoinTool {
       return;
     }
 
-
-    console.log(UIRenderer.message("info", "Đang kiểm tra toàn vẹn hệ thống..."));
-    const isValid = Utils.validatePackageIntegrity(configs);
-
-    if (!isValid) {
-      console.log(UIRenderer.message("warning", "Sẽ quay lại bảng điều khiển sau 5 giây."));
-      await new Promise(resolve => setTimeout(resolve, 5000));
-      return;
-    }
-
-
+    // (Đã bỏ bước kiểm tra tính toàn vẹn — chạy luôn vào phần chọn package)
 
     console.log(UIRenderer.renderSection("Danh sách cấu hình", `${Object.keys(configs).length} package sẵn sàng`));
     console.log(UIRenderer.displayConfiguredPackages(configs));
@@ -2829,15 +2987,15 @@ class MultiRejoinTool {
       return;
     }
 
-      const webhookConfig = Utils.loadWebhookConfig();
-      const autoexecConfig = new AutoexecManager().loadConfig();
-      console.log(UIRenderer.infoCard([
-        ["Instance", String(this.instances.length), "1;32"],
-        ["Trạng thái", "SẴN SÀNG", "1;32"],
-        ["Webhook", webhookConfig && webhookConfig.enabled ? "ĐANG BẬT" : "ĐANG TẮT", webhookConfig && webhookConfig.enabled ? "1;32" : "2;37"],
-        ["Autoexec", autoexecConfig ? autoexecConfig.executor : "ĐANG TẮT", autoexecConfig ? "1;32" : "2;37"],
-        ["Khởi động", "Sau 3 giây"]
-      ], "AUTO REJOIN"));
+    const webhookConfig = Utils.loadWebhookConfig();
+    const autoexecConfig = new AutoexecManager().loadConfig();
+    console.log(UIRenderer.infoCard([
+      ["Instance", String(this.instances.length), "1;32"],
+      ["Trạng thái", "SẴN SÀNG", "1;32"],
+      ["Webhook", webhookConfig && webhookConfig.enabled ? "ĐANG BẬT" : "ĐANG TẮT", webhookConfig && webhookConfig.enabled ? "1;32" : "2;37"],
+      ["Autoexec", autoexecConfig ? autoexecConfig.executor : "ĐANG TẮT", autoexecConfig ? "1;32" : "2;37"],
+      ["Khởi động", "Sau 3 giây"]
+    ], "AUTO REJOIN"));
     await new Promise(resolve => setTimeout(resolve, 3000));
 
     this.isRunning = true;
@@ -2866,7 +3024,6 @@ class MultiRejoinTool {
         autoexecManager.checkAndFix(autoexecConfig);
         nextAutoexecCheck = now + 15 * 60 * 1000;
       }
-
 
       const dueInstances = [];
       for (const instance of this.instances) {
@@ -2936,7 +3093,6 @@ class MultiRejoinTool {
         instance.notInGame = analysis.status !== "Online [+]";
       }
 
-
       if (webhookConfig && webhookConfig.enabled && webhookIntervalMs && Date.now() >= nextWebhookAt) {
         console.log(`\n Đang gửi webhook status...`);
         try {
@@ -2988,7 +3144,6 @@ class MultiRejoinTool {
       await sleep(1000);
     }
   }
-
 }
 
 class WebhookManager {
@@ -3467,66 +3622,7 @@ class ConfigEditor {
   }
 
   renderConfigTable() {
-    try {
-      const terminalWidth = process.stdout.columns || 110;
-      const table = new Table({
-        head: ["STT", "PACKAGE", "TÀI KHOẢN", "DELAY", "GAME ID", "TÊN GAME", "SERVER VIP"],
-        colWidths: terminalWidth >= 100
-          ? [5, 20, 15, 9, 16, 21, 14]
-          : [5, 15, 11, 8, 13, 16, 11],
-        wordWrap: true,
-        chars: { top: "─", "top-mid": "┬", "top-left": "╭", "top-right": "╮", bottom: "─", "bottom-mid": "┴", "bottom-left": "╰", "bottom-right": "╯", left: "│", "left-mid": "├", mid: "─", "mid-mid": "┼", right: "│", "right-mid": "┤", middle: "│" },
-        style: {
-          head: ["cyan"],
-          border: ["blue"]
-        }
-      });
-
-      let index = 1;
-      for (const [packageName, config] of Object.entries(this.configs)) {
-        try {
-          const packageDisplay = Utils.packageLabel(packageName, ' ');
-
-
-          const maskedUsername = Utils.maskSensitiveInfo(config.username);
-
-
-          const delayDisplay = `${config.delaySec || 'Unknown'}s`;
-
-
-          const serverLink = config.linkCode ? `Có ` : `Không [-]`;
-
-          table.push([
-            index.toString(),
-            packageDisplay,
-            maskedUsername,
-            delayDisplay,
-            config.placeId || 'Unknown',
-            config.gameName || 'Unknown',
-            serverLink
-          ]);
-          index++;
-        } catch (error) {
-          console.log(`⚠️ Lỗi khi xử lý config ${packageName}: ${error.message}`);
-
-          table.push([
-            index.toString(),
-            packageName,
-            'Error',
-            'Error',
-            'Error',
-            'Error',
-            'Error'
-          ]);
-          index++;
-        }
-      }
-
-      return table.toString();
-    } catch (error) {
-      console.log(`[-] Lỗi khi tạo bảng config: ${error.message}`);
-      return "[-] Không thể hiển thị bảng config";
-    }
+    return UIRenderer.displayConfiguredPackages(this.configs);
   }
 }
 
