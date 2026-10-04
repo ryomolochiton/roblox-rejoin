@@ -126,7 +126,6 @@ const PREFIX_CONFIG_PATH = cfgPath("package_prefix_config.json");
 const ACTIVITY_CONFIG_PATH = cfgPath("activity_config.json");
 const AUTOEXEC_CONFIG_PATH = cfgPath("autoexec_config.json");
 const LAUNCH_ACTIVITY_CACHE_PATH = cfgPath("launch_activity_cache.json");
-const BACKUP_DIR = cfgPath("backups");
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 const clamp = (value, min, max) => Math.max(min, Math.min(max, value));
@@ -186,21 +185,6 @@ class Utils {
     const tempPath = `${filePath}.${process.pid}.tmp`;
     fs.writeFileSync(tempPath, JSON.stringify(value, null, 2), { encoding: "utf8", mode: 0o600 });
     fs.renameSync(tempPath, filePath);
-  }
-
-  /** Tạo bản sao toàn bộ cấu hình hiện có. */
-  static backupConfigs() {
-    const stamp = new Date().toISOString().replace(/[:.]/g, "-");
-    const destination = path.join(BACKUP_DIR, stamp);
-    fs.mkdirSync(destination, { recursive: true, mode: 0o700 });
-    let copied = 0;
-    for (const name of CONFIG_FILENAMES) {
-      const source = cfgPath(name);
-      if (!fs.existsSync(source)) continue;
-      fs.copyFileSync(source, path.join(destination, name));
-      copied++;
-    }
-    return { destination, copied };
   }
 
   // Termux PREFIX
@@ -801,9 +785,10 @@ class Utils {
   static saveMultiConfigs(configs) {
     try {
       Utils.writeJsonAtomic(CONFIG_PATH, configs);
-      console.log(`[+] Đã lưu multi configs tại ${CONFIG_PATH}`);
+      return true;
     } catch (e) {
-      console.error(`[-] Không thể lưu configs: ${e.message}`);
+      console.error(UIRenderer.message("error", `Không thể lưu cấu hình: ${e.message}`));
+      return false;
     }
   }
 
@@ -820,9 +805,10 @@ class Utils {
   static saveWebhookConfig(config) {
     try {
       Utils.writeJsonAtomic(WEBHOOK_CONFIG_PATH, config);
-      console.log(`[+] Đã lưu webhook config tại ${WEBHOOK_CONFIG_PATH}`);
+      return true;
     } catch (e) {
-      console.error(`[-] Không thể lưu webhook config: ${e.message}`);
+      console.error(UIRenderer.message("error", `Không thể lưu cấu hình webhook: ${e.message}`));
+      return false;
     }
   }
 
@@ -848,9 +834,10 @@ class Utils {
       const config = { prefix: prefix };
       Utils._resolvedActivities?.clear();
       Utils.writeJsonAtomic(PREFIX_CONFIG_PATH, config);
-      console.log(`[+] Đã lưu prefix package: ${prefix}`);
+      return true;
     } catch (e) {
-      console.error(`[-] Không thể lưu prefix config: ${e.message}`);
+      console.error(UIRenderer.message("error", `Không thể lưu prefix: ${e.message}`));
+      return false;
     }
   }
 
@@ -873,9 +860,10 @@ class Utils {
       const config = { activity: activity };
       Utils._resolvedActivities?.clear();
       Utils.writeJsonAtomic(ACTIVITY_CONFIG_PATH, config);
-      console.log(`[+] Đã lưu activity: ${activity}`);
+      return true;
     } catch (e) {
-      console.error(`[-] Không thể lưu activity config: ${e.message}`);
+      console.error(UIRenderer.message("error", `Không thể lưu activity: ${e.message}`));
+      return false;
     }
   }
 
@@ -1231,87 +1219,76 @@ Timestamp: ${systemInfo.timestamp}
   }
 
   static validatePackageIntegrity(configs) {
-    console.log("[*] Đang kiểm tra toàn vẹn packages...");
+    console.log(UIRenderer.renderSection("Kiểm tra hệ thống", "Đối chiếu package và cấu hình"));
+    console.log(UIRenderer.message("info", "Đang quét và kiểm tra tính toàn vẹn..."));
 
     try {
-
       const systemPackages = this.detectAllRobloxPackages();
       const systemPackageNames = Object.keys(systemPackages);
-
-
       const configPackageNames = Object.keys(configs);
 
       if (configPackageNames.length === 0) {
-        console.log("[-] Không có config nào trong file JSON!");
-        console.log("[-] Vui lòng chạy setup packages để tạo config.");
+        console.log(UIRenderer.infoCard([
+          ["Trạng thái", "KHÔNG CÓ CẤU HÌNH", "1;31"],
+          ["Khắc phục", "Chạy mục 2 để thiết lập package"]
+        ], "KIỂM TRA THẤT BẠI"));
         return false;
       }
 
       if (systemPackageNames.length === 0) {
-        console.log("[-] Không tìm thấy package Roblox nào trong hệ thống!");
-        console.log("[-] Vui lòng cài đặt ít nhất một app Roblox.");
+        console.log(UIRenderer.infoCard([
+          ["Trạng thái", "KHÔNG TÌM THẤY ROBLOX", "1;31"],
+          ["Khắc phục", "Cài ít nhất một ứng dụng Roblox"]
+        ], "KIỂM TRA THẤT BẠI"));
         return false;
       }
 
-
       const missingPackages = configPackageNames.filter(pkg => !systemPackageNames.includes(pkg));
-
-
       const extraPackages = systemPackageNames.filter(pkg => !configPackageNames.includes(pkg));
-
-      let hasError = false;
-
-      if (missingPackages.length > 0) {
-        console.log("\n[-] PACKAGES THIẾU - Có trong config nhưng không có trong hệ thống:");
-        missingPackages.forEach(pkg => {
-          const displayName = systemPackages[pkg]?.displayName || pkg;
-          console.log(`  [-] ${displayName} (${pkg})`);
-        });
-        console.log("[-] Giải pháp: Cài đặt lại packages này hoặc xóa khỏi config.");
-        hasError = true;
-      }
-
-      if (extraPackages.length > 0) {
-        console.log("\n[-] PACKAGES DƯ - Có trong hệ thống nhưng không có trong config:");
-        extraPackages.forEach(pkg => {
-          const displayName = systemPackages[pkg]?.displayName || pkg;
-          console.log(`  [-] ${displayName} (${pkg})`);
-        });
-        console.log("[-] Giải pháp: Thêm vào config bằng cách chạy setup packages hoặc bỏ qua.");
-      }
-
+      const incompleteRows = [];
 
       for (const [packageName, config] of Object.entries(configs)) {
-        if (!config.username || !config.userId || !config.placeId || !config.delaySec) {
-          console.log(`\n[-] CONFIG KHÔNG ĐẦY ĐỦ cho ${packageName}:`);
-          if (!config.username) console.log("  [-] Thiếu username");
-          if (!config.userId) console.log("  [-] Thiếu userId");
-          if (!config.placeId) console.log("  [-] Thiếu placeId");
-          if (!config.delaySec) console.log("  [-] Thiếu delaySec");
-          console.log("[-] Giải pháp: Chạy lại setup packages hoặc sửa config.");
-          hasError = true;
-        }
+        const missing = [];
+        if (!config.username) missing.push("username");
+        if (!config.userId) missing.push("userId");
+        if (!config.placeId) missing.push("placeId");
+        if (!config.delaySec) missing.push("delaySec");
+        if (missing.length) incompleteRows.push([Utils.packageLabel(packageName), `Thiếu: ${missing.join(", ")}`, "1;31"]);
       }
 
+      if (missingPackages.length) {
+        console.log(UIRenderer.infoCard(missingPackages.map(pkg => [
+          "Không tồn tại",
+          pkg,
+          "1;31"
+        ]), "PACKAGE THIẾU"));
+      }
+      if (extraPackages.length) {
+        console.log(UIRenderer.infoCard(extraPackages.map(pkg => [
+          "Chưa cấu hình",
+          Utils.describePackage(pkg),
+          "1;33"
+        ]), "PACKAGE PHÁT HIỆN THÊM"));
+      }
+      if (incompleteRows.length) {
+        console.log(UIRenderer.infoCard(incompleteRows, "CẤU HÌNH CHƯA ĐẦY ĐỦ"));
+      }
+
+      const hasError = missingPackages.length > 0 || incompleteRows.length > 0;
       if (hasError) {
-        console.log("\n[-] KIỂM TRA TOÀN VẸN THẤT BẠI!");
-        console.log("[-] Không thể chạy auto rejoin khi có lỗi toàn vẹn.");
+        console.log(UIRenderer.message("error", "Kiểm tra thất bại. Hãy chạy mục 2 hoặc mục 3 để sửa cấu hình."));
         return false;
       }
 
       const matchingPackages = configPackageNames.filter(pkg => systemPackageNames.includes(pkg));
-      console.log(`[+] Kiểm tra toàn vẹn thành công!`);
-      console.log(`[+] Có ${matchingPackages.length}/${configPackageNames.length} packages khả dụng`);
-
-      if (extraPackages.length > 0) {
-        console.log(`[+] Có ${extraPackages.length} packages dư (không ảnh hưởng đến hoạt động)`);
-      }
-
+      console.log(UIRenderer.infoCard([
+        ["Khả dụng", `${matchingPackages.length}/${configPackageNames.length}`, "1;32"],
+        ["Chưa cấu hình", String(extraPackages.length), extraPackages.length ? "1;33" : "2;37"],
+        ["Kết quả", "SẴN SÀNG", "1;32"]
+      ], "KIỂM TRA HOÀN TẤT"));
       return true;
-
     } catch (e) {
-      console.error(`[-] Lỗi khi kiểm tra toàn vẹn: ${e.message}`);
-      console.log("[-] Vui lòng kiểm tra lại hệ thống và config file.");
+      console.error(UIRenderer.message("error", `Không thể kiểm tra hệ thống: ${e.message}`));
       return false;
     }
   }
@@ -1383,11 +1360,14 @@ Timestamp: ${systemInfo.timestamp}
 
       execSync('command -v nano', { stdio: 'ignore' });
 
-      console.log("\nChuyển hướng sang Nano Editor sau 5 giây...");
-      console.log("Vui lòng chuẩn bị copy script để dán vào.");
+      console.log(UIRenderer.infoCard([
+        ["Trình soạn thảo", "Nano"],
+        ["Thời gian mở", "Sau 5 giây"],
+        ["Hướng dẫn", "Dán script, lưu và đóng Nano"]
+      ], "CHUẨN BỊ NHẬP SCRIPT"));
       await new Promise(resolve => setTimeout(resolve, 5000));
 
-      console.log("Opening nano editor...");
+      console.log(UIRenderer.message("info", "Đang mở Nano Editor..."));
       execSync(`export TERM=xterm && nano "${tempFile}"`, { stdio: 'inherit' });
 
       if (fs.existsSync(tempFile)) {
@@ -1396,13 +1376,17 @@ Timestamp: ${systemInfo.timestamp}
         return content;
       }
     } catch (e) {
-      console.log("[-] Nano không khả dụng, chuyển sang chế độ nhập thủ công.");
-      console.log("[-] Nhập script của bạn (Gõ 'EXIT' ở dòng mới để kết thúc):");
+      console.log(UIRenderer.message("warning", "Nano không khả dụng; chuyển sang nhập thủ công."));
+      console.log(UIRenderer.infoCard([
+        ["Kết thúc", "Gõ EXIT ở một dòng mới"],
+        ["Nội dung cũ", initialContent ? "Đã nạp" : "Không có"]
+      ], "NHẬP SCRIPT THỦ CÔNG"));
 
       let lines = [];
       if (initialContent) {
-        console.log("--- Nội dung hiện tại ---");
+        console.log(UIRenderer.divider("Nội dung hiện tại"));
         console.log(initialContent);
+        console.log(UIRenderer.divider());
         lines = initialContent.split('\n');
       }
 
@@ -1541,28 +1525,38 @@ class GameSelector {
    * @param {string|null} cookie Cookie ROBLOSECURITY, dùng để giải share link chưa chuyển hướng.
    */
   async chooseGame(rl, cookie = null) {
-    console.log(`\n[*] Chọn game:`);
-    for (let k in this.GAMES) {
-      console.log(`${k}. ${this.GAMES[k][1]} (${this.GAMES[k][0]})`);
-    }
+    console.log(UIRenderer.renderSection("Chọn game", "Điểm đến Auto Rejoin"));
+    console.log(UIRenderer.options([
+      ...Object.entries(this.GAMES).filter(([key]) => key !== "0").map(([key, game]) => ({
+        key,
+        label: game[1],
+        description: `Place ID: ${game[0]}`
+      })),
+      { key: "0", label: "Tùy chỉnh", description: "Nhập Place ID hoặc link private server", color: "1;35" }
+    ]));
 
-    const ans = (await Utils.ask(rl, "Nhập số: ")).trim();
+    const ans = (await Utils.ask(rl, UIRenderer.prompt("Chọn game [0-2]"))).trim();
 
     if (ans === "0") {
-      const sub = (await Utils.ask(rl, "0.1 ID thủ công | 0.2 Link private server: ")).trim();
+      console.log(UIRenderer.options([
+        { key: "1", label: "Nhập Place ID", description: "Dùng ID game thủ công" },
+        { key: "2", label: "Private Server", description: "Dán link hoặc share code", color: "1;35" }
+      ], { footer: "Chọn cách thêm game tùy chỉnh" }));
+      const sub = (await Utils.ask(rl, UIRenderer.prompt("Lựa chọn [1-2]"))).trim();
       if (sub === "1") {
-        const pid = (await Utils.ask(rl, "Nhập Place ID: ")).trim();
+        const pid = (await Utils.ask(rl, UIRenderer.prompt("Place ID"))).trim();
         return { placeId: pid, name: "Tùy chỉnh", linkCode: null };
       }
       if (sub === "2") {
-        console.log("\n Dán link private server (chấp nhận cả 2 dạng):");
-        console.log(" - Đã chuyển hướng: https://www.roblox.com/games/2753915549/Blox-Fruits?privateServerLinkCode=7745553094670639602628");
-        console.log(" - Chưa chuyển hướng: https://www.roblox.com/share?code=639f43b65925484c842425b544167a2f&type=Server");
+        console.log(UIRenderer.infoCard([
+          ["Hỗ trợ", "Link games, link share hoặc share code"],
+          ["Bảo mật", "Cookie chỉ gửi đến API Roblox"]
+        ], "PRIVATE SERVER"));
         while (true) {
-          const link = await Utils.ask(rl, "\nDán link: ");
+          const link = await Utils.ask(rl, UIRenderer.prompt("Dán link private server"));
           const resolved = await Utils.resolveGameLink(link, cookie);
           if (!resolved) {
-            console.log(`[-] Link không hợp lệ hoặc không giải được!`);
+            console.log(UIRenderer.message("error", "Link không hợp lệ hoặc không thể giải mã."));
             continue;
           }
           return {
@@ -1572,66 +1566,33 @@ class GameSelector {
           };
         }
       }
-      throw new Error(`[-] Không hợp lệ!`);
+      throw new Error("Lựa chọn game không hợp lệ");
     }
 
     if (this.GAMES[ans]) {
-      return {
-        placeId: this.GAMES[ans][0],
-        name: this.GAMES[ans][1],
-        linkCode: null,
-      };
+      return { placeId: this.GAMES[ans][0], name: this.GAMES[ans][1], linkCode: null };
     }
 
-    throw new Error(`[-] Không hợp lệ!`);
+    throw new Error("Lựa chọn game không hợp lệ");
   }
 }
 
 class StatusHandler {
-  constructor(joinCooldownSec = 90) {
-    this.hasLaunched = false;
+  constructor() {
     this.joinedAt = 0;
-    // Thời gian chờ sau khi mở app để Roblox kịp load, tránh spam rejoin
-    this.joinCooldownMs = joinCooldownSec * 1000;
     // Số lần đã bắn rejoin liên tiếp mà user vẫn chưa vào game
     this.consecutiveFails = 0;
     // Lần rejoin gần nhất thành công ở mức "đã mở được app"
     this.lastLaunchOk = true;
     // presenceType của lần kiểm tra trước, dùng để phát hiện CHUYỂN trạng thái
     this.lastPtype = null;
-    // Khoảng nghỉ tối thiểu giữa 2 lần bắn, kể cả khi vừa đổi trạng thái.
-    // Chặn spam nếu presence API nhấp nháy (flapping) giữa 0 và 1.
+    // Không còn cooldown chờ Roblox load. Chỉ giữ khoảng chống gọi lệnh trùng
+    // rất ngắn để Presence API nhấp nháy không bắn nhiều lệnh cùng lúc.
     this.minLaunchGapMs = 8000;
     // Cần hai mẫu ngoài game liên tiếp để lọc nhiễu ngắn từ Presence API.
     this.pendingState = null;
     this.pendingStateCount = 0;
     this.confirmationsRequired = 2;
-  }
-
-  /**
-   * Cooldown chỉ dùng để chống spam khi app ĐANG load.
-   * Nếu user Offline hẳn thì app chắc chắn không load -> không chờ,
-   * chỉ giữ 1 khoảng nghỉ ngắn (grace) để am kịp mở app.
-   */
-  cooldownForState(offline) {
-    if (!offline) return this.joinCooldownMs;
-    // Offline: app đang TẮT nên phải cold start + load Roblox từ đầu — riêng việc
-    // này đã mất 40-70s trên máy yếu. Cooldown cũ 20s là quá ngắn: bot bắn đè
-    // liên tục lúc app đang khởi động, Roblox bị reset màn hình loading -> không
-    // bao giờ vào được game. Nâng nền lên 90s và backoff thêm.
-    const base = 90000;
-    const tries = Math.max(0, this.consecutiveFails - 1);
-    const backoff = Math.min(tries, 3) * 15000; // 90s -> 105s -> 120s -> 135s
-    return base + backoff;
-  }
-
-  isCoolingDown(now = Date.now(), offline = false) {
-    if (!this.hasLaunched) return false;
-    return (now - this.joinedAt) < this.cooldownForState(offline);
-  }
-
-  cooldownLeftSec(now = Date.now(), offline = false) {
-    return Math.max(0, Math.ceil((this.cooldownForState(offline) - (now - this.joinedAt)) / 1000));
   }
 
   /**
@@ -1641,20 +1602,6 @@ class StatusHandler {
    */
   shouldForceStop() {
     return this.consecutiveFails >= 4;
-  }
-
-  /**
-   * Trạng thái vừa TỤT khỏi in-game (2 -> 0/1/khác) trong lần kiểm tra này?
-   * Đây là thời điểm phải rejoin NGAY, không chờ cooldown: app đã thoát hẳn
-   * nên chẳng có gì để "chờ load" cả.
-   */
-  isFreshDrop(ptype) {
-    if (this.lastPtype === null) return false;      // lần chạy đầu, chưa có gì để so
-    if (ptype === 2) return false;                  // vẫn đang trong game
-    // 0 -> 1 KHÔNG phải "rớt game": đó là app vừa được bật lên và đang load
-    // (Offline -> Online ngoài game). Bắn rejoin đè lúc này sẽ reset màn loading.
-    if (this.lastPtype === 0 && ptype === 1) return false;
-    return this.lastPtype !== ptype;                // trạng thái vừa thay đổi
   }
 
   /** Chống spam tối thiểu, dùng cho trường hợp bỏ qua cooldown */
@@ -1669,8 +1616,6 @@ class StatusHandler {
     const ptype = presence && presence.userPresenceType !== undefined
       ? presence.userPresenceType
       : undefined;
-    const notInGame = ptype !== 2;
-
     // API đôi lúc trả Offline trong một nhịp ngắn. Xác nhận hai mẫu liên tiếp trước
     // khi rejoin, nhưng cho phép chạy ngay ở lần kiểm tra đầu tiên sau khi khởi động.
     if (ptype === 2) {
@@ -1693,22 +1638,9 @@ class StatusHandler {
       }
     }
 
-    // Vừa chuyển trạng thái (vd: Online[+] -> Offline, hoặc Offline -> Online ngoài game)
-    // => bắn rejoin NGAY, bỏ qua cooldown. Chỉ giữ khoảng nghỉ tối thiểu 8s
-    // để tránh spam khi API nhấp nháy.
-    const freshDrop = this.isFreshDrop(ptype);
+    // Không chờ load sau rejoin; chỉ chặn gọi lệnh trùng trong 8 giây.
     this.lastPtype = ptype;
-
-    let cooling = this.isCoolingDown(now, notInGame);
-    let coolMsg = cooling ? ` (đang chờ load ${this.cooldownLeftSec(now, notInGame)}s)` : "";
-
-    if (freshDrop && cooling && !this.withinMinGap(now)) {
-      // Trạng thái mới => cooldown cũ không còn ý nghĩa, huỷ luôn
-      cooling = false;
-      coolMsg = " [đổi trạng thái -> rejoin ngay]";
-      this.hasLaunched = false;
-      this.joinedAt = 0;
-    }
+    const throttled = this.withinMinGap(now);
 
     if (ptype === undefined) {
       return {
@@ -1724,10 +1656,9 @@ class StatusHandler {
     if (ptype === 0) {
       return {
         status: "Offline",
-        info: `User offline! Tiến hành rejoin ngay!${coolMsg}`,
-        shouldLaunch: !cooling,
-        // Offline mà bắn 2 lần không lên -> app treo, phải kill rồi mở lại
-        forceStop: !cooling && this.shouldForceStop(),
+        info: throttled ? "Đã gửi lệnh rejoin, đang chống lặp ngắn" : "User offline! Tiến hành rejoin ngay!",
+        shouldLaunch: !throttled,
+        forceStop: !throttled && this.shouldForceStop(),
         rejoinOnly: true
       };
     }
@@ -1736,9 +1667,9 @@ class StatusHandler {
     if (ptype === 1) {
       return {
         status: "Online nhưng không trong game",
-        info: `User online nhưng không trong game. Rejoin ngay!${coolMsg}`,
-        shouldLaunch: !cooling,
-        forceStop: !cooling && this.shouldForceStop(),
+        info: throttled ? "Đã gửi lệnh rejoin, đang chống lặp ngắn" : "User online nhưng không trong game. Rejoin ngay!",
+        shouldLaunch: !throttled,
+        forceStop: !throttled && this.shouldForceStop(),
         rejoinOnly: true
       };
     }
@@ -1747,9 +1678,9 @@ class StatusHandler {
     if (ptype !== 2) {
       return {
         status: "Không online",
-        info: `User không trong game. Rejoin ngay!${coolMsg}`,
-        shouldLaunch: !cooling,
-        forceStop: !cooling && this.shouldForceStop(),
+        info: throttled ? "Đã gửi lệnh rejoin, đang chống lặp ngắn" : "User không trong game. Rejoin ngay!",
+        shouldLaunch: !throttled,
+        forceStop: !throttled && this.shouldForceStop(),
         rejoinOnly: true
       };
     }
@@ -1774,15 +1705,15 @@ class StatusHandler {
 
       return {
         status: "Sai map",
-        info: `Sai map (root:${rootId || "?"} / place:${placeId || "?"}). Rejoin đúng map!${coolMsg}`,
-        shouldLaunch: !cooling,
-        forceStop: !cooling && this.shouldForceStop(),
+        info: throttled ? "Đã gửi lệnh đổi map, đang chống lặp ngắn" : `Sai map (root:${rootId || "?"} / place:${placeId || "?"}). Rejoin đúng map!`,
+        shouldLaunch: !throttled,
+        forceStop: !throttled && this.shouldForceStop(),
         rejoinOnly: true
       };
     }
 
-    // Đã vào đúng game -> reset trạng thái cooldown + bộ đếm fail
-    this.hasLaunched = false;
+    // Đã vào đúng game -> reset bộ đếm fail
+    this.joinedAt = 0;
     this.consecutiveFails = 0;
     this.pendingState = null;
     this.pendingStateCount = 0;
@@ -1796,27 +1727,13 @@ class StatusHandler {
     };
   }
 
-  /**
-   * @param {boolean} shouldLaunch  có bắn rejoin không
-   * @param {boolean} launchOk      lệnh mở app có thành công không
-   *
-   * Nếu am KHÔNG mở được app thì không bật cooldown dài — phải thử lại
-   * ở vòng kế tiếp, nếu không bot sẽ đứng im dù user vẫn offline.
-   */
+  /** Ghi nhận lần mở app; chỉ giữ mốc chống lặp ngắn, không chờ load. */
   updateJoinStatus(shouldLaunch, launchOk = true) {
     if (!shouldLaunch) return;
 
     this.consecutiveFails++;
     this.lastLaunchOk = launchOk;
-
-    if (launchOk) {
-      this.joinedAt = Date.now();
-      this.hasLaunched = true;
-    } else {
-      // Không mở được app -> bỏ cooldown, vòng sau thử lại ngay
-      this.hasLaunched = false;
-      this.joinedAt = 0;
-    }
+    this.joinedAt = launchOk ? Date.now() : 0;
   }
 }
 
@@ -1882,86 +1799,215 @@ class UIRenderer {
     return out.join('');
   }
 
+  static color(code, text) {
+    return `\x1b[${code}m${text}\x1b[0m`;
+  }
+
+  static stripAnsi(text) {
+    return String(text).replace(/\x1b\[[0-9;]*m/g, "");
+  }
+
+  static fit(text, width) {
+    const value = String(text ?? "");
+    if (value.length <= width) return value + " ".repeat(width - value.length);
+    return width > 1 ? `${value.slice(0, width - 1)}…` : value.slice(0, width);
+  }
+
+  static statusColor(status) {
+    const value = String(status || "Không rõ");
+    if (value === "Online [+]" || value === "Trong game") return this.color("1;32", value);
+    if (value === "Offline" || value === "Sai map") return this.color("1;31", value);
+    if (value === "Lỗi mạng") return this.color("1;33", value);
+    if (value.includes("Khởi tạo") || value === "Đang xác nhận") return this.color("1;36", value);
+    return this.color("1;35", value);
+  }
+
+  static renderSection(title, subtitle = "") {
+    const width = clamp(process.stdout.columns || 72, 34, 88);
+    const innerWidth = width - 2;
+    const line = "─".repeat(innerWidth);
+    const label = `${title.toUpperCase()}${subtitle ? `  /  ${subtitle}` : ""}`;
+    return `\n${this.color("1;36", `┌${line}┐`)}\n${this.color("1;36", "│")}${this.color("1;37", this.fit(label, innerWidth))}${this.color("1;36", "│")}\n${this.color("1;36", `└${line}┘`)}`;
+  }
+
+  static progressBar(value, total, size = 12) {
+    const ratio = total > 0 ? clamp(value / total, 0, 1) : 0;
+    const filled = Math.round(ratio * size);
+    return `${this.color("1;32", "█".repeat(filled))}${this.color("2;37", "░".repeat(size - filled))}`;
+  }
+
+  static screen(title, subtitle = "") {
+    console.clear();
+    console.log(this.renderTitle());
+    console.log(this.renderSection(title, subtitle));
+  }
+
+  static options(items, { footer = "Nhập số để lựa chọn", accent = "1;36" } = {}) {
+    const width = clamp((process.stdout.columns || 72) - 2, 32, 78);
+    const rule = "─".repeat(width);
+    const lines = [this.color(accent, `╭${rule}╮`)];
+    items.forEach((item, index) => {
+      const key = String(item.key);
+      const label = String(item.label || "");
+      const description = String(item.description || "");
+      const labelWidth = Math.max(8, width - key.length - 7);
+      lines.push(`${this.color(accent, "│")} ${this.color(item.color || "1;36", `[${key}]`)} ${this.color("1;37", this.fit(label, labelWidth))}${this.color(accent, "│")}`);
+      if (description) lines.push(`${this.color(accent, "│")}     ${this.color("2;37", this.fit(description, width - 5))}${this.color(accent, "│")}`);
+      if (index < items.length - 1) lines.push(this.color(accent, `├${rule}┤`));
+    });
+    lines.push(this.color(accent, `╰${rule}╯`));
+    if (footer) lines.push(this.color("2;37", footer));
+    return lines.join("\n");
+  }
+
+  static infoCard(rows, title = "THÔNG TIN") {
+    const width = clamp((process.stdout.columns || 72) - 2, 32, 78);
+    const labelWidth = clamp(Math.max(...rows.map(([label]) => String(label).length), 8), 8, 18);
+    const rule = "─".repeat(width);
+    const lines = [this.color("1;34", `╭─ ${title} ${"─".repeat(Math.max(1, width - title.length - 3))}╮`)];
+    for (const [label, value, tone = "1;37"] of rows) {
+      const prefix = `${this.fit(String(label).toUpperCase(), labelWidth)}  `;
+      const available = Math.max(8, width - labelWidth - 3);
+      lines.push(`${this.color("1;34", "│")} ${this.color("2;37", prefix)}${this.color(tone, this.fit(String(value ?? "-"), available))}${this.color("1;34", "│")}`);
+    }
+    lines.push(this.color("1;34", `╰${rule}╯`));
+    return lines.join("\n");
+  }
+
+  static prompt(label) {
+    return `\n${this.color("1;36", "›")} ${this.color("1;37", label)} ${this.color("1;36", ":")} `;
+  }
+
+  static message(type, text) {
+    const map = {
+      success: ["1;32", "THÀNH CÔNG"],
+      error: ["1;31", "LỖI"],
+      warning: ["1;33", "CẢNH BÁO"],
+      info: ["1;36", "THÔNG TIN"]
+    };
+    const [color, label] = map[type] || map.info;
+    return `${this.color(color, `[${label}]`)} ${text}`;
+  }
+
+  static selectionCard(items, title = "ĐÃ CHỌN") {
+    const rows = (items || []).map((item, index) => [
+      String(index + 1).padStart(2, "0"),
+      String(item),
+      "1;32"
+    ]);
+    return rows.length
+      ? this.infoCard(rows, title)
+      : this.message("warning", "Chưa có mục nào được chọn.");
+  }
+
+  static divider(label = "") {
+    const width = clamp((process.stdout.columns || 72) - 2, 32, 78);
+    const clean = String(label).trim();
+    if (!clean) return this.color("2;37", "─".repeat(width));
+    const tail = Math.max(1, width - clean.length - 3);
+    return this.color("2;37", `── ${clean.toUpperCase()} ${"─".repeat(tail)}`);
+  }
+
+  static step(current, total, label) {
+    const size = clamp((process.stdout.columns || 60) < 55 ? 10 : 18, 10, 18);
+    return `${this.color("2;37", `BƯỚC ${current}/${total}`)}  ${this.progressBar(current, total, size)}  ${this.color("1;37", label)}`;
+  }
+
   static renderTitle() {
     const colors = [
-      [0, 255, 255],
-      [80, 120, 255],
-      [190, 80, 255],
+      [0, 240, 255],
+      [60, 140, 255],
+      [150, 80, 255],
       [255, 70, 170]
     ];
-    const fallbackTitle = "╭────────────────────────────╮\n│        REJOIN TOOL         │\n╰────────────────────────────╯";
+    const terminalWidth = process.stdout.columns || 72;
+    const compact = terminalWidth < 54;
 
     try {
-      const titleText = figlet
-        ? figlet.textSync("REJOIN TOOL", {
+      const titleText = compact
+        ? "REJOIN TOOL"
+        : (figlet ? figlet.textSync("REJOIN", {
             font: "Small",
             horizontalLayout: "fitted",
             verticalLayout: "fitted"
-          })
-        : "REJOIN TOOL";
-
-      const rawBox = boxen(titleText, {
+          }) : "REJOIN TOOL");
+      const subtitle = compact ? "ANDROID CONTROL CENTER" : "ANDROID  •  MULTI INSTANCE  •  LIVE MONITOR";
+      const content = `${titleText}\n${subtitle}`;
+      const rawBox = boxen(content, {
         padding: 1,
         borderStyle: "round",
         align: "center"
       });
-
-      return rawBox.split("\n").map((line) =>
-        this._applyMultiColorGradient(line, colors)
-      ).join("\n");
+      return rawBox.split("\n").map((line) => this._applyMultiColorGradient(line, colors)).join("\n");
     } catch (_) {
-      return this._applyMultiColorGradient(fallbackTitle, colors);
+      return this._applyMultiColorGradient("╭────────────────────────────╮\n│        REJOIN TOOL         │\n│   ANDROID CONTROL CENTER   │\n╰────────────────────────────╯", colors);
     }
   }
 
   static renderMainMenu({ configCount, prefix, webhook, autoexec }) {
-    const cyan = (text) => `\x1b[1;36m${text}\x1b[0m`;
-    const magenta = (text) => `\x1b[1;35m${text}\x1b[0m`;
-    const green = (text) => `\x1b[1;32m${text}\x1b[0m`;
-    const yellow = (text) => `\x1b[1;33m${text}\x1b[0m`;
-    const red = (text) => `\x1b[1;31m${text}\x1b[0m`;
-    const blue = (text) => `\x1b[1;34m${text}\x1b[0m`;
+    const c = (code, text) => this.color(code, text);
+    const terminalWidth = process.stdout.columns || 72;
+    const twoColumns = terminalWidth >= 64;
+    const menuItems = [
+      ["1", "Bắt đầu Auto Rejoin", "Theo dõi và tự động vào lại game", "1;36"],
+      ["2", "Thiết lập package", "Quét và thêm tài khoản Roblox", "1;36"],
+      ["3", "Chỉnh sửa cấu hình", "Game, delay và private server", "1;36"],
+      ["4", "Prefix package", "Thiết lập tên package tùy chỉnh", "1;34"],
+      ["5", "Activity Roblox", "Tự dò hoặc cấu hình activity", "1;34"],
+      ["6", "Webhook Discord", "Báo cáo trạng thái định kỳ", "1;35"],
+      ["7", "Autoexec", "Quản lý script executor", "1;35"],
+      ["0", "Thoát chương trình", "Dừng an toàn và tắt wake lock", "1;31"]
+    ];
 
-    const terminalWidth = process.stdout.columns || 60;
-    const cellWidth = clamp(Math.floor((terminalWidth - 3) / 2), 23, 34);
-    const makeCell = (key, label, keyColor) => {
-      const maxLabel = Math.max(8, cellWidth - 6);
-      const shortLabel = label.length > maxLabel
-        ? `${label.slice(0, maxLabel - 1)}…`
-        : label;
-      const spacing = " ".repeat(Math.max(0, cellWidth - shortLabel.length - 5));
-      return ` ${keyColor(key)}  ${shortLabel}${spacing}`;
+    const badge = (label, value, active = true) =>
+      `${c("2;37", label)} ${active ? c("1;32", value) : c("1;31", value)}`;
+    const status = [
+      badge("CFG", String(configCount), configCount > 0),
+      badge("PREFIX", prefix || "CHƯA ĐẶT", Boolean(prefix)),
+      badge("WEBHOOK", webhook && webhook.enabled ? "BẬT" : "TẮT", Boolean(webhook && webhook.enabled)),
+      badge("AUTOEXEC", autoexec ? autoexec.executor : "TẮT", Boolean(autoexec))
+    ];
+
+    const renderCell = ([key, label, desc, color], width) => {
+      const labelWidth = Math.max(10, width - 6);
+      const descWidth = Math.max(10, width - 5);
+      return [
+        ` ${c(color, ` ${key} `)}  ${c("1;37", this.fit(label, labelWidth))}`,
+        `     ${c("2;37", this.fit(desc, descWidth))}`
+      ];
     };
 
-    const left = [
-      ["01", "Bắt đầu Auto Rejoin", cyan],
-      ["02", "Thiết lập package", cyan],
-      ["03", "Chỉnh sửa cấu hình", cyan],
-      ["04", "Prefix package", cyan],
-      ["05", "Activity Roblox", cyan]
-    ];
-    const right = [
-      ["06", "Webhook Discord", magenta],
-      ["07", "Autoexec", magenta],
-      ["08", "Chẩn đoán nhanh", magenta],
-      ["09", "Sao lưu cấu hình", magenta],
-      ["00", "Thoát", red]
-    ];
-
-    const horizontal = "─".repeat(cellWidth);
-    const lines = [blue(`╭${horizontal}┬${horizontal}╮`)];
-    for (let i = 0; i < left.length; i++) {
-      lines.push(
-        `${blue("│")}${makeCell(...left[i])}${blue("│")}${makeCell(...right[i])}${blue("│")}`
-      );
-      if (i < left.length - 1) lines.push(blue(`├${horizontal}┼${horizontal}┤`));
+    const lines = [];
+    if (twoColumns) {
+      const cellWidth = clamp(Math.floor((terminalWidth - 3) / 2), 30, 44);
+      const rule = "─".repeat(cellWidth);
+      lines.push(c("1;34", `╭${rule}┬${rule}╮`));
+      for (let i = 0; i < 4; i++) {
+        const left = renderCell(menuItems[i], cellWidth);
+        const right = renderCell(menuItems[i + 4], cellWidth);
+        lines.push(`${c("1;34", "│")}${left[0]}${c("1;34", "│")}${right[0]}${c("1;34", "│")}`);
+        lines.push(`${c("1;34", "│")}${left[1]}${c("1;34", "│")}${right[1]}${c("1;34", "│")}`);
+        if (i < 3) lines.push(c("1;34", `├${rule}┼${rule}┤`));
+      }
+      lines.push(c("1;34", `╰${rule}┴${rule}╯`));
+    } else {
+      const cellWidth = clamp(terminalWidth - 2, 30, 48);
+      const rule = "─".repeat(cellWidth);
+      lines.push(c("1;34", `╭${rule}╮`));
+      menuItems.forEach((item, index) => {
+        const cell = renderCell(item, cellWidth);
+        lines.push(`${c("1;34", "│")}${cell[0]}${c("1;34", "│")}`);
+        lines.push(`${c("1;34", "│")}${cell[1]}${c("1;34", "│")}`);
+        if (index < menuItems.length - 1) lines.push(c("1;34", `├${rule}┤`));
+      });
+      lines.push(c("1;34", `╰${rule}╯`));
     }
-    lines.push(blue(`╰${horizontal}┴${horizontal}╯`));
 
-    const statusLine1 = `${green(`CFG ${configCount}`)}  ${blue("│")}  ${cyan("PREFIX")} ${prefix || "chưa đặt"}`;
-    const statusLine2 = `${magenta("WEBHOOK")} ${webhook && webhook.enabled ? green("BẬT") : red("TẮT")}  ${blue("│")}  ${yellow("AUTOEXEC")} ${autoexec ? green(autoexec.executor) : red("TẮT")}`;
+    const statusLine = terminalWidth >= 76
+      ? status.join(c("2;37", "  │  "))
+      : `${status.slice(0, 2).join(c("2;37", "  │  "))}\n${status.slice(2).join(c("2;37", "  │  "))}`;
 
-    return `\n${cyan("◆ REJOIN TOOL")}\n${statusLine1}\n${statusLine2}\n\n${lines.join("\n")}`;
+    return `${this.renderSection("Bảng điều khiển", "Trạng thái hệ thống")}\n${statusLine}\n\n${lines.join("\n")}\n${c("2;37", "Dùng phím số để chọn  •  Q hoặc 0 để thoát")}`;
   }
 
   static calculateOptimalColumnWidths() {
@@ -2005,57 +2051,66 @@ class UIRenderer {
   static renderMultiInstanceTable(instances, startTime = null) {
     const stats = this.getSystemStats();
     const colWidths = this.calculateOptimalColumnWidths();
+    const terminalWidth = process.stdout.columns || 120;
+    const uptimeMs = startTime ? Date.now() - startTime : 0;
+    const hours = Math.floor(uptimeMs / 3600000);
+    const minutes = Math.floor((uptimeMs % 3600000) / 60000);
+    const seconds = Math.floor((uptimeMs % 60000) / 1000);
+    const uptime = `${hours}h ${minutes}m ${seconds}s`;
+    const online = instances.filter((x) => x.status === "Online [+]").length;
+    const errors = instances.filter((x) => x.status === "Lỗi mạng").length;
+    const rejoins = instances.reduce((sum, x) => sum + (x.rejoinCount || 0), 0);
+    const divider = this.color("2;37", "  │  ");
+    const summaryItems = [
+      this.color("1;36", `CPU ${stats.cpuUsage}%`),
+      this.color("1;36", `RAM ${stats.ramUsage}`),
+      this.color("1;32", `ONLINE ${online}/${instances.length}`),
+      this.color(errors ? "1;31" : "2;37", `LỖI ${errors}`),
+      this.color("1;33", `REJOIN ${rejoins}`),
+      this.color("2;37", `UPTIME ${uptime}`)
+    ];
+    const summary = terminalWidth < 76
+      ? `${summaryItems.slice(0, 3).join(divider)}\n${summaryItems.slice(3).join(divider)}`
+      : summaryItems.join(divider);
+    const health = `${this.color("2;37", "SỨC KHỎE ")}${this.progressBar(online, instances.length, terminalWidth < 70 ? 8 : 16)} ${online}/${instances.length}`;
 
-
-    let uptimeText = "";
-    if (startTime) {
-      const uptimeMs = Date.now() - startTime;
-      const hours = Math.floor(uptimeMs / (1000 * 60 * 60));
-      const minutes = Math.floor((uptimeMs % (1000 * 60 * 60)) / (1000 * 60));
-      const seconds = Math.floor((uptimeMs % (1000 * 60)) / 1000);
-      uptimeText = ` | Uptime: ${hours}h ${minutes}m ${seconds}s`;
+    if (terminalWidth < 76) {
+      const cards = instances.map((instance, index) => {
+        const rawUsername = instance.config.username || instance.user.username || "Unknown";
+        const username = Utils.maskSensitiveInfo(rawUsername);
+        const delay = this.formatCountdown(Number(instance.countdownSeconds) || 0);
+        return [
+          `${this.color("1;34", `╭─ INSTANCE ${String(index + 1).padStart(2, "0")} `)}${this.color("2;37", "─".repeat(16))}`,
+          `${this.color("1;37", Utils.packageLabel(instance.packageName))}  ${this.color("2;37", username)}`,
+          `${this.statusColor(instance.status)}  ${this.color("1;36", `Kiểm tra: ${delay}`)}`,
+          this.color("2;37", instance.info),
+          this.color("1;34", "╰" + "─".repeat(30))
+        ].join("\n");
+      }).join("\n");
+      return `${summary}\n${health}\n\n${cards}`;
     }
 
-    const online = instances.filter((x) => x.status === "Online [+]").length;
-    const rejoins = instances.reduce((sum, x) => sum + (x.rejoinCount || 0), 0);
-    const cpuRamLine = `CPU ${stats.cpuUsage}%  •  RAM ${stats.ramUsage}  •  Online ${online}/${instances.length}  •  Rejoin ${rejoins}${uptimeText}`;
-
     const table = new Table({
-      head: ["Package", "User", "Status", "Info", "Time", "Delay"],
-      colWidths: [
-        colWidths.package,
-        colWidths.user,
-        colWidths.status,
-        colWidths.info,
-        colWidths.time,
-        colWidths.delay
-      ],
+      head: ["PACKAGE", "USER", "TRẠNG THÁI", "THÔNG TIN", "CẬP NHẬT", "KIỂM TRA"],
+      colWidths: [colWidths.package, colWidths.user, colWidths.status, colWidths.info, colWidths.time, colWidths.delay],
       wordWrap: true,
-      style: {
-        head: ["cyan"],
-        border: ["gray"]
-      }
+      chars: { top: "─", "top-mid": "┬", "top-left": "╭", "top-right": "╮", bottom: "─", "bottom-mid": "┴", "bottom-left": "╰", "bottom-right": "╯", left: "│", "left-mid": "├", mid: "─", "mid-mid": "┼", right: "│", "right-mid": "┤", middle: "│" },
+      style: { head: ["cyan"], border: ["blue"], compact: false }
     });
 
-    instances.forEach(instance => {
-      const packageDisplay = Utils.packageLabel(instance.packageName);
-
-      const rawUsername = instance.config.username || instance.user.username || 'Unknown';
-      const username = Utils.maskSensitiveInfo(rawUsername);
-
-      const delaySeconds = Number(instance.countdownSeconds) || 0;
-
+    instances.forEach((instance) => {
+      const rawUsername = instance.config.username || instance.user.username || "Unknown";
       table.push([
-        packageDisplay,
-        username,
-        instance.status,
+        Utils.packageLabel(instance.packageName),
+        Utils.maskSensitiveInfo(rawUsername),
+        this.statusColor(instance.status),
         instance.info,
         new Date().toLocaleTimeString(),
-        this.formatCountdown(delaySeconds)
+        this.color("1;36", this.formatCountdown(Number(instance.countdownSeconds) || 0))
       ]);
     });
 
-    return `${cpuRamLine}\n${table.toString()}`;
+    return `${summary}\n${health}\n\n${table.toString()}`;
   }
 
   static formatCountdown(seconds) {
@@ -2065,14 +2120,16 @@ class UIRenderer {
   }
 
   static displayConfiguredPackages(configs) {
-    const colWidths = this.calculateOptimalColumnWidths();
-
+    const terminalWidth = process.stdout.columns || 90;
+    const wide = terminalWidth >= 76;
     const table = new Table({
-      head: ["STT", "Package", "Username", "Game", "Delay"],
-      colWidths: [5, 20, 15, 20, 8],
+      head: ["STT", "PACKAGE", "TÀI KHOẢN", "GAME", "NHỊP QUÉT"],
+      colWidths: wide ? [6, 22, 17, 24, 12] : [5, 15, 12, 17, 10],
+      wordWrap: true,
+      chars: { top: "─", "top-mid": "┬", "top-left": "╭", "top-right": "╮", bottom: "─", "bottom-mid": "┴", "bottom-left": "╰", "bottom-right": "╯", left: "│", "left-mid": "├", mid: "─", "mid-mid": "┼", right: "│", "right-mid": "┤", middle: "│" },
       style: {
         head: ["cyan"],
-        border: ["gray"]
+        border: ["blue"]
       }
     });
 
@@ -2119,9 +2176,10 @@ class AutoexecManager {
   saveConfig(config) {
     try {
       Utils.writeJsonAtomic(AUTOEXEC_CONFIG_PATH, config);
-      console.log("[+] Đã lưu cấu hình autoexec.");
+      return true;
     } catch (e) {
-      console.error(`[-] Báo lỗi lưu config: ${e.message}`);
+      console.error(UIRenderer.message("error", `Không thể lưu cấu hình autoexec: ${e.message}`));
+      return false;
     }
   }
 
@@ -2145,46 +2203,50 @@ class AutoexecManager {
   }
 
   async setup(rl) {
-    console.clear();
-    console.log(UIRenderer.renderTitle());
-    console.log("\n Cấu hình Autoexec");
+    UIRenderer.screen("Autoexec", "Quản lý script executor");
 
     const currentConfig = this.loadConfig();
     let currentScript = "";
     if (currentConfig) {
-      console.log(`\n Executor hiện tại: ${currentConfig.executor}`);
+      console.log(UIRenderer.infoCard([
+        ["Executor", currentConfig.executor, "1;32"],
+        ["Đường dẫn", currentConfig.path || "Chưa xác định"],
+        ["Script", currentConfig.script ? `${currentConfig.script.length} ký tự` : "Trống"]
+      ], "CẤU HÌNH HIỆN TẠI"));
       currentScript = currentConfig.script || "";
     }
 
-    console.log("\nChọn Executor:");
     const executors = Object.keys(this.EXECUTORS);
-    executors.forEach((ex, i) => {
-      console.log(`${i + 1}. ${ex}`);
-    });
+    console.log(UIRenderer.options(executors.map((ex, i) => ({
+      key: i + 1,
+      label: ex,
+      description: this.EXECUTORS[ex]
+    })), { footer: "Chọn executor muốn cấu hình", accent: "1;35" }));
 
-    const choice = parseInt(await Utils.ask(rl, "\nNhập số (1-4): ")) - 1;
+    const choice = parseInt(await Utils.ask(rl, UIRenderer.prompt("Executor [1-4]"))) - 1;
     if (choice < 0 || choice >= executors.length) {
-      console.log("[-] Lựa chọn không hợp lệ!");
+      console.log(UIRenderer.message("error", "Lựa chọn executor không hợp lệ."));
       return;
     }
 
     const selectedExecutor = executors[choice];
 
-    console.log("\nDán script của bạn dưới đây (Sử dụng Nano hoặc nhập EXIT để kết thúc):");
+    console.log(`\n${UIRenderer.step(2, 3, "Nhập nội dung script")}`);
+    console.log(UIRenderer.message("info", "Nano sẽ được mở; nếu không khả dụng, nhập EXIT ở dòng mới để kết thúc."));
     const script = await Utils.openEditor(rl, currentScript);
 
     if (!script || !script.trim()) {
-      console.log("[-] Script trống!");
+      console.log(UIRenderer.message("error", "Script đang trống."));
       return;
     }
 
-    console.log("\n--- Preview Script ---");
-    console.log(script.substring(0, 200) + (script.length > 200 ? "..." : ""));
-    console.log("----------------------");
+    console.log(UIRenderer.renderSection("Xem trước script", `${script.length} ký tự`));
+    console.log(UIRenderer.infoCard([["Nội dung", script.substring(0, 200) + (script.length > 200 ? "..." : "")]], "PREVIEW"));
+    console.log(UIRenderer.step(3, 3, "Xác nhận và lưu"));
 
-    const confirm = await Utils.ask(rl, "Lưu script này? (y/n): ");
+    const confirm = await Utils.ask(rl, UIRenderer.prompt("Lưu script? [y/N]"));
     if (confirm.toLowerCase() !== 'y') {
-      console.log("[-] Đã hủy.");
+      console.log(UIRenderer.message("warning", "Đã hủy lưu script."));
       return;
     }
 
@@ -2194,11 +2256,22 @@ class AutoexecManager {
       path: this.EXECUTORS[selectedExecutor]
     };
 
-    this.saveConfig(config);
-    this.writeToExecutor(selectedExecutor, script.trim());
+    const configSaved = this.saveConfig(config);
+    const scriptWritten = this.writeToExecutor(selectedExecutor, script.trim());
 
-    console.log("\n[+] Setup Autoexec thành công!");
-    await new Promise(r => setTimeout(r, 2000));
+    const completed = configSaved && scriptWritten;
+    console.log(UIRenderer.infoCard([
+      ["Executor", selectedExecutor, completed ? "1;32" : "1;33"],
+      ["Đường dẫn", this.EXECUTORS[selectedExecutor]],
+      ["Cấu hình", configSaved ? "ĐÃ LƯU" : "THẤT BẠI", configSaved ? "1;32" : "1;31"],
+      ["File script", scriptWritten ? "ĐÃ GHI" : "THẤT BẠI", scriptWritten ? "1;32" : "1;31"],
+      ["Kết quả", completed ? "HOÀN TẤT" : "CHƯA HOÀN TẤT", completed ? "1;32" : "1;31"]
+    ], completed ? "AUTOEXEC HOÀN TẤT" : "AUTOEXEC GẶP LỖI"));
+    console.log(UIRenderer.message(
+      completed ? "success" : "error",
+      completed ? "Script đã sẵn sàng cho executor." : "Kiểm tra quyền truy cập bộ nhớ rồi thử lại."
+    ));
+    await sleep(completed ? 1500 : 2500);
   }
 
   checkAndFix(config) {
@@ -2245,8 +2318,6 @@ class MultiRejoinTool {
       "5": () => this.configureActivity(rl),
       "6": () => this.setupWebhook(rl),
       "7": () => this.setupAutoexec(rl),
-      "8": () => this.runDiagnostics(rl),
-      "9": () => this.backupConfigs(rl),
     };
 
     try {
@@ -2260,11 +2331,11 @@ class MultiRejoinTool {
           autoexec: new AutoexecManager().loadConfig(),
         }));
 
-        const choice = (await Utils.ask(rl, "\n  Chọn chức năng [0-9]: ")).trim();
+        const choice = (await Utils.ask(rl, UIRenderer.prompt("Chọn chức năng [0-7]"))).trim();
         if (choice === "0" || choice.toLowerCase() === "q") break;
         const action = actions[choice];
         if (!action) {
-          console.log("\n[!] Lựa chọn không hợp lệ.");
+          console.log(UIRenderer.message("warning", "Lựa chọn không hợp lệ."));
           await sleep(900);
           continue;
         }
@@ -2282,72 +2353,43 @@ class MultiRejoinTool {
     }
   }
 
-  async runDiagnostics(rl) {
-    console.clear();
-    console.log(UIRenderer.renderTitle());
-    console.log("\n  CHẨN ĐOÁN NHANH\n");
-    const rows = [];
-    const push = (name, ok, detail) => rows.push([ok ? "OK" : "LỖI", name, detail]);
-
-    push("Quyền root", process.getuid ? process.getuid() === 0 : true, process.getuid ? `UID ${process.getuid()}` : "Không xác định");
-    const sqliteCandidates = [
-      path.join(Utils.termuxPrefix(), "bin", "sqlite3"),
-      "/system/bin/sqlite3",
-      "/usr/bin/sqlite3",
-    ];
-    push("sqlite3", sqliteCandidates.some((file) => fs.existsSync(file)), "Đọc cookie Roblox");
-    const detected = Utils.detectAllRobloxPackages();
-    push("Package Roblox", Object.keys(detected).length > 0, `${Object.keys(detected).length} package`);
-    const configs = Utils.loadMultiConfigs();
-    push("Cấu hình", Object.keys(configs).length > 0, `${Object.keys(configs).length} instance`);
-    push("Activity", Object.keys(detected).length === 0 || Object.keys(detected).some((pkg) => Utils.resolveLaunchActivities(pkg).length > 0), "Tự dò/cached");
-
-    const table = new Table({
-      head: ["Trạng thái", "Hạng mục", "Chi tiết"],
-      colWidths: [12, 22, Math.max(24, Math.min(52, (process.stdout.columns || 100) - 40))],
-      wordWrap: true,
-      style: { head: ["cyan"], border: ["gray"] }
-    });
-    rows.forEach((row) => table.push(row));
-    console.log(table.toString());
-    await Utils.ask(rl, "\nNhấn Enter để quay lại menu...");
-  }
-
-  async backupConfigs(rl) {
-    try {
-      const result = Utils.backupConfigs();
-      console.log(`\n[+] Đã sao lưu ${result.copied} file cấu hình.`);
-      console.log(`    ${result.destination}`);
-    } catch (error) {
-      console.error(`\n[-] Sao lưu thất bại: ${error.message}`);
-    }
-    await Utils.ask(rl, "\nNhấn Enter để quay lại menu...");
-  }
-
   async setupPackages(rl) {
-    console.log("\n Đang quét tất cả packages Roblox...");
+    UIRenderer.screen("Thiết lập package", "Quét và thêm tài khoản Roblox");
+    console.log(UIRenderer.step(1, 4, "Đang quét package Roblox"));
     const packages = Utils.detectAllRobloxPackages();
 
     if (Object.keys(packages).length === 0) {
-      console.log("[-] Không tìm thấy package Roblox nào!");
+      console.log(UIRenderer.infoCard([
+        ["Kết quả", "KHÔNG TÌM THẤY", "1;31"],
+        ["Gợi ý", "Kiểm tra prefix ở mục 4"]
+      ], "QUÉT PACKAGE"));
       await new Promise(resolve => setTimeout(resolve, 2000));
       return;
     }
 
-    console.log("\n Tìm thấy các packages:");
-    console.log("0.  Setup tất cả packages");
     const packageList = [];
     Object.values(packages).forEach((pkg, index) => {
-      console.log(`${index + 1}. ${pkg.displayName} (${pkg.packageName})`);
       packageList.push({ packageName: Object.keys(packages)[index], packageInfo: pkg });
     });
+    console.log(UIRenderer.step(2, 4, `Đã tìm thấy ${packageList.length} package`));
+    console.log(UIRenderer.options([
+      { key: "0", label: "Thiết lập tất cả", description: `${packageList.length} package đã tìm thấy`, color: "1;32" },
+      ...packageList.map((pkg, index) => ({
+        key: index + 1,
+        label: pkg.packageInfo.displayName,
+        description: pkg.packageName
+      }))
+    ], { footer: "Có thể nhập nhiều số, cách nhau bằng dấu cách" }));
 
-    const choice = await Utils.ask(rl, "\nChọn packages để setup (0 để setup tất cả, hoặc số cách nhau bởi khoảng trắng): ");
+    const choice = await Utils.ask(rl, UIRenderer.prompt("Chọn package"));
     let selectedPackages = [];
 
     if (choice.trim() === "0") {
       selectedPackages = packageList;
-      console.log(" Sẽ setup tất cả packages!");
+      console.log(UIRenderer.selectionCard(
+        selectedPackages.map((pkg) => pkg.packageInfo.displayName),
+        "PACKAGE SẼ THIẾT LẬP"
+      ));
     } else {
       const indices = choice
         .trim()
@@ -2356,30 +2398,36 @@ class MultiRejoinTool {
         .filter(i => i >= 0 && i < packageList.length);
 
       if (indices.length === 0) {
-        console.log("[-] Lựa chọn không hợp lệ!");
+        console.log(UIRenderer.message("error", "Không có package hợp lệ được chọn."));
         await sleep(900);
         return;
       }
 
       selectedPackages = [...new Map(indices.map(i => [packageList[i].packageName, packageList[i]])).values()];
-      console.log(` Sẽ setup các packages:`);
-      selectedPackages.forEach((pkg, i) => {
-        console.log(`  - ${i + 1}. ${pkg.packageInfo.displayName}`);
-      });
+      console.log(UIRenderer.selectionCard(
+        selectedPackages.map((pkg) => pkg.packageInfo.displayName),
+        "PACKAGE SẼ THIẾT LẬP"
+      ));
     }
 
 
     // Giữ lại config của các package không được chọn, tránh setup một app làm mất app khác.
     const configs = Utils.loadMultiConfigs();
+    let configuredCount = 0;
+    const skippedPackages = [];
 
     for (const { packageName, packageInfo } of selectedPackages) {
-      console.clear();
-      console.log(UIRenderer.renderTitle());
-      console.log(`\n Cấu hình cho ${packageInfo.displayName}`);
+      UIRenderer.screen("Cấu hình tài khoản", packageInfo.displayName);
+      console.log(UIRenderer.step(3, 4, "Xác thực và chọn game"));
+      console.log(UIRenderer.infoCard([
+        ["Tên", packageInfo.displayName, "1;36"],
+        ["Package", packageName]
+      ], "PACKAGE ĐANG XỬ LÝ"));
 
       const cookie = Utils.getRobloxCookie(packageName);
       if (!cookie) {
-        console.log(`[-] Không lấy được cookie cho ${packageName}, bỏ qua...`);
+        console.log(UIRenderer.message("error", `Không lấy được cookie cho ${packageName}; đã bỏ qua.`));
+        skippedPackages.push(packageInfo.displayName);
         continue;
       }
 
@@ -2387,24 +2435,27 @@ class MultiRejoinTool {
       const userId = await user.fetchAuthenticatedUser();
 
       if (!userId) {
-        console.log(`[-] Không lấy được user info cho ${packageName}, bỏ qua...`);
+        console.log(UIRenderer.message("error", `Không xác thực được tài khoản của ${packageName}; đã bỏ qua.`));
+        skippedPackages.push(packageInfo.displayName);
         continue;
       }
 
-      console.log(` Username: ${Utils.maskSensitiveInfo(user.username)}`);
-      console.log(` User ID: ${Utils.maskSensitiveInfo(userId)}`);
+      console.log(UIRenderer.infoCard([
+        ["Tài khoản", Utils.maskSensitiveInfo(user.username), "1;32"],
+        ["User ID", Utils.maskSensitiveInfo(userId)]
+      ], "XÁC THỰC THÀNH CÔNG"));
 
       const selector = new GameSelector();
       const game = await selector.chooseGame(rl, cookie);
 
       let delaySec;
       while (true) {
-        const input = parseInt(await Utils.ask(rl, " Delay check (giây, 15-120): ")) || 1;
+        const input = parseInt(await Utils.ask(rl, UIRenderer.prompt("Nhịp kiểm tra [15-120 giây]"))) || 1;
         if (input >= 15 && input <= 120) {
           delaySec = input;
           break;
         }
-        console.log("[-] Giá trị không hợp lệ! Vui lòng nhập lại.");
+        console.log(UIRenderer.message("error", "Giá trị phải nằm trong khoảng 15-120 giây."));
       }
 
       configs[packageName] = {
@@ -2416,15 +2467,35 @@ class MultiRejoinTool {
         delaySec,
         packageName
       };
+      configuredCount++;
 
-      console.log(`[+] Đã cấu hình xong cho ${packageInfo.displayName}!`);
+      console.log(UIRenderer.infoCard([
+        ["Package", packageInfo.displayName],
+        ["Game", game.name, "1;36"],
+        ["Nhịp quét", `${delaySec} giây`],
+        ["Kết quả", "ĐÃ CẤU HÌNH", "1;32"]
+      ], "HOÀN TẤT TÀI KHOẢN"));
     }
 
-    Utils.saveMultiConfigs(configs);
-    console.log("\n[+] Setup hoàn tất!");
+    console.log(UIRenderer.step(4, 4, "Lưu cấu hình"));
+    const saved = Utils.saveMultiConfigs(configs);
+    console.log(UIRenderer.infoCard([
+      ["Đã chọn", String(selectedPackages.length)],
+      ["Thành công", String(configuredCount), configuredCount ? "1;32" : "1;31"],
+      ["Bỏ qua", String(skippedPackages.length), skippedPackages.length ? "1;33" : "2;37"],
+      ["Lưu file", saved ? "THÀNH CÔNG" : "THẤT BẠI", saved ? "1;32" : "1;31"]
+    ], "KẾT QUẢ THIẾT LẬP"));
+    if (skippedPackages.length) {
+      console.log(UIRenderer.selectionCard(skippedPackages, "PACKAGE ĐÃ BỎ QUA"));
+    }
+    console.log(UIRenderer.message(
+      saved && configuredCount > 0 ? "success" : "warning",
+      saved && configuredCount > 0
+        ? `Đã hoàn tất thiết lập ${configuredCount} package.`
+        : "Không có package mới nào được cấu hình hoàn chỉnh."
+    ));
 
-
-    console.log("\n Đang quay lại menu chính...");
+    console.log(UIRenderer.message("info", "Đang quay lại menu chính..."));
     await sleep(900);
     return;
   }
@@ -2433,7 +2504,10 @@ class MultiRejoinTool {
     const configs = Utils.loadMultiConfigs();
 
     if (Object.keys(configs).length === 0) {
-      console.log("[-] Chưa có config nào! Vui lòng chạy setup packages trước.");
+      console.log(UIRenderer.infoCard([
+        ["Trạng thái", "CHƯA CÓ CẤU HÌNH", "1;31"],
+        ["Hướng dẫn", "Chạy mục 2: Thiết lập package"]
+      ], "KHÔNG THỂ TIẾP TỤC"));
       await new Promise(resolve => setTimeout(resolve, 2000));
       return;
     }
@@ -2445,7 +2519,7 @@ class MultiRejoinTool {
 
     if (success) {
 
-      console.log("\n Đang quay lại menu chính...");
+      console.log(UIRenderer.message("info", "Đang quay lại bảng điều khiển..."));
       await new Promise(resolve => setTimeout(resolve, 2000));
       return;
     } else {
@@ -2460,7 +2534,7 @@ class MultiRejoinTool {
     await webhookManager.setupWebhook(rl);
 
 
-    console.log("\n Đang quay lại menu chính...");
+    console.log(UIRenderer.message("info", "Đang quay lại bảng điều khiển..."));
     await sleep(900);
     return;
   }
@@ -2469,148 +2543,176 @@ class MultiRejoinTool {
     const autoexecManager = new AutoexecManager();
     await autoexecManager.setup(rl);
 
-    console.log("\n Đang quay lại menu chính...");
+    console.log(UIRenderer.message("info", "Đang quay lại bảng điều khiển..."));
     await sleep(900);
     return;
   }
 
   async configurePackagePrefix(rl) {
-    console.clear();
-    console.log(UIRenderer.renderTitle());
-    console.log("\n Cấu hình Prefix Package Roblox");
-
+    UIRenderer.screen("Prefix package", "Nhận diện ứng dụng Roblox");
 
     const currentPrefix = Utils.loadPackagePrefixConfig();
-    console.log(`\n Prefix hiện tại: ${currentPrefix}`);
+    console.log(UIRenderer.infoCard([
+      ["Hiện tại", currentPrefix, "1;32"],
+      ["Mặc định", "com.roblox"],
+      ["Chế độ", "Áp dụng cho quét package"]
+    ], "TRẠNG THÁI PREFIX"));
 
-    console.log("\n Chọn hành động:");
-    console.log("1. ✏️ Thay đổi prefix");
-    console.log("2.  Đặt lại về mặc định (com.roblox)");
-    console.log("3. 🔍 Tự động nhận diện prefix (quét app xử lý roblox://)");
-    console.log("4. ⏭️ Quay lại menu chính");
+    console.log(UIRenderer.options([
+      { key: "1", label: "Thay đổi prefix", description: "Nhập prefix package thủ công" },
+      { key: "2", label: "Đặt lại mặc định", description: "Khôi phục về com.roblox" },
+      { key: "3", label: "Tự động nhận diện", description: "Quét ứng dụng xử lý roblox://", color: "1;32" },
+      { key: "4", label: "Quay lại", description: "Trở về bảng điều khiển", color: "1;31" }
+    ]));
 
-    const choice = await Utils.ask(rl, "\nNhập lựa chọn (1-4): ");
+    const choice = await Utils.ask(rl, UIRenderer.prompt("Lựa chọn [1-4]"));
 
     if (choice.trim() === "1") {
-      console.log("\n✏️ Thay đổi prefix package Roblox");
-      console.log("Ví dụ: com.roblox, con.roblx, com.robloxclone, etc.");
+      console.log(UIRenderer.infoCard([
+        ["Định dạng", "Tên package không có phần .client"],
+        ["Ví dụ", "com.roblox hoặc com.robloxclone"]
+      ], "NHẬP PREFIX THỦ CÔNG"));
 
       let newPrefix;
       while (true) {
-        newPrefix = await Utils.ask(rl, "Nhập prefix mới: ");
+        newPrefix = await Utils.ask(rl, UIRenderer.prompt("Prefix mới"));
         if (newPrefix.trim()) {
           break;
         }
-        console.log("[-] Prefix không được để trống!");
+        console.log(UIRenderer.message("error", "Prefix không được để trống."));
       }
 
-      Utils.savePackagePrefixConfig(newPrefix.trim());
-      console.log(`[+] Đã cập nhật prefix thành: ${newPrefix.trim()}`);
+      const saved = Utils.savePackagePrefixConfig(newPrefix.trim());
+      console.log(UIRenderer.infoCard([
+        ["Prefix cũ", currentPrefix],
+        ["Prefix mới", newPrefix.trim(), saved ? "1;32" : "1;31"],
+        ["Kết quả", saved ? "ĐÃ CẬP NHẬT" : "THẤT BẠI", saved ? "1;32" : "1;31"]
+      ], "PREFIX PACKAGE"));
 
     } else if (choice.trim() === "2") {
-      Utils.savePackagePrefixConfig("com.roblox");
-      console.log("[+] Đã đặt lại prefix về mặc định: com.roblox");
+      const saved = Utils.savePackagePrefixConfig("com.roblox");
+      console.log(UIRenderer.infoCard([
+        ["Prefix cũ", currentPrefix],
+        ["Prefix mới", "com.roblox", saved ? "1;32" : "1;31"],
+        ["Kết quả", saved ? "ĐÃ KHÔI PHỤC" : "THẤT BẠI", saved ? "1;32" : "1;31"]
+      ], "PREFIX MẶC ĐỊNH"));
 
     } else if (choice.trim() === "3") {
-      console.log("\n🔍 Đang quét các app xử lý được scheme roblox:// ...");
+      console.log(UIRenderer.message("info", "Đang quét các ứng dụng xử lý scheme roblox://..."));
       const { prefix: detected, packages: handlers } = Utils.autoDetectPrefix();
 
       if (!handlers.length) {
-        console.log("[-] Không tìm thấy app nào khai báo xử lý roblox://.");
-        console.log("[!] Có thể app mod không đăng ký scheme, hãy nhập prefix thủ công (mục 1).");
+        console.log(UIRenderer.infoCard([
+          ["Kết quả", "KHÔNG TÌM THẤY", "1;31"],
+          ["Gợi ý", "Nhập prefix thủ công ở lựa chọn 1"]
+        ], "TỰ ĐỘNG NHẬN DIỆN"));
       } else {
-        console.log(`[+] Tìm thấy ${handlers.length} app:`);
-        handlers.forEach((p, i) => console.log(`   ${i + 1}. ${p}`));
-        console.log(`\n[*] Prefix suy ra: \x1b[32m${detected}\x1b[0m`);
+        console.log(UIRenderer.selectionCard(handlers, "ỨNG DỤNG ĐÃ PHÁT HIỆN"));
+        console.log(UIRenderer.infoCard([
+          ["Số ứng dụng", String(handlers.length), "1;32"],
+          ["Prefix suy ra", detected, "1;36"]
+        ], "KẾT QUẢ NHẬN DIỆN"));
 
-        const ok = (await Utils.ask(rl, `Lưu prefix "${detected}"? (y/n): `)).trim().toLowerCase();
+        const ok = (await Utils.ask(rl, UIRenderer.prompt(`Lưu prefix "${detected}"? [Y/n]`))).trim().toLowerCase();
         if (ok === "y" || ok === "yes" || ok === "") {
-          Utils.savePackagePrefixConfig(detected);
-          console.log(`[+] Đã cập nhật prefix thành: ${detected}`);
+          const saved = Utils.savePackagePrefixConfig(detected);
+          console.log(UIRenderer.infoCard([
+            ["Ứng dụng", String(handlers.length)],
+            ["Prefix", detected, saved ? "1;32" : "1;31"],
+            ["Kết quả", saved ? "ĐÃ LƯU" : "THẤT BẠI", saved ? "1;32" : "1;31"]
+          ], "NHẬN DIỆN PREFIX"));
         } else {
-          console.log("[*] Đã huỷ, giữ nguyên prefix cũ.");
+          console.log(UIRenderer.message("warning", "Đã hủy; prefix cũ được giữ nguyên."));
         }
       }
 
     } else if (choice.trim() === "4") {
 
-      console.log("\n Đang quay lại menu chính...");
+      console.log(UIRenderer.message("info", "Đang quay lại bảng điều khiển..."));
       await new Promise(resolve => setTimeout(resolve, 2000));
       return;
     } else {
-      console.log("[-] Lựa chọn không hợp lệ!");
+      console.log(UIRenderer.message("error", "Lựa chọn không hợp lệ."));
     }
 
 
-    console.log("\n Đang quay lại menu chính...");
+    console.log(UIRenderer.message("info", "Đang quay lại bảng điều khiển..."));
     await sleep(900);
     return;
   }
 
   async configureActivity(rl) {
-    console.clear();
-    console.log(UIRenderer.renderTitle());
-    console.log("\n Cấu hình Activity Roblox");
-
+    UIRenderer.screen("Activity Roblox", "Điểm khởi chạy ứng dụng");
 
     const currentActivity = Utils.loadActivityConfig();
     const currentPrefix = Utils.loadPackagePrefixConfig();
-
-    if (currentActivity) {
-      console.log(`\n Activity tùy chỉnh hiện tại: ${currentActivity}`);
-      console.log(`⚠️  Đang sử dụng activity tùy chỉnh thay vì activity mặc định!`);
-    } else {
-      console.log(`\n Activity hiện tại: TỰ ĐỘNG DÒ (khuyến nghị)`);
-      console.log(`   Bot sẽ tự tìm activity thật của từng app qua resolve-activity/dumpsys,`);
-      console.log(`   thử lần lượt rồi nhớ activity chạy được. Chỉ đặt tay khi tự dò thất bại.`);
+    console.log(UIRenderer.infoCard([
+      ["Chế độ", currentActivity ? "TÙY CHỈNH" : "TỰ ĐỘNG DÒ", currentActivity ? "1;33" : "1;32"],
+      ["Activity", currentActivity || "resolve-activity / dumpsys"],
+      ["Prefix", currentPrefix]
+    ], "CẤU HÌNH ACTIVITY"));
+    if (!currentActivity) {
+      console.log(UIRenderer.message("info", "Chế độ tự động dò được khuyến nghị và sẽ ghi nhớ activity hoạt động."));
     }
 
-    console.log("\n Chọn hành động:");
-    console.log("1. ✏️ Thay đổi activity");
-    console.log("2.  Đặt lại về activity mặc định");
-    console.log("3. ⏭️ Quay lại menu chính");
+    console.log(UIRenderer.options([
+      { key: "1", label: "Thay đổi activity", description: "Nhập tên activity thủ công" },
+      { key: "2", label: "Bật tự động dò", description: "Xóa activity tùy chỉnh", color: "1;32" },
+      { key: "3", label: "Quay lại", description: "Trở về bảng điều khiển", color: "1;31" }
+    ]));
 
-    const choice = await Utils.ask(rl, "\nNhập lựa chọn (1-3): ");
+    const choice = await Utils.ask(rl, UIRenderer.prompt("Lựa chọn [1-3]"));
 
     if (choice.trim() === "1") {
-      console.log("\n✏️ Thay đổi activity Roblox");
-      console.log(`Ví dụ: ${currentPrefix}.client.ActivityProtocolLaunch`);
-      console.log(`        ${currentPrefix}.client.vnggames.ActivityProtocolLaunch`);
-      console.log(`        com.roblox.client.ActivityProtocolLaunch`);
-      console.log("\n⚠️  Lưu ý: Activity phải khớp với package name để hoạt động đúng!");
+      console.log(UIRenderer.infoCard([
+        ["Ví dụ 1", `${currentPrefix}.client.ActivityProtocolLaunch`],
+        ["Ví dụ 2", `${currentPrefix}.client.vnggames.ActivityProtocolLaunch`],
+        ["Lưu ý", "Activity phải khớp package", "1;33"]
+      ], "NHẬP ACTIVITY THỦ CÔNG"));
 
       let newActivity;
       while (true) {
-        newActivity = await Utils.ask(rl, "Nhập activity mới: ");
+        newActivity = await Utils.ask(rl, UIRenderer.prompt("Activity mới"));
         if (newActivity.trim()) {
           break;
         }
-        console.log("[-] Activity không được để trống!");
+        console.log(UIRenderer.message("error", "Activity không được để trống."));
       }
 
-      Utils.saveActivityConfig(newActivity.trim());
-      console.log(`[+] Đã cập nhật activity thành: ${newActivity.trim()}`);
-      console.log(`⚠️  Activity tùy chỉnh sẽ được sử dụng cho tất cả packages!`);
+      const saved = Utils.saveActivityConfig(newActivity.trim());
+      console.log(UIRenderer.infoCard([
+        ["Chế độ", "TÙY CHỈNH", saved ? "1;33" : "1;31"],
+        ["Activity", newActivity.trim()],
+        ["Phạm vi", "Tất cả package"],
+        ["Kết quả", saved ? "ĐÃ CẬP NHẬT" : "THẤT BẠI", saved ? "1;32" : "1;31"]
+      ], "ACTIVITY ROBLOX"));
 
     } else if (choice.trim() === "2") {
       if (currentActivity) {
-        Utils.saveActivityConfig(null);
-        console.log("[+] Đã đặt lại về chế độ tự động dò activity!");
+        const saved = Utils.saveActivityConfig(null);
+        console.log(UIRenderer.infoCard([
+          ["Chế độ", saved ? "TỰ ĐỘNG DÒ" : "TÙY CHỈNH", saved ? "1;32" : "1;31"],
+          ["Activity cũ", currentActivity],
+          ["Kết quả", saved ? "ĐÃ CHUYỂN CHẾ ĐỘ" : "THẤT BẠI", saved ? "1;32" : "1;31"]
+        ], "ACTIVITY ROBLOX"));
       } else {
-        console.log("ℹ️ Đã đang sử dụng activity mặc định!");
+        console.log(UIRenderer.infoCard([
+          ["Chế độ", "TỰ ĐỘNG DÒ", "1;32"],
+          ["Kết quả", "KHÔNG CẦN THAY ĐỔI"]
+        ], "ACTIVITY ROBLOX"));
       }
 
     } else if (choice.trim() === "3") {
 
-      console.log("\n Đang quay lại menu chính...");
+      console.log(UIRenderer.message("info", "Đang quay lại bảng điều khiển..."));
       await new Promise(resolve => setTimeout(resolve, 2000));
       return;
     } else {
-      console.log("[-] Lựa chọn không hợp lệ!");
+      console.log(UIRenderer.message("error", "Lựa chọn không hợp lệ."));
     }
 
 
-    console.log("\n Đang quay lại menu chính...");
+    console.log(UIRenderer.message("info", "Đang quay lại bảng điều khiển..."));
     await sleep(900);
     return;
   }
@@ -2618,51 +2720,55 @@ class MultiRejoinTool {
 
 
   async startAutoRejoin(rl) {
+    UIRenderer.screen("Khởi động Auto Rejoin", "Chọn instance cần chạy");
     const configs = Utils.loadMultiConfigs();
 
     if (Object.keys(configs).length === 0) {
-      console.log("[-] Chưa có config nào! Vui lòng chạy setup packages trước.");
+      console.log(UIRenderer.infoCard([
+        ["Trạng thái", "CHƯA CÓ CẤU HÌNH", "1;31"],
+        ["Hướng dẫn", "Chạy mục 2: Thiết lập package"]
+      ], "KHÔNG THỂ TIẾP TỤC"));
       await new Promise(resolve => setTimeout(resolve, 2000));
       return;
     }
 
 
-    console.log("\n Kiểm tra toàn vẹn hệ thống...");
+    console.log(UIRenderer.message("info", "Đang kiểm tra toàn vẹn hệ thống..."));
     const isValid = Utils.validatePackageIntegrity(configs);
 
     if (!isValid) {
-      console.log("\n Quay lại menu chính sau 5 giây...");
+      console.log(UIRenderer.message("warning", "Sẽ quay lại bảng điều khiển sau 5 giây."));
       await new Promise(resolve => setTimeout(resolve, 5000));
       return;
     }
 
 
 
-    console.log("\n Danh sách packages đã cấu hình:");
+    console.log(UIRenderer.renderSection("Danh sách cấu hình", `${Object.keys(configs).length} package sẵn sàng`));
     console.log(UIRenderer.displayConfiguredPackages(configs));
 
-    console.log("\n Chọn packages để chạy:");
-    console.log("0.  Chạy tất cả packages");
+    const packageList = Object.keys(configs);
+    console.log(UIRenderer.options([
+      { key: "0", label: "Chạy tất cả package", description: `${packageList.length} instance đã cấu hình`, color: "1;32" },
+      ...packageList.map((packageName, index) => {
+        const config = configs[packageName];
+        return {
+          key: index + 1,
+          label: Utils.packageLabel(packageName),
+          description: `${Utils.maskSensitiveInfo(config.username)} • ${config.gameName || "Unknown"}`
+        };
+      })
+    ], { footer: "Có thể chọn nhiều số, cách nhau bằng dấu cách" }));
 
-    let index = 1;
-    const packageList = [];
-    for (const [packageName, config] of Object.entries(configs)) {
-      const packageDisplay = Utils.packageLabel(packageName, ' ');
-
-
-      const maskedUsername = Utils.maskSensitiveInfo(config.username);
-
-      console.log(`${index}. ${packageDisplay} (${maskedUsername})`);
-      packageList.push(packageName);
-      index++;
-    }
-
-    const choice = await Utils.ask(rl, "\nNhập lựa chọn (0 để chạy tất cả, hoặc số cách nhau bởi khoảng trắng): ");
+    const choice = await Utils.ask(rl, UIRenderer.prompt("Chọn package cần chạy"));
     let selectedPackages = [];
 
     if (choice.trim() === "0") {
       selectedPackages = Object.keys(configs);
-      console.log(" Sẽ chạy tất cả packages!");
+      console.log(UIRenderer.selectionCard(
+        selectedPackages.map((pkg) => Utils.packageLabel(pkg)),
+        "PACKAGE SẼ CHẠY"
+      ));
     } else {
       const indices = choice
         .trim()
@@ -2671,19 +2777,16 @@ class MultiRejoinTool {
         .filter(i => i >= 0 && i < packageList.length);
 
       if (indices.length === 0) {
-        console.log("[-] Lựa chọn không hợp lệ!");
+        console.log(UIRenderer.message("error", "Lựa chọn không hợp lệ."));
         await sleep(900);
         return;
       }
 
       selectedPackages = [...new Set(indices.map(i => packageList[i]))];
-      console.log(` Sẽ chạy các packages:`);
-      selectedPackages.forEach((pkg, i) => {
-        console.log(`  - ${i + 1}. ${pkg}`);
-      });
+      console.log(UIRenderer.selectionCard(selectedPackages.map((pkg) => Utils.packageLabel(pkg)), "PACKAGE SẼ CHẠY"));
     }
 
-    console.log("\n Khởi tạo multi-instance rejoin...");
+    console.log(UIRenderer.message("info", "Đang khởi tạo hệ thống multi-instance..."));
     await this.initializeSelectedInstances(selectedPackages, configs);
   }
 
@@ -2697,14 +2800,12 @@ class MultiRejoinTool {
       const cookie = Utils.getRobloxCookie(packageName);
 
       if (!cookie) {
-        console.log(`[-] Không lấy được cookie cho ${packageName}, bỏ qua...`);
+        console.log(UIRenderer.message("error", `Không lấy được cookie cho ${packageName}; đã bỏ qua.`));
         continue;
       }
 
       const user = new RobloxUser(config.username, config.userId, cookie);
-      // Cooldown mặc định = max(90s, delaySec) để game kịp load trước lần rejoin kế tiếp
-      const cooldownSec = Math.max(90, Number(config.delaySec) || 0);
-      const statusHandler = new StatusHandler(cooldownSec);
+      const statusHandler = new StatusHandler();
 
       this.instances.push({
         packageName,
@@ -2724,12 +2825,19 @@ class MultiRejoinTool {
     }
 
     if (this.instances.length === 0) {
-      console.log("[-] Không có instance nào khả dụng!");
+      console.log(UIRenderer.message("error", "Không có instance nào khả dụng."));
       return;
     }
 
-    console.log(`[+] Đã khởi tạo ${this.instances.length} instances!`);
-    console.log(" Bắt đầu auto rejoin trong 3 giây...");
+      const webhookConfig = Utils.loadWebhookConfig();
+      const autoexecConfig = new AutoexecManager().loadConfig();
+      console.log(UIRenderer.infoCard([
+        ["Instance", String(this.instances.length), "1;32"],
+        ["Trạng thái", "SẴN SÀNG", "1;32"],
+        ["Webhook", webhookConfig && webhookConfig.enabled ? "ĐANG BẬT" : "ĐANG TẮT", webhookConfig && webhookConfig.enabled ? "1;32" : "2;37"],
+        ["Autoexec", autoexecConfig ? autoexecConfig.executor : "ĐANG TẮT", autoexecConfig ? "1;32" : "2;37"],
+        ["Khởi động", "Sau 3 giây"]
+      ], "AUTO REJOIN"));
     await new Promise(resolve => setTimeout(resolve, 3000));
 
     this.isRunning = true;
@@ -2850,24 +2958,30 @@ class MultiRejoinTool {
 ╰────────────────────────────╯`);
         }
 
+        console.log(UIRenderer.renderSection("Giám sát trực tiếp", `${this.instances.length} instance đang hoạt động`));
         console.log(UIRenderer.renderMultiInstanceTable(this.instances, this.startTime));
 
         if (webhookConfig && webhookConfig.url) {
           const urlParts = webhookConfig.url.split('/');
           const webhookId = urlParts[urlParts.length - 2] || 'unknown';
-          const statusText = webhookConfig.enabled ? '[+] Đã bật' : '[-] Đã tắt';
-          console.log(`\n Webhook Status: ID ${webhookId} - ${statusText} - [ĐÃ ẨN VÌ LÝ DO BẢO MẬT]`);
-          if (webhookConfig.enabled && webhookIntervalMs) {
-            const nextWebhookIn = Math.max(0, Math.ceil((nextWebhookAt - Date.now()) / 1000));
-            const minutes = Math.floor(nextWebhookIn / 60);
-            const seconds = nextWebhookIn % 60;
-            console.log(` Webhook: ${minutes}m ${seconds}s nữa sẽ gửi báo cáo (${webhookConfig.intervalMinutes} phút/lần)`);
-          } else {
-            console.log(` Webhook: Đã tắt - không gửi báo cáo tự động`);
-          }
+          const statusText = webhookConfig.enabled
+            ? UIRenderer.color("1;32", "BẬT")
+            : UIRenderer.color("1;31", "TẮT");
+          const nextWebhookText = webhookConfig.enabled && webhookIntervalMs
+            ? (() => {
+                const nextWebhookIn = Math.max(0, Math.ceil((nextWebhookAt - Date.now()) / 1000));
+                return `${Math.floor(nextWebhookIn / 60)}m ${nextWebhookIn % 60}s`;
+              })()
+            : "Đã tắt";
+          console.log(UIRenderer.infoCard([
+            ["Webhook ID", webhookId],
+            ["Trạng thái", webhookConfig.enabled ? "ĐANG BẬT" : "ĐANG TẮT", webhookConfig.enabled ? "1;32" : "1;31"],
+            ["Lần gửi tiếp", nextWebhookText],
+            ["Chu kỳ", `${webhookConfig.intervalMinutes} phút`]
+          ], "WEBHOOK"));
         }
 
-        console.log("\n Nhấn Ctrl+C để dừng chương trình");
+        console.log(`\n${UIRenderer.color("2;37", "CTRL+C")}  ${UIRenderer.color("1;37", "Dừng chương trình an toàn")}`);
       }
 
       renderCounter++;
@@ -2883,73 +2997,62 @@ class WebhookManager {
   }
 
   async setupWebhook(rl) {
-    console.clear();
-    console.log(UIRenderer.renderTitle());
-    console.log("\n Cấu hình Webhook Discord");
-    console.log("=".repeat(50));
+    UIRenderer.screen("Webhook Discord", "Báo cáo trạng thái tự động");
 
     if (this.webhookConfig) {
-      console.log(`\n Cấu hình hiện tại:`);
       const urlParts = this.webhookConfig.url.split('/');
       const webhookId = urlParts[urlParts.length - 2] || 'unknown';
-      console.log(` Webhook ID: ${webhookId}`);
-      console.log(` URL: [ĐÃ ẨN VÌ LÝ DO BẢO MẬT]`);
-      console.log(`⏱️ Thời gian gửi: ${this.webhookConfig.intervalMinutes} phút`);
-      console.log(` Trạng thái: ${this.webhookConfig.enabled ? '[+] Đã bật' : '[-] Đã tắt'}`);
+      console.log(UIRenderer.infoCard([
+        ["Webhook ID", webhookId],
+        ["URL", "ĐÃ ẨN VÌ LÝ DO BẢO MẬT"],
+        ["Chu kỳ", `${this.webhookConfig.intervalMinutes} phút`],
+        ["Trạng thái", this.webhookConfig.enabled ? "ĐANG BẬT" : "ĐANG TẮT", this.webhookConfig.enabled ? "1;32" : "1;31"]
+      ], "CẤU HÌNH HIỆN TẠI"));
+      console.log(UIRenderer.options([
+        { key: "1", label: "Chỉnh sửa webhook", description: "Cập nhật URL hoặc chu kỳ gửi" },
+        { key: "2", label: "Bật / Tắt webhook", description: "Thay đổi trạng thái gửi báo cáo", color: "1;33" },
+        { key: "3", label: "Xóa webhook", description: "Xóa cấu hình đã lưu", color: "1;31" },
+        { key: "4", label: "Quay lại", description: "Trở về bảng điều khiển", color: "1;31" }
+      ], { accent: "1;35" }));
 
-      console.log("\n Chọn hành động:");
-      console.log("1. ✏️ Chỉnh sửa webhook");
-      console.log("2.  Bật/Tắt webhook");
-      console.log("3. [-] Xóa webhook");
-      console.log("4. ⏭️ Quay lại menu chính");
-
-      const choice = await Utils.ask(rl, "\nNhập lựa chọn (1-4): ");
-
-      if (choice.trim() === "1") {
-        await this.editWebhook(rl);
-      } else if (choice.trim() === "2") {
-        await this.toggleWebhook(rl);
-      } else if (choice.trim() === "3") {
-        await this.deleteWebhook(rl);
-      } else {
-        return;
-      }
-    } else {
-      console.log("\n Chưa có cấu hình webhook!");
-      console.log("\n Chọn hành động:");
-      console.log("1.  Tạo webhook mới");
-      console.log("2. ⏭️ Quay lại menu chính");
-
-      const choice = await Utils.ask(rl, "\nNhập lựa chọn (1-2): ");
-
-      if (choice.trim() === "1") {
-        await this.createWebhook(rl);
-      } else {
-        return;
-      }
+      const choice = await Utils.ask(rl, UIRenderer.prompt("Lựa chọn [1-4]"));
+      if (choice.trim() === "1") await this.editWebhook(rl);
+      else if (choice.trim() === "2") await this.toggleWebhook(rl);
+      else if (choice.trim() === "3") await this.deleteWebhook(rl);
+      return;
     }
+
+    console.log(UIRenderer.message("warning", "Chưa có cấu hình webhook."));
+    console.log(UIRenderer.options([
+      { key: "1", label: "Tạo webhook mới", description: "Thiết lập URL và chu kỳ gửi", color: "1;32" },
+      { key: "2", label: "Quay lại", description: "Trở về bảng điều khiển", color: "1;31" }
+    ], { accent: "1;35" }));
+    const choice = await Utils.ask(rl, UIRenderer.prompt("Lựa chọn [1-2]"));
+    if (choice.trim() === "1") await this.createWebhook(rl);
   }
 
   async createWebhook(rl) {
-    console.log("\n Tạo cấu hình webhook mới:");
+    console.log(UIRenderer.renderSection("Tạo webhook", "2 bước thiết lập"));
+    console.log(UIRenderer.step(1, 2, "Nhập địa chỉ webhook Discord"));
 
     let webhookUrl;
     while (true) {
-      webhookUrl = await Utils.ask(rl, " Nhập URL webhook Discord: ");
+      webhookUrl = await Utils.ask(rl, UIRenderer.prompt("URL webhook Discord"));
       if (webhookUrl.trim() && webhookUrl.includes('discord.com/api/webhooks/')) {
         break;
       }
-      console.log("[-] URL webhook không hợp lệ! Vui lòng nhập lại.");
+      console.log(UIRenderer.message("error", "URL webhook không hợp lệ. Vui lòng nhập lại."));
     }
 
+    console.log(UIRenderer.step(2, 2, "Thiết lập chu kỳ báo cáo"));
     let intervalMinutes;
     while (true) {
-      const input = await Utils.ask(rl, "⏱️ Thời gian gửi webhook (5-180 phút): ");
+      const input = await Utils.ask(rl, UIRenderer.prompt("Chu kỳ gửi [5-180 phút]"));
       intervalMinutes = parseInt(input);
       if (intervalMinutes >= 5 && intervalMinutes <= 180) {
         break;
       }
-      console.log("[-] Thời gian phải từ 5-180 phút! Vui lòng nhập lại.");
+      console.log(UIRenderer.message("error", "Thời gian phải từ 5 đến 180 phút."));
     }
 
     this.webhookConfig = {
@@ -2958,19 +3061,32 @@ class WebhookManager {
       enabled: true
     };
 
-    Utils.saveWebhookConfig(this.webhookConfig);
-    console.log("[+] Đã lưu cấu hình webhook!");
-    await new Promise(resolve => setTimeout(resolve, 2000));
+    const saved = Utils.saveWebhookConfig(this.webhookConfig);
+    console.log(UIRenderer.infoCard([
+      ["Webhook ID", webhookUrl.trim().split('/').slice(-2, -1)[0] || "unknown"],
+      ["Chu kỳ", `${intervalMinutes} phút`],
+      ["Trạng thái", saved ? "ĐANG BẬT" : "CHƯA LƯU", saved ? "1;32" : "1;31"],
+      ["Kết quả", saved ? "ĐÃ TẠO" : "THẤT BẠI", saved ? "1;32" : "1;31"]
+    ], saved ? "WEBHOOK HOÀN TẤT" : "WEBHOOK GẶP LỖI"));
+    console.log(UIRenderer.message(
+      saved ? "success" : "error",
+      saved ? "Webhook đã được tạo và bật." : "Không thể lưu webhook; cấu hình chưa được áp dụng."
+    ));
+    await sleep(saved ? 1500 : 2500);
   }
 
   async editWebhook(rl) {
-    console.log("\n✏️ Chỉnh sửa webhook:");
+    console.log(UIRenderer.renderSection("Chỉnh sửa webhook", "Giữ trống để dùng giá trị cũ"));
 
     let webhookUrl;
     while (true) {
       const urlParts = this.webhookConfig.url.split('/');
       const webhookId = urlParts[urlParts.length - 2] || 'unknown';
-      webhookUrl = await Utils.ask(rl, ` Webhook ID hiện tại: ${webhookId}\n URL: [ĐÃ ẨN VÌ LÝ DO BẢO MẬT]\nNhập URL mới (Enter để giữ nguyên): `);
+      console.log(UIRenderer.infoCard([
+        ["Webhook ID", webhookId],
+        ["URL", "ĐÃ ẨN VÌ LÝ DO BẢO MẬT"]
+      ], "ĐỊA CHỈ HIỆN TẠI"));
+      webhookUrl = await Utils.ask(rl, UIRenderer.prompt("URL mới [Enter = giữ nguyên]"));
       if (!webhookUrl.trim()) {
         webhookUrl = this.webhookConfig.url;
         break;
@@ -2978,12 +3094,13 @@ class WebhookManager {
       if (webhookUrl.includes('discord.com/api/webhooks/')) {
         break;
       }
-      console.log("[-] URL webhook không hợp lệ! Vui lòng nhập lại.");
+      console.log(UIRenderer.message("error", "URL webhook không hợp lệ. Vui lòng nhập lại."));
     }
 
     let intervalMinutes;
     while (true) {
-      const input = await Utils.ask(rl, `⏱️ Thời gian hiện tại: ${this.webhookConfig.intervalMinutes} phút\nNhập thời gian mới (5-180 phút, Enter để giữ nguyên): `);
+      console.log(UIRenderer.message("info", `Chu kỳ hiện tại: ${this.webhookConfig.intervalMinutes} phút.`));
+      const input = await Utils.ask(rl, UIRenderer.prompt("Chu kỳ mới [5-180, Enter = giữ nguyên]"));
       if (!input.trim()) {
         intervalMinutes = this.webhookConfig.intervalMinutes;
         break;
@@ -2992,7 +3109,7 @@ class WebhookManager {
       if (intervalMinutes >= 5 && intervalMinutes <= 180) {
         break;
       }
-      console.log("[-] Thời gian phải từ 5-180 phút! Vui lòng nhập lại.");
+      console.log(UIRenderer.message("error", "Thời gian phải từ 5 đến 180 phút."));
     }
 
     this.webhookConfig = {
@@ -3001,60 +3118,72 @@ class WebhookManager {
       enabled: this.webhookConfig.enabled
     };
 
-    Utils.saveWebhookConfig(this.webhookConfig);
-    console.log("[+] Đã cập nhật cấu hình webhook!");
-    await new Promise(resolve => setTimeout(resolve, 2000));
+    const saved = Utils.saveWebhookConfig(this.webhookConfig);
+    console.log(UIRenderer.infoCard([
+      ["Webhook ID", webhookUrl.trim().split('/').slice(-2, -1)[0] || "unknown"],
+      ["Chu kỳ", `${intervalMinutes} phút`],
+      ["Trạng thái", this.webhookConfig.enabled ? "ĐANG BẬT" : "ĐANG TẮT", this.webhookConfig.enabled ? "1;32" : "1;31"],
+      ["Kết quả", saved ? "ĐÃ CẬP NHẬT" : "THẤT BẠI", saved ? "1;32" : "1;31"]
+    ], saved ? "WEBHOOK ĐÃ CẬP NHẬT" : "WEBHOOK GẶP LỖI"));
+    await sleep(saved ? 1500 : 2500);
   }
 
   async toggleWebhook(rl) {
-    console.log("\n Bật/Tắt webhook:");
+    console.log(UIRenderer.renderSection("Trạng thái webhook", "Bật hoặc tắt báo cáo"));
     const urlParts = this.webhookConfig.url.split('/');
     const webhookId = urlParts[urlParts.length - 2] || 'unknown';
-    console.log(` Webhook ID: ${webhookId}`);
-    console.log(` URL: [ĐÃ ẨN VÌ LÝ DO BẢO MẬT]`);
-    console.log(`⏱️ Thời gian gửi: ${this.webhookConfig.intervalMinutes} phút`);
-    console.log(` Trạng thái hiện tại: ${this.webhookConfig.enabled ? '[+] Đã bật' : '[-] Đã tắt'}`);
+    console.log(UIRenderer.infoCard([
+      ["Webhook ID", webhookId],
+      ["Chu kỳ", `${this.webhookConfig.intervalMinutes} phút`],
+      ["Trạng thái", this.webhookConfig.enabled ? "ĐANG BẬT" : "ĐANG TẮT", this.webhookConfig.enabled ? "1;32" : "1;31"]
+    ], "XÁC NHẬN THAY ĐỔI"));
 
     const newStatus = !this.webhookConfig.enabled;
     const statusText = newStatus ? 'bật' : 'tắt';
 
-    const confirm = await Utils.ask(rl, `\n⚠️ Bạn có muốn ${statusText} webhook? (y/N): `);
+    const confirm = await Utils.ask(rl, UIRenderer.prompt(`Xác nhận ${statusText} webhook? [y/N]`));
 
     if (confirm.toLowerCase() === 'y' || confirm.toLowerCase() === 'yes') {
       this.webhookConfig.enabled = newStatus;
-      Utils.saveWebhookConfig(this.webhookConfig);
-      console.log(`[+] Đã ${statusText} webhook!`);
-      if (newStatus) {
-        console.log(" Webhook sẽ gửi báo cáo tự động.");
-      } else {
-        console.log(" Webhook sẽ không gửi báo cáo tự động.");
-      }
-      await new Promise(resolve => setTimeout(resolve, 3000));
+      const saved = Utils.saveWebhookConfig(this.webhookConfig);
+      if (!saved) this.webhookConfig.enabled = !newStatus;
+      console.log(UIRenderer.infoCard([
+        ["Webhook ID", webhookId],
+        ["Trạng thái", saved ? (newStatus ? "ĐANG BẬT" : "ĐANG TẮT") : "KHÔNG ĐỔI", saved ? (newStatus ? "1;32" : "1;31") : "1;33"],
+        ["Báo cáo", saved && newStatus ? "SẼ TỰ ĐỘNG GỬI" : "KHÔNG TỰ ĐỘNG GỬI"],
+        ["Kết quả", saved ? "ĐÃ CẬP NHẬT" : "THẤT BẠI", saved ? "1;32" : "1;31"]
+      ], "TRẠNG THÁI WEBHOOK"));
+      await sleep(saved ? 1500 : 2500);
     } else {
-      console.log("[-] Đã hủy thay đổi trạng thái webhook.");
-      await new Promise(resolve => setTimeout(resolve, 2000));
+      console.log(UIRenderer.message("warning", "Đã hủy thay đổi trạng thái webhook."));
+      await sleep(1200);
     }
   }
 
   async deleteWebhook(rl) {
-    console.log("\n[-] Xóa cấu hình webhook:");
+    console.log(UIRenderer.renderSection("Xóa webhook", "Thao tác cần xác nhận"));
     const urlParts = this.webhookConfig.url.split('/');
     const webhookId = urlParts[urlParts.length - 2] || 'unknown';
-    console.log(` Webhook ID: ${webhookId}`);
-    console.log(` URL: [ĐÃ ẨN VÌ LÝ DO BẢO MẬT]`);
-    console.log(`⏱️ Thời gian gửi: ${this.webhookConfig.intervalMinutes} phút`);
+    console.log(UIRenderer.infoCard([
+      ["Webhook ID", webhookId],
+      ["Chu kỳ", `${this.webhookConfig.intervalMinutes} phút`],
+      ["Cảnh báo", "Cấu hình này sẽ bị xóa", "1;31"]
+    ], "WEBHOOK SẼ XÓA"));
 
-    const confirm = await Utils.ask(rl, "\n⚠️ Bạn có chắc chắn muốn xóa webhook? (y/N): ");
+    const confirm = await Utils.ask(rl, UIRenderer.prompt("Chắc chắn xóa webhook? [y/N]"));
 
     if (confirm.toLowerCase() === 'y' || confirm.toLowerCase() === 'yes') {
-      Utils.saveWebhookConfig(null);
-      this.webhookConfig = null;
-      console.log("[+] Đã xóa cấu hình webhook!");
-      console.log(" Webhook sẽ không còn gửi báo cáo tự động.");
-      await new Promise(resolve => setTimeout(resolve, 3000));
+      const saved = Utils.saveWebhookConfig(null);
+      if (saved) this.webhookConfig = null;
+      console.log(UIRenderer.infoCard([
+        ["Webhook ID", webhookId],
+        ["Trạng thái", saved ? "ĐÃ XÓA" : "VẪN ĐƯỢC GIỮ", saved ? "1;32" : "1;31"],
+        ["Báo cáo", saved ? "ĐÃ TẮT" : "KHÔNG THAY ĐỔI"]
+      ], saved ? "XÓA WEBHOOK HOÀN TẤT" : "XÓA WEBHOOK THẤT BẠI"));
+      await sleep(saved ? 1500 : 2500);
     } else {
-      console.log("[-] Đã hủy xóa webhook.");
-      await new Promise(resolve => setTimeout(resolve, 2000));
+      console.log(UIRenderer.message("warning", "Đã hủy xóa webhook."));
+      await sleep(1200);
     }
   }
 
@@ -3135,50 +3264,42 @@ class ConfigEditor {
   async startEdit(rl) {
     try {
       if (Object.keys(this.configs).length === 0) {
-        console.log("[-] Chưa có config nào! Vui lòng chạy setup packages trước.");
+        console.log(UIRenderer.infoCard([
+          ["Trạng thái", "CHƯA CÓ CẤU HÌNH", "1;31"],
+          ["Hướng dẫn", "Chạy mục 2: Thiết lập package"]
+        ], "KHÔNG THỂ CHỈNH SỬA"));
         await new Promise(resolve => setTimeout(resolve, 2000));
         return false;
       }
 
-      console.log("\n Danh sách config hiện tại:");
+      UIRenderer.screen("Chỉnh sửa cấu hình", "Chọn tài khoản cần cập nhật");
+      console.log(UIRenderer.renderSection("Danh sách hiện tại", `${Object.keys(this.configs).length} cấu hình`));
       console.log(this.renderConfigTable());
 
-      console.log("\n Chọn config để chỉnh sửa:");
-      console.log("0. ✏️ Sửa tất cả config");
-
-      let index = 1;
-      const configList = [];
-      for (const [packageName, config] of Object.entries(this.configs)) {
-        try {
-          const packageDisplay = Utils.packageLabel(packageName, ' ');
-
-
-          const maskedUsername = Utils.maskSensitiveInfo(config.username);
-
-
-          const maskedUserId = Utils.maskSensitiveInfo(config.userId);
-
-          console.log(`${index}. ${packageDisplay} (${maskedUsername}) - Game: ${config.gameName || 'Unknown'}`);
-          configList.push({ packageName, config });
-          index++;
-        } catch (error) {
-          console.log(`⚠️ Lỗi khi xử lý config ${packageName}: ${error.message}`);
-          continue;
-        }
-      }
-
+      const configList = Object.entries(this.configs).map(([packageName, config]) => ({ packageName, config }));
       if (configList.length === 0) {
-        console.log("[-] Không có config hợp lệ nào!");
+        console.log(UIRenderer.message("error", "Không có cấu hình hợp lệ nào."));
         await new Promise(resolve => setTimeout(resolve, 2000));
         return false;
       }
 
-      const choice = await Utils.ask(rl, "\nNhập lựa chọn (0 để sửa tất cả, hoặc số cách nhau bởi khoảng trắng): ");
+      console.log(UIRenderer.options([
+        { key: "0", label: "Sửa tất cả cấu hình", description: `${configList.length} tài khoản`, color: "1;32" },
+        ...configList.map(({ packageName, config }, index) => ({
+          key: index + 1,
+          label: Utils.packageLabel(packageName),
+          description: `${Utils.maskSensitiveInfo(config.username)} • ${config.gameName || "Unknown"}`
+        }))
+      ], { footer: "Có thể chọn nhiều số, cách nhau bằng dấu cách" }));
+
+      const choice = await Utils.ask(rl, UIRenderer.prompt("Chọn cấu hình"));
       let selectedConfigs = [];
 
       if (choice.trim() === "0") {
         selectedConfigs = configList;
-        console.log("✏️ Sẽ sửa tất cả config!");
+        console.log(UIRenderer.selectionCard(selectedConfigs.map((cfg) =>
+          `${Utils.packageLabel(cfg.packageName)} • ${Utils.maskSensitiveInfo(cfg.config.username)}`
+        ), "CẤU HÌNH SẼ SỬA"));
       } else {
         try {
           const indices = choice
@@ -3188,21 +3309,15 @@ class ConfigEditor {
             .filter(i => i >= 0 && i < configList.length);
 
           if (indices.length === 0) {
-            console.log("[-] Lựa chọn không hợp lệ!");
+            console.log(UIRenderer.message("error", "Lựa chọn không hợp lệ."));
             await sleep(900);
             return false;
           }
 
-          selectedConfigs = indices.map(i => configList[i]);
-          console.log(`✏️ Sẽ sửa các config:`);
-          selectedConfigs.forEach((cfg, i) => {
-            try {
-              const maskedUsername = Utils.maskSensitiveInfo(cfg.config.username);
-              console.log(`  - ${i + 1}. ${cfg.packageName} (${maskedUsername})`);
-            } catch (error) {
-              console.log(`  - ${i + 1}. ${cfg.packageName} (Lỗi hiển thị)`);
-            }
-          });
+          selectedConfigs = [...new Map(indices.map(i => [configList[i].packageName, configList[i]])).values()];
+          console.log(UIRenderer.selectionCard(selectedConfigs.map((cfg) =>
+            `${Utils.packageLabel(cfg.packageName)} • ${Utils.maskSensitiveInfo(cfg.config.username)}`
+          ), "CẤU HÌNH SẼ SỬA"));
         } catch (error) {
           console.log(`[-] Lỗi khi xử lý lựa chọn: ${error.message}`);
           await sleep(900);
@@ -3213,114 +3328,137 @@ class ConfigEditor {
 
       for (const { packageName, config } of selectedConfigs) {
         try {
-          console.clear();
-          console.log(UIRenderer.renderTitle());
-          console.log(`\n✏️ Chỉnh sửa config cho ${packageName}`);
+          const packageDisplay = Utils.packageLabel(packageName);
+          UIRenderer.screen("Chỉnh sửa cấu hình", packageDisplay);
+          console.log(UIRenderer.infoCard([
+            ["Package", packageDisplay, "1;36"],
+            ["Tài khoản", Utils.maskSensitiveInfo(config.username)],
+            ["User ID", Utils.maskSensitiveInfo(config.userId)],
+            ["Game", `${config.gameName || "Unknown"} (${config.placeId || "Unknown"})`],
+            ["Nhịp quét", `${config.delaySec || "Unknown"} giây`],
+            ["Server VIP", config.linkCode ? "ĐÃ CẤU HÌNH" : "KHÔNG", config.linkCode ? "1;32" : "2;37"]
+          ], "CHI TIẾT CẤU HÌNH"));
+          console.log(UIRenderer.options([
+            { key: "1", label: "Thay đổi game", description: "Chọn game hoặc Place ID mới" },
+            { key: "2", label: "Thay đổi nhịp quét", description: "Khoảng 15-120 giây" },
+            { key: "3", label: "Thay đổi server VIP", description: "Cập nhật link private server", color: "1;35" },
+            { key: "4", label: "Xóa cấu hình", description: "Loại tài khoản này khỏi danh sách", color: "1;31" },
+            { key: "5", label: "Giữ nguyên", description: "Bỏ qua cấu hình này", color: "1;33" }
+          ]));
 
-          const packageDisplay = Utils.packageLabel(packageName, ' ');
-
-          console.log(` Package: ${packageDisplay}`);
-          console.log(` Username: ${Utils.maskSensitiveInfo(config.username)}`);
-          console.log(` User ID: ${Utils.maskSensitiveInfo(config.userId)}`);
-          console.log(` Game: ${config.gameName || 'Unknown'} (${config.placeId || 'Unknown'})`);
-          console.log(`⏱️ Delay: ${config.delaySec || 'Unknown'}s`);
-          if (config.linkCode) {
-            console.log(` Link Code: ${config.linkCode}`);
-          }
-
-          console.log("\n Chọn thông tin để chỉnh sửa:");
-          console.log("1.  Thay đổi game");
-          console.log("2. ⏱️ Thay đổi delay");
-          console.log("3.  Thay đổi link code");
-          console.log("4. [-] Xóa config này");
-          console.log("5. ⏭️ Bỏ qua (giữ nguyên)");
-
-          const editChoice = await Utils.ask(rl, "\nChọn option (1-5): ");
+          const editChoice = await Utils.ask(rl, UIRenderer.prompt("Lựa chọn [1-5]"));
 
           try {
             switch (editChoice.trim()) {
-              case "1":
+              case "1": {
                 const selector = new GameSelector();
                 const game = await selector.chooseGame(rl, Utils.getRobloxCookie(packageName));
                 config.placeId = game.placeId;
                 config.gameName = game.name;
                 config.linkCode = game.linkCode;
-                console.log(`[+] Đã cập nhật game thành ${game.name}!`);
+                console.log(UIRenderer.infoCard([
+                  ["Game", game.name, "1;32"],
+                  ["Place ID", game.placeId],
+                  ["Server VIP", game.linkCode ? "ĐÃ CẤU HÌNH" : "KHÔNG"],
+                  ["Kết quả", "ĐÃ CẬP NHẬT", "1;32"]
+                ], "CẬP NHẬT GAME"));
                 break;
+              }
 
-              case "2":
+              case "2": {
                 let newDelay;
                 while (true) {
                   try {
-                    const input = await Utils.ask(rl, "⏱️ Delay check mới (giây, 15-120): ");
+                    const input = await Utils.ask(rl, UIRenderer.prompt("Nhịp quét mới [15-120 giây]"));
                     const delayValue = parseInt(input) || 0;
                     if (delayValue >= 15 && delayValue <= 120) {
                       newDelay = delayValue;
                       break;
                     }
-                    console.log("[-] Giá trị không hợp lệ! Vui lòng nhập lại.");
+                    console.log(UIRenderer.message("error", "Giá trị phải nằm trong khoảng 15-120 giây."));
                   } catch (error) {
-                    console.log("[-] Lỗi khi nhập delay, vui lòng thử lại.");
+                    console.log(UIRenderer.message("error", "Không đọc được nhịp quét; vui lòng thử lại."));
                   }
                 }
                 config.delaySec = newDelay;
-                console.log(`[+] Đã cập nhật delay thành ${newDelay}s!`);
+                console.log(UIRenderer.infoCard([
+                  ["Package", packageDisplay],
+                  ["Nhịp quét", `${newDelay} giây`, "1;32"],
+                  ["Kết quả", "ĐÃ CẬP NHẬT", "1;32"]
+                ], "CẬP NHẬT NHỊP QUÉT"));
                 break;
+              }
 
               case "3":
-                console.log("\n Dán link private server (chấp nhận cả 2 dạng):");
-                console.log(" - Đã chuyển hướng: https://www.roblox.com/games/2753915549/Blox-Fruits?privateServerLinkCode=7745553094670639602628");
-                console.log(" - Chưa chuyển hướng: https://www.roblox.com/share?code=639f43b65925484c842425b544167a2f&type=Server");
+                console.log(UIRenderer.infoCard([
+                  ["Hỗ trợ", "Link games đã chuyển hướng"],
+                  ["Hỗ trợ", "Link share hoặc share code"],
+                  ["Bảo mật", "Cookie chỉ gửi đến API Roblox", "1;32"]
+                ], "PRIVATE SERVER"));
                 while (true) {
                   try {
-                    const link = await Utils.ask(rl, "\nDán link: ");
+                    const link = await Utils.ask(rl, UIRenderer.prompt("Dán link private server"));
                     const resolved = await Utils.resolveGameLink(link, Utils.getRobloxCookie(packageName));
                     if (!resolved) {
-                      console.log(`[-] Link không hợp lệ hoặc không giải được!`);
+                      console.log(UIRenderer.message("error", "Link không hợp lệ hoặc không thể giải mã."));
                       continue;
                     }
                     config.placeId = resolved.placeId;
-                    config.gameName = resolved.linkCode ? "Private Server " : "Tùy chỉnh";
+                    config.gameName = resolved.linkCode ? "Private Server" : "Tùy chỉnh";
                     config.linkCode = resolved.linkCode;
-                    console.log(`[+] Đã cập nhật link code!`);
+                    console.log(UIRenderer.infoCard([
+                      ["Place ID", resolved.placeId, "1;36"],
+                      ["Link code", resolved.linkCode ? "ĐÃ CẬP NHẬT" : "KHÔNG CÓ"],
+                      ["Kết quả", "ĐÃ CẬP NHẬT", "1;32"]
+                    ], "PRIVATE SERVER"));
                     break;
                   } catch (error) {
-                    console.log(`[-] Lỗi khi xử lý link: ${error.message}`);
+                    console.log(UIRenderer.message("error", `Không thể xử lý link: ${error.message}`));
                   }
                 }
                 break;
 
-              case "4":
-                delete this.configs[packageName];
-                console.log(`[+] Đã xóa config cho ${packageDisplay}!`);
+              case "4": {
+                console.log(UIRenderer.message("warning", `Bạn sắp xóa cấu hình của ${packageDisplay}.`));
+                const confirmDelete = (await Utils.ask(rl, UIRenderer.prompt("Xác nhận xóa? [y/N]"))).trim().toLowerCase();
+                if (confirmDelete === "y" || confirmDelete === "yes") {
+                  delete this.configs[packageName];
+                  console.log(UIRenderer.infoCard([
+                    ["Package", packageDisplay],
+                    ["Kết quả", "ĐÃ XÓA CẤU HÌNH", "1;32"]
+                  ], "XÓA CẤU HÌNH"));
+                } else {
+                  console.log(UIRenderer.message("warning", "Đã hủy xóa cấu hình."));
+                }
                 break;
+              }
 
               case "5":
-                console.log(`⏭️ Giữ nguyên config cho ${packageDisplay}`);
+                console.log(UIRenderer.message("info", `Giữ nguyên cấu hình cho ${packageDisplay}.`));
                 break;
 
               default:
-                console.log("[-] Lựa chọn không hợp lệ!");
+                console.log(UIRenderer.message("error", "Lựa chọn không hợp lệ."));
                 break;
             }
           } catch (error) {
-            console.log(`[-] Lỗi khi chỉnh sửa config: ${error.message}`);
+            console.log(UIRenderer.message("error", `Không thể chỉnh sửa cấu hình: ${error.message}`));
           }
         } catch (error) {
-          console.log(`[-] Lỗi khi xử lý config ${packageName}: ${error.message}`);
+          console.log(UIRenderer.message("error", `Không thể xử lý ${packageName}: ${error.message}`));
           continue;
         }
       }
 
 
-      try {
-        Utils.saveMultiConfigs(this.configs);
-        console.log("\n[+] Hoàn tất chỉnh sửa config!");
-      } catch (error) {
-        console.log(`[-] Lỗi khi lưu config: ${error.message}`);
-      }
+      const saved = Utils.saveMultiConfigs(this.configs);
+      console.log(UIRenderer.infoCard([
+        ["Đã chọn", String(selectedConfigs.length)],
+        ["Còn lại", String(Object.keys(this.configs).length)],
+        ["Kết quả", saved ? "ĐÃ LƯU THAY ĐỔI" : "LƯU THẤT BẠI", saved ? "1;32" : "1;31"]
+      ], saved ? "CHỈNH SỬA HOÀN TẤT" : "CHỈNH SỬA GẶP LỖI"));
 
-      return true;
+      return saved;
     } catch (error) {
       console.log(`[-] Lỗi nghiêm trọng trong ConfigEditor: ${error.message}`);
       await new Promise(resolve => setTimeout(resolve, 2000));
@@ -3330,12 +3468,17 @@ class ConfigEditor {
 
   renderConfigTable() {
     try {
+      const terminalWidth = process.stdout.columns || 110;
       const table = new Table({
-        head: ["STT", "Package", "Username", "Delay", "Game ID", "Game Name", "Server VIP Link"],
-        colWidths: [5, 20, 15, 8, 15, 20, 15],
+        head: ["STT", "PACKAGE", "TÀI KHOẢN", "DELAY", "GAME ID", "TÊN GAME", "SERVER VIP"],
+        colWidths: terminalWidth >= 100
+          ? [5, 20, 15, 9, 16, 21, 14]
+          : [5, 15, 11, 8, 13, 16, 11],
+        wordWrap: true,
+        chars: { top: "─", "top-mid": "┬", "top-left": "╭", "top-right": "╮", bottom: "─", "bottom-mid": "┴", "bottom-left": "╰", "bottom-right": "╯", left: "│", "left-mid": "├", mid: "─", "mid-mid": "┼", right: "│", "right-mid": "┤", middle: "│" },
         style: {
           head: ["cyan"],
-          border: ["gray"]
+          border: ["blue"]
         }
       });
 
