@@ -555,19 +555,30 @@ class Utils {
     }
 
     const q = Utils.shq;
-    const activity =
-      Utils.loadActivityConfig() ||
-      `${Utils.loadPackagePrefixConfig()}.client.ActivityProtocolLaunch`;
-    const activities = [activity];
-    console.log(` [${packageName}] Đang dùng activity: ${activity}`);
+    const customActivity = Utils.loadActivityConfig();
+    const defaultActivity = `${Utils.loadPackagePrefixConfig()}.client.ActivityProtocolLaunch`;
+    // VNG có thể đổi activity giữa các phiên bản. Ưu tiên activity đã resolve từ
+    // chính package, sau đó mới dùng mặc định; không ép VNG mở bằng class lỗi thời.
+    const activities = [...new Set([
+      ...(customActivity ? [customActivity] : Utils.resolveLaunchActivities(packageName)),
+      defaultActivity,
+    ].filter(Boolean))];
+    console.log(` [${packageName}] Activity ứng viên: ${activities.join(", ")}`);
 
-    // Chỉ mở bằng activity đã cấu hình / mặc định (không còn fallback URL thuần)
     const attempts = [];
     for (const a of activities) {
-      const base = `am start -n ${packageName}/${a} -a android.intent.action.VIEW -d ${q(url)} --activity-clear-top`;
+      // single-top không huỷ Activity hiện tại như clear-top, tránh Roblox VNG bị văng
+      // khi Presence API vẫn chưa kịp cập nhật sau lần mở trước.
+      const base = `am start -n ${packageName}/${a} -a android.intent.action.VIEW -d ${q(url)} --activity-single-top`;
       attempts.push({ activity: a, cmd: `/system/bin/${base}` });
       attempts.push({ activity: a, cmd: `su -c ${q(`unset LD_PRELOAD LD_LIBRARY_PATH; /system/bin/${base}`)}` });
     }
+
+    // Fallback vẫn khóa đúng package bằng -p, nên khi cài cả Global và VNG sẽ
+    // không hiện hộp chọn hoặc mở nhầm bản Global.
+    const implicitBase = `am start -a android.intent.action.VIEW -d ${q(url)} -p ${packageName} --activity-single-top`;
+    attempts.push({ activity: "intent theo package", cmd: `/system/bin/${implicitBase}` });
+    attempts.push({ activity: "intent theo package", cmd: `su -c ${q(`unset LD_PRELOAD LD_LIBRARY_PATH; /system/bin/${implicitBase}`)}` });
 
     for (const { activity, cmd } of attempts) {
       try {
@@ -1561,7 +1572,9 @@ class GameSelector {
 }
 
 class StatusHandler {
-  constructor() {
+  constructor(packageName = "") {
+    this.packageName = packageName;
+    this.isVng = /\.vnggames$/i.test(packageName);
     this.joinedAt = 0;
     // Số lần đã bắn rejoin liên tiếp mà user vẫn chưa vào game
     this.consecutiveFails = 0;
@@ -1569,20 +1582,22 @@ class StatusHandler {
     this.lastLaunchOk = true;
     // presenceType của lần kiểm tra trước, dùng để phát hiện CHUYỂN trạng thái
     this.lastPtype = null;
-    // Không còn cooldown chờ Roblox load. Chỉ giữ khoảng chống gọi lệnh trùng
-    // rất ngắn để Presence API nhấp nháy không bắn nhiều lệnh cùng lúc.
-    this.minLaunchGapMs = 8000;
-    // Cần hai mẫu ngoài game liên tiếp để lọc nhiễu ngắn từ Presence API.
+    // VNG khởi động/chuyển map chậm hơn Global. Cho app đủ thời gian cập nhật
+    // Presence để tránh bắn intent liên tục làm Activity bị đóng và gây văng.
+    this.minLaunchGapMs = this.isVng ? 45000 : 15000;
+    // Cần nhiều mẫu ngoài game liên tiếp hơn trên VNG vì Presence thường trễ.
     this.pendingState = null;
     this.pendingStateCount = 0;
-    this.confirmationsRequired = 2;
+    this.confirmationsRequired = this.isVng ? 3 : 2;
   }
 
   /**
    * Đã bắn rejoin nhiều lần mà vẫn không vào được -> nên force-stop app.
    */
   shouldForceStop() {
-    return this.consecutiveFails >= 4;
+    // Tránh force-stop VNG khi ứng dụng chỉ đang tải chậm. Chỉ dùng biện pháp
+    // mạnh sau nhiều lần xác nhận thất bại thực sự.
+    return this.consecutiveFails >= (this.isVng ? 8 : 5);
   }
 
   /** Chống spam tối thiểu, dùng cho trường hợp bỏ qua cooldown */
@@ -2963,7 +2978,7 @@ class MultiRejoinTool {
       }
 
       const user = new RobloxUser(config.username, config.userId, cookie);
-      const statusHandler = new StatusHandler();
+      const statusHandler = new StatusHandler(packageName);
 
       this.instances.push({
         packageName,
@@ -3640,7 +3655,22 @@ process.on('SIGINT', () => gracefulShutdown('SIGINT'));
 process.on('SIGTERM', () => gracefulShutdown('SIGTERM'));
 
 
+process.on('unhandledRejection', (reason) => {
+  console.error(`[-] Lỗi bất đồng bộ: ${reason && reason.stack ? reason.stack : reason}`);
+});
+process.on('uncaughtException', (error) => {
+  console.error(`[-] Lỗi không xử lý: ${error && error.stack ? error.stack : error}`);
+  Utils.disableWakeLock();
+  process.exitCode = 1;
+});
+
 (async () => {
-  const tool = new MultiRejoinTool();
-  await tool.start();
+  try {
+    const tool = new MultiRejoinTool();
+    await tool.start();
+  } catch (error) {
+    console.error(`[-] Tool dừng do lỗi: ${error && error.stack ? error.stack : error}`);
+    Utils.disableWakeLock();
+    process.exitCode = 1;
+  }
 })();
