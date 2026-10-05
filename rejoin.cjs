@@ -556,7 +556,7 @@ class Utils {
 
     const q = Utils.shq;
     const customActivity = Utils.loadActivityConfig();
-    const defaultActivity = `${Utils.loadPackagePrefixConfig()}.client.ActivityProtocolLaunch`;
+    const defaultActivity = "com.roblox.client.ActivityProtocolLaunch";
     // VNG có thể đổi activity giữa các phiên bản. Ưu tiên activity đã resolve từ
     // chính package, sau đó mới dùng mặc định; không ép VNG mở bằng class lỗi thời.
     const activities = [...new Set([
@@ -2831,12 +2831,12 @@ class MultiRejoinTool {
   /**
    * MỤC 5 — ACTIVITY ROBLOX
    * Không còn chế độ tự dò / cache.
-   * Chỉ có 2 chế độ: TÙY CHỈNH (nhập tay) hoặc MẶC ĐỊNH theo prefix.
+   * Chỉ có 2 chế độ: TÙY CHỈNH (nhập tay) hoặc MẶC ĐỊNH cố định.
    */
   async configureActivity(rl) {
     while (true) {
       const prefix = Utils.loadPackagePrefixConfig();
-      const defaultActivity = `${prefix}.client.ActivityProtocolLaunch`;
+      const defaultActivity = "com.roblox.client.ActivityProtocolLaunch";
       const customActivity = Utils.loadActivityConfig();
       const effective = customActivity || defaultActivity;
 
@@ -2852,7 +2852,7 @@ class MultiRejoinTool {
 
       console.log(UIRenderer.options([
         { key: "1", label: "Thay đổi activity", description: "Nhập tên class activity thủ công", color: "1;36" },
-        { key: "2", label: "Khôi phục mặc định", description: "Dùng ActivityProtocolLaunch theo prefix", color: "1;32" },
+        { key: "2", label: "Khôi phục mặc định", description: "Dùng com.roblox.client.ActivityProtocolLaunch", color: "1;32" },
         { key: "0", label: "Quay lại", description: "Trở về menu chính", color: "1;31" }
       ], { footer: "Không tự dò • Không dùng cache activity", accent: "1;35" }));
 
