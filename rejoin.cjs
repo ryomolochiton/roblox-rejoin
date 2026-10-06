@@ -866,7 +866,18 @@ class GameSelector {
     };
   }
 
-  async chooseGame(rl) {
+  async chooseGame(rl, cookie = null) {
+    // Có cookie -> thử lấy danh sách game tài khoản hay chơi.
+    // Lỗi / không có dữ liệu -> tự dùng danh sách có sẵn bên dưới.
+    if (cookie) {
+      console.log(UIRenderer.message("info", "Đang lấy danh sách game tài khoản hay chơi..."));
+      const recent = await GameSelector.fetchRecentGames(cookie);
+      if (recent.length) {
+        const picked = await this.chooseFromRecent(rl, recent);
+        if (picked) return picked;
+      }
+    }
+
     const maxKey = Math.max(...Object.keys(this.GAMES).map(Number));
     console.log(UIRenderer.renderSection("Chọn game", "Điểm đến Auto Rejoin"));
     console.log(UIRenderer.options([
@@ -881,35 +892,7 @@ class GameSelector {
     const ans = (await Utils.ask(rl, UIRenderer.prompt(`Chọn game [0-${maxKey}]`))).trim();
 
     if (ans === "0") {
-      console.log(UIRenderer.options([
-        { key: "1", label: "Nhập Place ID", description: "Dùng ID game thủ công" },
-        { key: "2", label: "Private Server", description: "Dán link redirect sau khi vào private server", color: "1;35" }
-      ], { footer: "Chọn cách thêm game tùy chỉnh" }));
-      const sub = (await Utils.ask(rl, UIRenderer.prompt("Lựa chọn [1-2]"))).trim();
-      if (sub === "1") {
-        const pid = (await Utils.ask(rl, UIRenderer.prompt("Place ID"))).trim();
-        return { placeId: pid, name: "Tùy chỉnh", linkCode: null };
-      }
-      if (sub === "2") {
-        console.log(UIRenderer.infoCard([
-          ["Cách lấy", "Dán link redirect sau khi vào private server"],
-          ["Ví dụ", "https://www.roblox.com/games/2753915549/Blox-Fruits?privateServerLinkCode=77455530946706396026289495938493"]
-        ], "PRIVATE SERVER"));
-        while (true) {
-          const link = await Utils.ask(rl, UIRenderer.prompt("Dán link redirect đã chuyển hướng"));
-          const m = link.match(/\/games\/(\d+)[^?]*\?[^=]*=([\w-]+)/);
-          if (!m) {
-            console.log(UIRenderer.message("error", "Link không hợp lệ!"));
-            continue;
-          }
-          return {
-            placeId: m[1],
-            name: "Private Server",
-            linkCode: m[2],
-          };
-        }
-      }
-      throw new Error(`[-] Không hợp lệ!`);
+      return this.chooseCustom(rl);
     }
 
     if (this.GAMES[ans]) {
@@ -921,6 +904,175 @@ class GameSelector {
     }
 
     throw new Error(`[-] Không hợp lệ!`);
+  }
+
+  /** Menu game tài khoản hay chơi. Trả về null nếu người dùng muốn xem danh sách có sẵn. */
+  async chooseFromRecent(rl, recent) {
+    console.log(UIRenderer.renderSection("Chọn game", "Game tài khoản này hay chơi"));
+    console.log(UIRenderer.options([
+      ...recent.map((game, index) => ({
+        key: String(index + 1),
+        label: game.name,
+        description: `Place ID: ${game.placeId}`
+      })),
+      { key: "L", label: "Danh sách có sẵn", description: "Xem danh sách game mặc định của tool", color: "1;36" },
+      { key: "0", label: "Tùy chỉnh", description: "Nhập Place ID hoặc link private server", color: "1;35" }
+    ]));
+
+    const ans = (await Utils.ask(rl, UIRenderer.prompt(`Chọn game [0-${recent.length} / L]`))).trim();
+
+    if (ans.toLowerCase() === "l") return null;
+    if (ans === "0") return this.chooseCustom(rl);
+
+    const picked = recent[parseInt(ans, 10) - 1];
+    if (picked && /^\d+$/.test(ans)) {
+      return { placeId: picked.placeId, name: picked.name, linkCode: null };
+    }
+    throw new Error(`[-] Không hợp lệ!`);
+  }
+
+  /** Nhập Place ID thủ công hoặc link private server. */
+  async chooseCustom(rl) {
+    console.log(UIRenderer.options([
+      { key: "1", label: "Nhập Place ID", description: "Dùng ID game thủ công" },
+      { key: "2", label: "Private Server", description: "Dán link redirect sau khi vào private server", color: "1;35" }
+    ], { footer: "Chọn cách thêm game tùy chỉnh" }));
+    const sub = (await Utils.ask(rl, UIRenderer.prompt("Lựa chọn [1-2]"))).trim();
+    if (sub === "1") {
+      const pid = (await Utils.ask(rl, UIRenderer.prompt("Place ID"))).trim();
+      return { placeId: pid, name: "Tùy chỉnh", linkCode: null };
+    }
+    if (sub === "2") {
+      console.log(UIRenderer.infoCard([
+        ["Cách lấy", "Dán link redirect sau khi vào private server"],
+        ["Ví dụ", "https://www.roblox.com/games/2753915549/Blox-Fruits?privateServerLinkCode=77455530946706396026289495938493"]
+      ], "PRIVATE SERVER"));
+      while (true) {
+        const link = await Utils.ask(rl, UIRenderer.prompt("Dán link redirect đã chuyển hướng"));
+        const m = link.match(/\/games\/(\d+)[^?]*\?[^=]*=([\w-]+)/);
+        if (!m) {
+          console.log(UIRenderer.message("error", "Link không hợp lệ!"));
+          continue;
+        }
+        return {
+          placeId: m[1],
+          name: "Private Server",
+          linkCode: m[2],
+        };
+      }
+    }
+    throw new Error(`[-] Không hợp lệ!`);
+  }
+
+  /**
+   * Lấy game tài khoản hay chơi (mục "Continue / Recently played" ở trang chủ Roblox).
+   * API này không chính thức nên mọi lỗi đều trả về [] để tool dùng danh sách có sẵn.
+   */
+  static async fetchRecentGames(cookie, limit = 10) {
+    const headers = {
+      Cookie: cookie,
+      "User-Agent": "Mozilla/5.0 (Linux; Android 10; Termux)",
+      Accept: "application/json",
+      "Content-Type": "application/json",
+    };
+    const body = {
+      pageType: "Home",
+      sessionId: typeof require("crypto").randomUUID === "function"
+        ? require("crypto").randomUUID()
+        : `${Date.now()}-${Math.random().toString(16).slice(2)}`,
+    };
+    const url = "https://apis.roblox.com/discovery-api/omni-recommendation";
+
+    try {
+      let res;
+      try {
+        res = await axios.post(url, body, { headers, timeout: 15000 });
+      } catch (e) {
+        // Roblox có thể đòi X-CSRF-TOKEN: lấy token từ phản hồi 403 rồi thử lại 1 lần.
+        const token = e.response && e.response.headers && e.response.headers["x-csrf-token"];
+        if (e.response && e.response.status === 403 && token) {
+          res = await axios.post(url, body, {
+            headers: { ...headers, "X-CSRF-TOKEN": token },
+            timeout: 15000
+          });
+        } else {
+          throw e;
+        }
+      }
+
+      const parsed = GameSelector.parseRecentGames(res.data, limit);
+      let games = parsed.games;
+
+      // Thiếu rootPlaceId trong dữ liệu trả về -> đổi universeId sang placeId.
+      const missing = parsed.missingUniverseIds;
+      if (missing.length) {
+        try {
+          const r = await axios.get("https://games.roblox.com/v1/games", {
+            params: { universeIds: missing.join(",") },
+            headers: { "User-Agent": headers["User-Agent"], Accept: "application/json" },
+            timeout: 15000
+          });
+          for (const g of (r.data && r.data.data) || []) {
+            if (g && g.rootPlaceId) {
+              games.push({ placeId: String(g.rootPlaceId), name: g.name || `Game ${g.rootPlaceId}` });
+            }
+          }
+        } catch (e) {
+          console.log(UIRenderer.message("warning", `Không đổi được universeId sang placeId: ${e.message}`));
+        }
+      }
+
+      const seen = new Set();
+      games = games.filter((g) => {
+        if (seen.has(g.placeId)) return false;
+        seen.add(g.placeId);
+        return true;
+      }).slice(0, limit);
+
+      if (!games.length) {
+        const topics = parsed.topics.length ? parsed.topics.join(", ") : "không có";
+        console.log(UIRenderer.message("warning", `Không thấy game gần đây của tài khoản (các mục Roblox trả về: ${topics}). Dùng danh sách có sẵn.`));
+      }
+      return games;
+    } catch (e) {
+      const status = e.response && e.response.status ? ` (HTTP ${e.response.status})` : "";
+      console.log(UIRenderer.message("warning", `Không lấy được game gần đây${status}: ${e.message}. Dùng danh sách có sẵn.`));
+      return [];
+    }
+  }
+
+  /** Tách game từ phản hồi omni-recommendation. Hàm thuần, không gọi mạng. */
+  static parseRecentGames(data, limit = 10) {
+    const out = { games: [], missingUniverseIds: [], topics: [] };
+    const sorts = Array.isArray(data && data.sorts) ? data.sorts : [];
+    const label = (s) => Object.entries(s || {})
+      .filter(([k, v]) => k !== "recommendationList" && (typeof v === "string" || typeof v === "number"))
+      .map(([, v]) => String(v))
+      .join(" ");
+
+    out.topics = sorts.map((s) => String((s && (s.topic || s.sortDisplayName || s.sortName || s.sortId)) || "?"));
+
+    const wanted = /continue|recent|jump back|resume|tiếp tục|gần đây/i;
+    const sort = sorts.find((s) => wanted.test(label(s)));
+    if (!sort) return out;
+
+    const list = Array.isArray(sort.recommendationList) ? sort.recommendationList : [];
+    const metaGame = (data.contentMetadata && data.contentMetadata.Game) || {};
+
+    for (const item of list) {
+      if (!item || !item.contentId) continue;
+      if (item.contentType && String(item.contentType).toLowerCase() !== "game") continue;
+      if (out.games.length + out.missingUniverseIds.length >= limit) break;
+
+      const id = String(item.contentId);
+      const meta = metaGame[id];
+      if (meta && meta.rootPlaceId) {
+        out.games.push({ placeId: String(meta.rootPlaceId), name: meta.name || `Game ${meta.rootPlaceId}` });
+      } else {
+        out.missingUniverseIds.push(id);
+      }
+    }
+    return out;
   }
 }
 
@@ -1911,7 +2063,7 @@ class MultiRejoinTool {
       ], "XÁC THỰC THÀNH CÔNG"));
 
       const selector = new GameSelector();
-      const game = await selector.chooseGame(rl);
+      const game = await selector.chooseGame(rl, cookie);
 
       let delaySec;
       while (true) {
