@@ -1464,7 +1464,7 @@ class RobloxUser {
         {
           timeout: 15000,
           headers: {
-            Cookie: this.cookie,
+            ...(this.cookie ? { Cookie: this.cookie } : {}),
             "User-Agent": "Mozilla/5.0 (Linux; Android 10; Termux)",
             "Content-Type": "application/json",
             Accept: "application/json",
@@ -2538,7 +2538,13 @@ class MultiRejoinTool {
           await action();
         } catch (error) {
           console.error(`\n[-] Không thể hoàn tất: ${error.message}`);
-          await sleep(1800);
+        }
+
+        // Không xóa thông báo ngay khi một chức năng kết thúc hoặc gặp lỗi.
+        // Điều này đặc biệt hữu ích khi mục Rejoin không tạo được instance
+        // (ví dụ: không đọc được cookie hoặc package không còn tồn tại).
+        if (!this.isRunning) {
+          await Utils.ask(rl, UIRenderer.prompt("Nhấn Enter để quay lại menu"));
         }
       }
     } finally {
@@ -2972,12 +2978,18 @@ class MultiRejoinTool {
       const config = configs[packageName];
       const cookie = Utils.getRobloxCookie(packageName);
 
+      // Mục 2 đã lưu sẵn userId. Cookie chỉ giúp Presence API chính thức trả
+      // dữ liệu đầy đủ hơn, không phải điều kiện bắt buộc để mở Roblox/rejoin.
+      // Trước đây return null tại đây làm package bị bỏ qua và mục 1 dừng ngay.
       if (!cookie) {
-        console.log(UIRenderer.message("error", `Không lấy được cookie cho ${packageName}; đã bỏ qua.`));
-        continue;
+        if (!config.userId) {
+          console.log(UIRenderer.message("error", `${packageName} thiếu cả cookie và userId; hãy chạy lại mục 2.`));
+          continue;
+        }
+        console.log(UIRenderer.message("warning", `Không đọc được cookie cho ${packageName}; tiếp tục bằng userId đã lưu.`));
       }
 
-      const user = new RobloxUser(config.username, config.userId, cookie);
+      const user = new RobloxUser(config.username, config.userId, cookie || null);
       const statusHandler = new StatusHandler(packageName);
 
       this.instances.push({
@@ -2998,7 +3010,12 @@ class MultiRejoinTool {
     }
 
     if (this.instances.length === 0) {
-      console.log(UIRenderer.message("error", "Không có instance nào khả dụng."));
+      console.log(UIRenderer.infoCard([
+        ["Kết quả", "KHÔNG THỂ KHỞI ĐỘNG", "1;31"],
+        ["Nguyên nhân", "Package đã chọn thiếu userId hợp lệ"],
+        ["Khắc phục", "Chạy lại mục 2 để cập nhật tài khoản và package"],
+        ["Lưu ý", "Không đọc được cookie không còn làm dừng mục 1"]
+      ], "AUTO REJOIN THẤT BẠI"));
       return;
     }
 
