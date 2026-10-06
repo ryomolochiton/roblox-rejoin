@@ -125,7 +125,6 @@ const WEBHOOK_CONFIG_PATH = cfgPath("webhook_config.json");
 const PREFIX_CONFIG_PATH = cfgPath("package_prefix_config.json");
 const ACTIVITY_CONFIG_PATH = cfgPath("activity_config.json");
 const AUTOEXEC_CONFIG_PATH = cfgPath("autoexec_config.json");
-const LAUNCH_ACTIVITY_CACHE_PATH = cfgPath("launch_activity_cache.json");
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 const clamp = (value, min, max) => Math.max(min, Math.min(max, value));
@@ -309,28 +308,6 @@ class Utils {
     return env;
   }
 
-  // Nhận diện output lỗi của `am start` (am trả exit code 0 cả khi lỗi)
-  static _amFailed(out) {
-    const s = String(out || "");
-    return /Error:|Exception|Permission Denial|does not exist|not found|Activity class .* does not exist/i.test(s);
-  }
-
-  /** Đóng hẳn app trước khi mở lại (dùng khi app treo / rejoin nhiều lần không lên) */
-  static forceStop(packageName) {
-    const cmds = [
-      `/system/bin/am force-stop ${packageName}`,
-      `su -c 'unset LD_PRELOAD LD_LIBRARY_PATH; /system/bin/am force-stop ${packageName}'`
-    ];
-    for (const c of cmds) {
-      try {
-        execSync(c, { stdio: "pipe", env: Utils.androidEnv(), timeout: 15000 });
-        console.log(`[*] [${packageName}] Đã force-stop app.`);
-        return true;
-      } catch { }
-    }
-    return false;
-  }
-
   /** Chạy 1 lệnh shell, trả về {ok, out}. Không ném exception. */
   static _run(cmd, timeout = 15000) {
     try {
@@ -347,200 +324,6 @@ class Utils {
     }
   }
 
-  /** App có đang chạy không (pidof / ps). */
-  static isAppRunning(packageName) {
-    const probes = [
-      `/system/bin/pidof ${packageName}`,
-      `pidof ${packageName}`,
-      `su -c ${Utils.shq(`unset LD_PRELOAD LD_LIBRARY_PATH; /system/bin/pidof ${packageName}`)}`,
-      `/system/bin/ps -A -o NAME | grep -x ${Utils.shq(packageName)}`
-    ];
-    for (const p of probes) {
-      const r = Utils._run(p, 8000);
-      if (r.ok && r.out.trim()) return true;
-    }
-    return false;
-  }
-
-  static _activityCache = null;
-
-  static _loadActivityCache() {
-    if (Utils._activityCache) return Utils._activityCache;
-    try {
-      if (fs.existsSync(LAUNCH_ACTIVITY_CACHE_PATH)) {
-        Utils._activityCache = JSON.parse(fs.readFileSync(LAUNCH_ACTIVITY_CACHE_PATH, "utf8")) || {};
-        return Utils._activityCache;
-      }
-    } catch (_) { }
-    Utils._activityCache = {};
-    return Utils._activityCache;
-  }
-
-  static _saveActivityCache(packageName, activity) {
-    try {
-      const cache = Utils._loadActivityCache();
-      cache[packageName] = activity;
-      Utils._activityCache = cache;
-      const known = Utils._resolvedActivities.get(packageName) || [];
-      Utils._resolvedActivities.set(packageName, [activity, ...known.filter((x) => x !== activity)]);
-      Utils.writeJsonAtomic(LAUNCH_ACTIVITY_CACHE_PATH, cache);
-    } catch (e) {
-      console.warn(`[!] Không lưu được activity cache: ${e.message}`);
-    }
-  }
-
-  /**
-   * Dò activity thật sự dùng để mở deep-link roblox://.
-   * (Giữ cho mục đích tham khảo; khởi chạy giờ CHỈ dùng activity
-   *  cấu hình tay ở mục 5 hoặc mặc định theo prefix.)
-   *
-   * @returns {string[]} danh sách activity ứng viên, xếp theo độ tin cậy giảm dần.
-   */
-  static _resolvedActivities = new Map();
-
-  static resolveLaunchActivities(packageName) {
-    const memoized = Utils._resolvedActivities.get(packageName);
-    if (memoized && memoized.length) return [...memoized];
-
-    const found = new Map(); // activity -> score
-    const add = (act, score) => {
-      if (!act) return;
-      let a = String(act).trim();
-      if (!a) return;
-      // chuẩn hoá "pkg/.Foo" -> "pkg.Foo"
-      if (a.includes("/")) {
-        const [p, c] = a.split("/");
-        a = c.startsWith(".") ? `${p}${c}` : c;
-      } else if (a.startsWith(".")) {
-        a = `${packageName}${a}`;
-      }
-      if (!a.includes(".")) return;
-      const prev = found.get(a) || 0;
-      if (score > prev) found.set(a, score);
-    };
-
-    const scoreOf = (act) => {
-      const l = act.toLowerCase();
-      if (l.includes("protocollaunch")) return 100;
-      if (l.includes("protocol")) return 90;
-      if (l.includes("deeplink") || l.includes("deep_link")) return 80;
-      if (l.includes("launch")) return 70;
-      if (l.includes("splash")) return 60;
-      if (l.includes("main")) return 50;
-      return 30;
-    };
-
-    // 1) Activity đã cache (lần trước chạy được)
-    const cached = Utils._loadActivityCache()[packageName];
-    if (cached) add(cached, 1000);
-
-    // 2) Activity user cấu hình tay
-    const custom = Utils.loadActivityConfig();
-    if (custom) add(custom, 900);
-
-    // 3) resolve-activity cho scheme roblox://
-    const resolvers = [
-      `/system/bin/cmd package resolve-activity --brief -a android.intent.action.VIEW -d "roblox://placeID=1" ${packageName}`,
-      `su -c ${Utils.shq(`unset LD_PRELOAD LD_LIBRARY_PATH; /system/bin/cmd package resolve-activity --brief -a android.intent.action.VIEW -d 'roblox://placeID=1' ${packageName}`)}`,
-      `/system/bin/cmd package resolve-activity --brief ${packageName}`
-    ];
-    for (const cmd of resolvers) {
-      const r = Utils._run(cmd, 12000);
-      if (!r.ok) continue;
-      for (const line of r.out.split("\n")) {
-        const t = line.trim();
-        if (t.includes("/") && t.startsWith(packageName)) add(t, 850);
-      }
-    }
-
-    // 4) query-activities: liệt kê mọi activity nhận scheme roblox://
-    const queries = [
-      `/system/bin/cmd package query-activities -a android.intent.action.VIEW -d "roblox://placeID=1"`,
-      `su -c ${Utils.shq(`unset LD_PRELOAD LD_LIBRARY_PATH; /system/bin/cmd package query-activities -a android.intent.action.VIEW -d 'roblox://placeID=1'`)}`
-    ];
-    for (const cmd of queries) {
-      const r = Utils._run(cmd, 15000);
-      if (!r.ok) continue;
-      const re = new RegExp(`${packageName.replace(/\./g, "\\.")}/[\\w.$]+`, "g");
-      const m = r.out.match(re);
-      if (m) for (const x of m) add(x, 800);
-    }
-
-    // 5) dumpsys package: quét activity có trong manifest
-    const dumps = [
-      `/system/bin/dumpsys package ${packageName}`,
-      `su -c ${Utils.shq(`unset LD_PRELOAD LD_LIBRARY_PATH; /system/bin/dumpsys package ${packageName}`)}`
-    ];
-    for (const cmd of dumps) {
-      const r = Utils._run(cmd, 20000);
-      if (!r.ok || !r.out.trim()) continue;
-      const re = new RegExp(`${packageName.replace(/\./g, "\\.")}/[\\w.$]+`, "g");
-      const m = r.out.match(re);
-      if (m) for (const x of new Set(m)) {
-        const cls = x.split("/")[1] || "";
-        add(x, scoreOf(cls));
-      }
-      break;
-    }
-
-    // 6) Fallback theo prefix (giữ hành vi cũ làm phương án cuối)
-    const prefix = Utils.loadPackagePrefixConfig();
-    add(`${prefix}.client.ActivityProtocolLaunch`, 20);
-    add(`${packageName}.ActivityProtocolLaunch`, 15);
-    add(`${packageName}.client.ActivityProtocolLaunch`, 10);
-
-    const activities = [...found.entries()]
-      .sort((a, b) => b[1] - a[1])
-      .map(([act]) => act)
-      .slice(0, 8);
-    Utils._resolvedActivities.set(packageName, activities);
-    return [...activities];
-  }
-
-  /**
-   * App đang TẮT HẲN: bắn thẳng deep-link thường thất bại vì process chưa dựng.
-   * Mở app bằng intent LAUNCHER (hoặc monkey) trước, chờ process lên rồi mới join.
-   * @returns {Promise<boolean>} true nếu process đã chạy.
-   */
-  static async coldStart(packageName, maxWaitMs = 12000) {
-    console.log(`[*] [${packageName}] App đang tắt -> cold start trước khi join.`);
-    const q = Utils.shq;
-    const starters = [
-      `/system/bin/monkey -p ${packageName} -c android.intent.category.LAUNCHER 1`,
-      `/system/bin/cmd package resolve-activity --brief ${packageName}`, // no-op an toàn
-      `/system/bin/am start -a android.intent.action.MAIN -c android.intent.category.LAUNCHER -p ${packageName}`,
-      `su -c ${q(`unset LD_PRELOAD LD_LIBRARY_PATH; /system/bin/monkey -p ${packageName} -c android.intent.category.LAUNCHER 1`)}`,
-      `su -c ${q(`unset LD_PRELOAD LD_LIBRARY_PATH; /system/bin/am start -a android.intent.action.MAIN -c android.intent.category.LAUNCHER -p ${packageName}`)}`
-    ];
-
-    for (const cmd of starters) {
-      if (cmd.includes("resolve-activity")) continue;
-      const r = Utils._run(cmd, 20000);
-      if (r.ok && !Utils._amFailed(r.out)) break;
-    }
-
-    // chờ process dựng lên, poll mỗi giây
-    const deadline = Date.now() + maxWaitMs;
-    while (Date.now() < deadline) {
-      if (Utils.isAppRunning(packageName)) {
-        const left = Math.max(0, deadline - Date.now());
-        console.log(`[+] [${packageName}] App đã lên (còn dư ${Math.round(left / 1000)}s), chờ 3s cho ổn định.`);
-        await new Promise((r) => setTimeout(r, 3000));
-        return true;
-      }
-      await new Promise((r) => setTimeout(r, 1000));
-    }
-    console.warn(`[!] [${packageName}] Chờ ${Math.round(maxWaitMs / 1000)}s mà app vẫn chưa lên, vẫn thử bắn deep-link.`);
-    return false;
-  }
-
-  /**
-   * Mở Roblox vào đúng place.
-   * @returns {Promise<boolean>} true nếu lệnh mở app thực sự thành công.
-   *
-   * CHỈ mở bằng activity đã cấu hình tay (mục 5) HOẶC mặc định theo prefix.
-   * Không còn tự dò activity, không còn cache, không fallback URL thuần.
-   */
   static async launch(placeId, linkCode = null, packageName) {
     const url = linkCode
       ? `roblox://placeID=${placeId}&linkCode=${linkCode}`
@@ -549,62 +332,39 @@ class Utils {
     console.log(` [${packageName}] Đang mở: ${url}`);
     if (linkCode) console.log(` [${packageName}] Đã join bằng linkCode: ${linkCode}`);
 
-    // App tắt hẳn -> phải cold start trước, nếu không deep-link sẽ rơi vào hư không
-    if (!Utils.isAppRunning(packageName)) {
-      await Utils.coldStart(packageName);
-    }
 
-    const q = Utils.shq;
-    const customActivity = Utils.loadActivityConfig();
-    const defaultActivity = "com.roblox.client.ActivityProtocolLaunch";
-    // VNG có thể đổi activity giữa các phiên bản. Ưu tiên activity đã resolve từ
-    // chính package, sau đó mới dùng mặc định; không ép VNG mở bằng class lỗi thời.
-    const activities = [...new Set([
-      ...(customActivity ? [customActivity] : Utils.resolveLaunchActivities(packageName)),
-      defaultActivity,
-    ].filter(Boolean))];
-    console.log(` [${packageName}] Activity ứng viên: ${activities.join(", ")}`);
+    let activity;
+    const prefix = this.loadPackagePrefixConfig();
+    const customActivity = this.loadActivityConfig();
 
-    const attempts = [];
-    for (const a of activities) {
-      // single-top không huỷ Activity hiện tại như clear-top, tránh Roblox VNG bị văng
-      // khi Presence API vẫn chưa kịp cập nhật sau lần mở trước.
-      const base = `am start -n ${packageName}/${a} -a android.intent.action.VIEW -d ${q(url)} --activity-single-top`;
-      attempts.push({ activity: a, cmd: `/system/bin/${base}` });
-      attempts.push({ activity: a, cmd: `su -c ${q(`unset LD_PRELOAD LD_LIBRARY_PATH; /system/bin/${base}`)}` });
-    }
 
-    // Fallback vẫn khóa đúng package bằng -p, nên khi cài cả Global và VNG sẽ
-    // không hiện hộp chọn hoặc mở nhầm bản Global.
-    const implicitBase = `am start -a android.intent.action.VIEW -d ${q(url)} -p ${packageName} --activity-single-top`;
-    attempts.push({ activity: "intent theo package", cmd: `/system/bin/${implicitBase}` });
-    attempts.push({ activity: "intent theo package", cmd: `su -c ${q(`unset LD_PRELOAD LD_LIBRARY_PATH; /system/bin/${implicitBase}`)}` });
+    if (customActivity) {
+      activity = customActivity;
+      console.log(` [${packageName}] Sử dụng activity tùy chỉnh: ${activity}`);
+    } else {
 
-    for (const { activity, cmd } of attempts) {
-      try {
-        const out = execSync(cmd, {
-          stdio: "pipe",
-          encoding: "utf8",
-          env: Utils.androidEnv(),
-          timeout: 20000
-        });
+      if (packageName.startsWith(`${prefix}.client.`)) {
 
-        // `am` hay trả exit 0 kèm "Error: ..." -> phải soi output
-        if (Utils._amFailed(out)) {
-          console.warn(`[!] [${packageName}] am báo lỗi (${activity}), thử cách khác: ${String(out).trim().split("\n")[0]}`);
-          continue;
-        }
 
-        console.log(`[+] [${packageName}] Launch OK qua activity: ${activity}`);
-        return true;
-      } catch (e) {
-        const detail = (e.stderr || e.stdout || e.message || "").toString().trim().split("\n")[0];
-        console.warn(`[!] [${packageName}] Thử launch thất bại (${activity}): ${detail}`);
+        activity = `${prefix}.client.ActivityProtocolLaunch`;
+      } else if (packageName === `${prefix}.client`) {
+
+        activity = `${prefix}.client.ActivityProtocolLaunch`;
+      } else {
+
+        activity = `${prefix}.client.ActivityProtocolLaunch`;
       }
+      console.log(` [${packageName}] Sử dụng activity mặc định: ${activity}`);
     }
 
-    console.error(`[-] [${packageName}] Launch failed: không mở được app bằng activity đã cấu hình. Chạy mục 5 để kiểm tra activity.`);
-    return false;
+    const command = `am start -n ${packageName}/${activity} -a android.intent.action.VIEW -d "${url}" --activity-clear-top`;
+
+    try {
+      execSync(command, { stdio: 'pipe' });
+      console.log(`[+] [${packageName}] Launch command executed!`);
+    } catch (e) {
+      console.error(`[-] [${packageName}] Launch failed: ${e.message}`);
+    }
   }
 
   static ask(rl, msg) {
@@ -835,7 +595,6 @@ class Utils {
   static savePackagePrefixConfig(prefix) {
     try {
       const config = { prefix: prefix };
-      Utils._resolvedActivities?.clear();
       Utils.writeJsonAtomic(PREFIX_CONFIG_PATH, config);
       return true;
     } catch (e) {
@@ -861,7 +620,6 @@ class Utils {
   static saveActivityConfig(activity) {
     try {
       const config = { activity: activity };
-      Utils._resolvedActivities?.clear();
       Utils.writeJsonAtomic(ACTIVITY_CONFIG_PATH, config);
       return true;
     } catch (e) {
@@ -1398,28 +1156,15 @@ Timestamp: ${systemInfo.timestamp}
 }
 
 class GameLauncher {
-  /**
-   * @returns {boolean} true nếu app thực sự được mở.
-   */
-  static async handleGameLaunch(shouldLaunch, placeId, linkCode, packageName, rejoinOnly = false, forceStop = false) {
-    if (!shouldLaunch) return false;
+  static async handleGameLaunch(shouldLaunch, placeId, linkCode, packageName, rejoinOnly = false) {
+    if (shouldLaunch) {
+      console.log(` [${packageName}] Starting launch process...`);
 
-    console.log(` [${packageName}] Starting launch process...`);
 
-    // Rejoin liên tục không lên -> app nhiều khả năng đang treo, kill trước
-    if (forceStop) {
-      console.log(`[*] [${packageName}] Rejoin nhiều lần không vào được -> force-stop rồi mở lại.`);
-      Utils.forceStop(packageName);
-      await new Promise(r => setTimeout(r, 2000));
+      await Utils.launch(placeId, linkCode, packageName);
+
+      console.log(`[+] [${packageName}] Launch process completed!`);
     }
-
-    const ok = await Utils.launch(placeId, linkCode, packageName);
-
-    console.log(ok
-      ? `[+] [${packageName}] Launch process completed!`
-      : `[-] [${packageName}] Launch process FAILED - sẽ thử lại vòng sau.`);
-
-    return ok;
   }
 }
 
@@ -1572,164 +1317,77 @@ class GameSelector {
 }
 
 class StatusHandler {
-  constructor(packageName = "") {
-    this.packageName = packageName;
-    this.isVng = /\.vnggames$/i.test(packageName);
+  constructor() {
+    this.hasLaunched = false;
     this.joinedAt = 0;
-    // Số lần đã bắn rejoin liên tiếp mà user vẫn chưa vào game
-    this.consecutiveFails = 0;
-    // Lần rejoin gần nhất thành công ở mức "đã mở được app"
-    this.lastLaunchOk = true;
-    // presenceType của lần kiểm tra trước, dùng để phát hiện CHUYỂN trạng thái
-    this.lastPtype = null;
-    // VNG khởi động/chuyển map chậm hơn Global. Cho app đủ thời gian cập nhật
-    // Presence để tránh bắn intent liên tục làm Activity bị đóng và gây văng.
-    this.minLaunchGapMs = this.isVng ? 45000 : 15000;
-    // Cần nhiều mẫu ngoài game liên tiếp hơn trên VNG vì Presence thường trễ.
-    this.pendingState = null;
-    this.pendingStateCount = 0;
-    this.confirmationsRequired = this.isVng ? 3 : 2;
-  }
-
-  /**
-   * Đã bắn rejoin nhiều lần mà vẫn không vào được -> nên force-stop app.
-   */
-  shouldForceStop() {
-    // Tránh force-stop VNG khi ứng dụng chỉ đang tải chậm. Chỉ dùng biện pháp
-    // mạnh sau nhiều lần xác nhận thất bại thực sự.
-    return this.consecutiveFails >= (this.isVng ? 8 : 5);
-  }
-
-  /** Chống spam tối thiểu, dùng cho trường hợp bỏ qua cooldown */
-  withinMinGap(now) {
-    return this.joinedAt > 0 && (now - this.joinedAt) < this.minLaunchGapMs;
   }
 
   analyzePresence(presence, targetRootPlaceId) {
     const now = Date.now();
 
-    // presenceType 0 = Offline, 1 = Online (ngoài game) -> cả hai đều KHÔNG ở trong game
-    const ptype = presence && presence.userPresenceType !== undefined
-      ? presence.userPresenceType
-      : undefined;
-    // API đôi lúc trả Offline trong một nhịp ngắn. Xác nhận hai mẫu liên tiếp trước
-    // khi rejoin, nhưng cho phép chạy ngay ở lần kiểm tra đầu tiên sau khi khởi động.
-    if (ptype === 2) {
-      this.pendingState = null;
-      this.pendingStateCount = 0;
-    } else if (ptype !== undefined) {
-      if (this.pendingState === ptype) this.pendingStateCount++;
-      else {
-        this.pendingState = ptype;
-        this.pendingStateCount = 1;
-      }
-      if (this.lastPtype !== null && this.pendingStateCount < this.confirmationsRequired) {
-        return {
-          status: "Đang xác nhận",
-          info: "Phát hiện rời game, đang xác nhận lại để tránh rejoin nhầm",
-          shouldLaunch: false,
-          forceStop: false,
-          rejoinOnly: true
-        };
-      }
-    }
-
-    // Không chờ load sau rejoin; chỉ chặn gọi lệnh trùng trong 8 giây.
-    this.lastPtype = ptype;
-    const throttled = this.withinMinGap(now);
-
-    if (ptype === undefined) {
+    if (!presence || presence.userPresenceType === undefined) {
       return {
         status: "Không rõ",
-        info: "Dữ liệu presence thiếu trạng thái; giữ nguyên để tránh rejoin nhầm",
-        shouldLaunch: false,
-        forceStop: false,
+        info: "Không lấy được trạng thái hoặc thiếu rootPlaceId",
+        shouldLaunch: true,
         rejoinOnly: true
       };
     }
 
 
-    if (ptype === 0) {
+    if (presence.userPresenceType === 0) {
       return {
         status: "Offline",
-        info: throttled ? "Đã gửi lệnh rejoin, đang chống lặp ngắn" : "User offline! Tiến hành rejoin ngay!",
-        shouldLaunch: !throttled,
-        forceStop: !throttled && this.shouldForceStop(),
+        info: "User offline! Tiến hành rejoin! ",
+        shouldLaunch: true,
         rejoinOnly: true
       };
     }
 
 
-    if (ptype === 1) {
+    if (presence.userPresenceType === 1) {
       return {
         status: "Online nhưng không trong game",
-        info: throttled ? "Đã gửi lệnh rejoin, đang chống lặp ngắn" : "User online nhưng không trong game. Rejoin ngay!",
-        shouldLaunch: !throttled,
-        forceStop: !throttled && this.shouldForceStop(),
+        info: "User online nhưng không trong game.",
+        shouldLaunch: true,
         rejoinOnly: true
       };
     }
 
 
-    if (ptype !== 2) {
+    if (presence.userPresenceType !== 2) {
       return {
         status: "Không online",
-        info: throttled ? "Đã gửi lệnh đổi map, đang chống lặp ngắn" : "User không trong game. Rejoin ngay!",
-        shouldLaunch: !throttled,
-        forceStop: !throttled && this.shouldForceStop(),
+        info: "User không trong game. Đã mở lại game!",
+        shouldLaunch: true,
         rejoinOnly: true
       };
     }
 
-    // Đang trong game: chấp nhận nếu khớp rootPlaceId HOẶC placeId
-    // (nhiều game có sub-place, chỉ so rootPlaceId sẽ bị rejoin nhầm liên tục)
-    const target = targetRootPlaceId != null ? targetRootPlaceId.toString() : "";
-    const rootId = presence.rootPlaceId != null ? presence.rootPlaceId.toString() : "";
-    const placeId = presence.placeId != null ? presence.placeId.toString() : "";
-    const matched = target && (rootId === target || placeId === target);
 
-    if (!matched) {
-      // Nếu API không trả về place nào (thiếu quyền/cookie) thì không rejoin bừa
-      if (!rootId && !placeId) {
-        return {
-          status: "Trong game",
-          info: "Đang trong game nhưng API không trả về placeId (giữ nguyên)",
-          shouldLaunch: false,
-          rejoinOnly: true
-        };
-      }
-
+    if (!presence.rootPlaceId || presence.rootPlaceId.toString() !== targetRootPlaceId.toString()) {
       return {
         status: "Sai map",
-        info: throttled ? "Đã gửi lệnh đổi map, đang chống lặp ngắn" : `Sai map (root:${rootId || "?"} / place:${placeId || "?"}). Rejoin đúng map!`,
-        shouldLaunch: !throttled,
-        forceStop: !throttled && this.shouldForceStop(),
+        info: `User đang trong game nhưng sai rootPlaceId (${presence.rootPlaceId}). Đã rejoin đúng map! `,
+        shouldLaunch: true,
         rejoinOnly: true
       };
     }
 
-    // Đã vào đúng game -> reset bộ đếm fail
-    this.joinedAt = 0;
-    this.consecutiveFails = 0;
-    this.pendingState = null;
-    this.pendingStateCount = 0;
 
     return {
       status: "Online [+]",
       info: "Đang ở đúng game",
       shouldLaunch: false,
-      forceStop: false,
       rejoinOnly: true
     };
   }
 
-  /** Ghi nhận lần mở app; chỉ giữ mốc chống lặp ngắn, không chờ load. */
-  updateJoinStatus(shouldLaunch, launchOk = true) {
-    if (!shouldLaunch) return;
-
-    this.consecutiveFails++;
-    this.lastLaunchOk = launchOk;
-    this.joinedAt = launchOk ? Date.now() : 0;
+  updateJoinStatus(shouldLaunch) {
+    if (shouldLaunch) {
+      this.joinedAt = Date.now();
+      this.hasLaunched = true;
+    }
   }
 }
 
@@ -2978,19 +2636,13 @@ class MultiRejoinTool {
       const config = configs[packageName];
       const cookie = Utils.getRobloxCookie(packageName);
 
-      // Mục 2 đã lưu sẵn userId. Cookie chỉ giúp Presence API chính thức trả
-      // dữ liệu đầy đủ hơn, không phải điều kiện bắt buộc để mở Roblox/rejoin.
-      // Trước đây return null tại đây làm package bị bỏ qua và mục 1 dừng ngay.
       if (!cookie) {
-        if (!config.userId) {
-          console.log(UIRenderer.message("error", `${packageName} thiếu cả cookie và userId; hãy chạy lại mục 2.`));
-          continue;
-        }
-        console.log(UIRenderer.message("warning", `Không đọc được cookie cho ${packageName}; tiếp tục bằng userId đã lưu.`));
+        console.log(UIRenderer.message("error", `Không lấy được cookie cho ${packageName}, bỏ qua...`));
+        continue;
       }
 
-      const user = new RobloxUser(config.username, config.userId, cookie || null);
-      const statusHandler = new StatusHandler(packageName);
+      const user = new RobloxUser(config.username, config.userId, cookie);
+      const statusHandler = new StatusHandler();
 
       this.instances.push({
         packageName,
@@ -3002,19 +2654,16 @@ class MultiRejoinTool {
         countdown: "00s",
         lastCheck: 0,
         presenceType: "Unknown",
-        networkErrors: 0,
-        rejoinCount: 0,
-        // Mặc định coi như chưa ở trong game -> kiểm tra nhanh ngay từ đầu
-        notInGame: true
+        // Chỉ để bảng giám sát hiển thị số lần rejoin
+        rejoinCount: 0
       });
     }
 
     if (this.instances.length === 0) {
       console.log(UIRenderer.infoCard([
         ["Kết quả", "KHÔNG THỂ KHỞI ĐỘNG", "1;31"],
-        ["Nguyên nhân", "Package đã chọn thiếu userId hợp lệ"],
-        ["Khắc phục", "Chạy lại mục 2 để cập nhật tài khoản và package"],
-        ["Lưu ý", "Không đọc được cookie không còn làm dừng mục 1"]
+        ["Nguyên nhân", "Không lấy được cookie của package đã chọn"],
+        ["Khắc phục", "Đăng nhập Roblox trên package đó rồi chạy lại"]
       ], "AUTO REJOIN THẤT BẠI"));
       return;
     }
@@ -3057,72 +2706,49 @@ class MultiRejoinTool {
         nextAutoexecCheck = now + 15 * 60 * 1000;
       }
 
-      const dueInstances = [];
       for (const instance of this.instances) {
-        const baseDelayMs = (Number(instance.config.delaySec) || 30) * 1000;
-        const normalDelayMs = instance.notInGame
-          ? Math.min(5000, baseDelayMs)
-          : Math.min(baseDelayMs, 30000);
-        // Khi API lỗi liên tục, tăng nhịp retry 5s -> 10s -> 20s -> tối đa 60s.
-        const delayMs = instance.networkErrors
-          ? Math.max(normalDelayMs, Math.min(60000, 5000 * (2 ** Math.min(instance.networkErrors, 4))))
-          : normalDelayMs;
-        const elapsed = now - instance.lastCheck;
-        instance.countdownSeconds = Math.ceil(Math.max(0, delayMs - elapsed) / 1000);
-        if (elapsed >= delayMs) dueInstances.push(instance);
-        if (!instance.presenceType) instance.presenceType = "Unknown";
-      }
+        const { config, user, statusHandler } = instance;
+        const delayMs = config.delaySec * 1000;
 
-      // Các request presence độc lập được chạy đồng thời để nhiều account không chặn nhau.
-      const results = await Promise.allSettled(dueInstances.map(async (instance) => ({
-        instance,
-        presence: await instance.user.getPresence(),
-      })));
+        const timeSinceLastCheck = now - instance.lastCheck;
 
-      for (let i = 0; i < results.length; i++) {
-        const result = results[i];
-        if (result.status === "rejected") {
-          const instance = dueInstances[i];
-          instance.lastCheck = Date.now();
-          instance.networkErrors = (instance.networkErrors || 0) + 1;
-          instance.status = "Lỗi mạng";
-          instance.info = "Presence API gặp lỗi bất ngờ, sẽ tự thử lại.";
-          continue;
-        }
-        const { instance, presence } = result.value;
-        const { config, statusHandler } = instance;
-        instance.lastCheck = Date.now();
+        const timeLeft = Math.max(0, delayMs - timeSinceLastCheck);
+        instance.countdownSeconds = Math.ceil(timeLeft / 1000);
 
-        if (presence && presence.__fetchFailed) {
-          instance.networkErrors = (instance.networkErrors || 0) + 1;
-          instance.status = "Lỗi mạng";
-          instance.info = `Presence API lỗi (${instance.networkErrors} lần), tự tăng thời gian thử lại.`;
-          continue;
+        if (timeSinceLastCheck >= delayMs) {
+          let presence = await user.getPresence();
+          // getPresence() của bản này trả marker __fetchFailed khi lỗi mạng;
+          // logic rejoin coi đó là "không lấy được presence" (null).
+          if (presence && presence.__fetchFailed) presence = null;
+
+          let presenceTypeDisplay = "Unknown";
+          if (presence && presence.userPresenceType !== undefined) {
+            presenceTypeDisplay = presence.userPresenceType.toString();
+          }
+
+          const analysis = statusHandler.analyzePresence(presence, config.placeId);
+
+          if (analysis.shouldLaunch) {
+            GameLauncher.handleGameLaunch(
+              analysis.shouldLaunch,
+              config.placeId,
+              config.linkCode,
+              config.packageName,
+              true
+            );
+            statusHandler.updateJoinStatus(analysis.shouldLaunch);
+            instance.rejoinCount = (instance.rejoinCount || 0) + 1;
+          }
+
+          instance.status = analysis.status;
+          instance.info = analysis.info;
+          instance.presenceType = presenceTypeDisplay;
+          instance.lastCheck = now;
         }
 
-        instance.networkErrors = 0;
-        instance.presenceType = presence && presence.userPresenceType !== undefined
-          ? String(presence.userPresenceType)
-          : "Unknown";
-        const analysis = statusHandler.analyzePresence(presence, config.placeId);
-
-        if (analysis.shouldLaunch) {
-          const launchOk = await GameLauncher.handleGameLaunch(
-            true,
-            config.placeId,
-            config.linkCode,
-            config.packageName || instance.packageName,
-            true,
-            analysis.forceStop
-          );
-          statusHandler.updateJoinStatus(true, launchOk);
-          instance.rejoinCount = (instance.rejoinCount || 0) + (launchOk ? 1 : 0);
-          if (!launchOk) analysis.info += " [mở app thất bại - sẽ thử lại]";
+        if (!instance.presenceType) {
+          instance.presenceType = "Unknown";
         }
-
-        instance.status = analysis.status;
-        instance.info = analysis.info;
-        instance.notInGame = analysis.status !== "Online [+]";
       }
 
       if (webhookConfig && webhookConfig.enabled && webhookIntervalMs && Date.now() >= nextWebhookAt) {
