@@ -1,9 +1,9 @@
 #!/usr/bin/env node
-const { execSync, exec } = require("child_process");
+const { execSync, execFileSync, execFile, spawnSync, exec } = require("child_process");
 function ensurePackages() {
-  // boxen@6+ và screenshot-desktop không bắt buộc trên Android/Termux -> optional
+  // boxen / screenshot-desktop không còn được dùng (không chạy được trên Android) -> bỏ để khởi động nhanh hơn.
   const requiredPackages = ["axios", "cli-table3", "figlet"];
-  const optionalPackages = ["boxen@5.1.2", "screenshot-desktop"];
+  const optionalPackages = [];
 
   const installPkg = (spec, optional) => {
     const name = spec.split("@")[0] || spec;
@@ -99,20 +99,32 @@ const CONFIG_FILENAMES = [
   "launch_activity_cache.json",
 ];
 
-/** Chuyển config cũ (nằm trong repo) sang CONFIG_DIR, chạy 1 lần duy nhất. */
+/**
+ * Chuyển config cũ sang CONFIG_DIR (chỉ chép file còn thiếu).
+ * Nguồn cũ: thư mục repo (bản rất cũ) và ~/.roblox-rejoin theo HOME hiện tại — vì tiến trình root (su)
+ * có thể từng dùng HOME khác, còn nay CONFIG_DIR được truyền cố định từ tiến trình cha.
+ */
 function migrateLegacyConfigs() {
-  if (path.resolve(CONFIG_DIR) === path.resolve(__dirname)) return;
-  for (const name of CONFIG_FILENAMES) {
-    const oldPath = path.join(__dirname, name);
-    const newPath = path.join(CONFIG_DIR, name);
-    try {
-      if (fs.existsSync(oldPath) && !fs.existsSync(newPath)) {
-        fs.copyFileSync(oldPath, newPath);
-        console.log(`[+] Đã chuyển config "${name}" sang ${CONFIG_DIR}`);
-        try { fs.renameSync(oldPath, `${oldPath}.migrated`); } catch (_) {}
+  const sources = [
+    { dir: __dirname, rename: true },
+    { dir: path.join(os.homedir() || __dirname, ".roblox-rejoin"), rename: false },
+  ].filter((s) => path.resolve(s.dir) !== path.resolve(CONFIG_DIR));
+
+  for (const { dir, rename } of sources) {
+    for (const name of CONFIG_FILENAMES) {
+      const oldPath = path.join(dir, name);
+      const newPath = path.join(CONFIG_DIR, name);
+      try {
+        if (fs.existsSync(oldPath) && !fs.existsSync(newPath)) {
+          fs.copyFileSync(oldPath, newPath);
+          console.log(`[+] Đã chuyển config "${name}" sang ${CONFIG_DIR}`);
+          if (rename) {
+            try { fs.renameSync(oldPath, `${oldPath}.migrated`); } catch (_) { }
+          }
+        }
+      } catch (e) {
+        console.error(`[-] Không migrate được "${name}": ${e.message}`);
       }
-    } catch (e) {
-      console.error(`[-] Không migrate được "${name}": ${e.message}`);
     }
   }
 }
@@ -126,47 +138,76 @@ const PREFIX_CONFIG_PATH = cfgPath("package_prefix_config.json");
 const ACTIVITY_CONFIG_PATH = cfgPath("activity_config.json");
 const AUTOEXEC_CONFIG_PATH = cfgPath("autoexec_config.json");
 
+const UI_CONFIG_PATH = cfgPath("ui_config.json");
+
+/**
+ * Thư mục tạm RIÊNG TƯ (0700) nằm trong CONFIG_DIR: bản sao cookie DB, ảnh chụp màn hình,
+ * script đang soạn... Trước đây các file này nằm ở /sdcard hoặc thư mục repo (ai cũng đọc được / bị git clean).
+ */
+const TMP_DIR = path.join(CONFIG_DIR, "tmp");
+try { fs.mkdirSync(TMP_DIR, { recursive: true, mode: 0o700 }); } catch (_) { }
+
+/** Dọn file tạm sót lại từ lần chạy trước (quá 1 giờ). */
+function cleanTmpDir(maxAgeMs = 60 * 60 * 1000) {
+  try {
+    for (const name of fs.readdirSync(TMP_DIR)) {
+      const p = path.join(TMP_DIR, name);
+      try { if (Date.now() - fs.statSync(p).mtimeMs > maxAgeMs) fs.unlinkSync(p); } catch (_) { }
+    }
+  } catch (_) { }
+}
+cleanTmpDir();
+
+const execFileAsync = util.promisify(execFile);
+
 // Activity mặc định cố định, KHÔNG phụ thuộc prefix package.
 const DEFAULT_ACTIVITY = "com.roblox.client.ActivityProtocolLaunch";
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 const clamp = (value, min, max) => Math.max(min, Math.min(max, value));
+// Giám sát trực tiếp vẽ lại mỗi N nhịp (1 nhịp = 1 giây) để hoạt ảnh và đồng hồ chạy mượt.
+const LIVE_REFRESH_TICKS = 1;
 
-// figlet / boxen / screenshot-desktop là tuỳ chọn:
-// boxen >= 6 là ESM-only nên require() sẽ ném ERR_REQUIRE_ESM,
-// screenshot-desktop không hoạt động trên Android. Không được để crash tool.
+// ---- Tham số vận hành ----
+const HTTP_TIMEOUT = 15000;            // timeout cho MỌI request mạng (trước đây không có -> treo cả tool khi mạng chập chờn)
+const LAUNCH_GRACE_MS = 75 * 1000;     // sau khi gửi lệnh mở game, chờ chừng này rồi mới đánh giá lại (tránh mở lại giữa lúc game đang load)
+const LAUNCH_STAGGER_MS = 2000;        // giãn cách khi mở nhiều instance cùng lúc cho đỡ nặng máy
+const COOKIE_REFRESH_MS = 3 * 60 * 1000;
+const RECENT_GAMES_LIMIT = 5;           // số game "tài khoản hay chơi" hiển thị khi chọn game (trước đây là 10)
+const USER_AGENT = "Mozilla/5.0 (Linux; Android 10; Termux)";
+
+const IN_GAME_STATUSES = new Set(["Online [+]", "Trong game"]);
+const ERROR_STATUSES = new Set(["Lỗi mạng", "Cookie hết hạn", "Lỗi mở game"]);
+const isInGameStatus = (status) => IN_GAME_STATUSES.has(String(status || "").trim());
+
+/** Bọc chuỗi an toàn cho shell (dùng khi bắt buộc đi qua `su -c "..."`). */
+const shQuote = (value) => `'${String(value).replace(/'/g, `'\\''`)}'`;
+
+/**
+ * Tạm chuyển hướng console.* vào một hàm sink (dùng cho màn giám sát trực tiếp:
+ * log chen ngang sẽ làm vỡ khung hình, nên gom vào bảng NHẬT KÝ). Trả về hàm khôi phục.
+ */
+function captureConsole(sink) {
+  const methods = ["log", "info", "warn", "error"];
+  const saved = {};
+  for (const m of methods) {
+    saved[m] = console[m];
+    console[m] = (...args) => {
+      try { sink(m, util.format(...args)); } catch (_) { }
+    };
+  }
+  return () => { for (const m of methods) console[m] = saved[m]; };
+}
+
+/** Escape chuỗi để nhúng an toàn vào RegExp. */
+const escapeRegExp = (s) => String(s).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+
+// figlet / screenshot-desktop là tuỳ chọn: thiếu thì dùng phông tích hợp / screencap, không được để crash tool.
 let figlet = null;
 try {
   figlet = require("figlet");
 } catch (e) {
   console.warn(`[!] Không load được figlet, dùng tiêu đề dự phòng: ${e.message}`);
-}
-
-let boxen = null;
-try {
-  const _boxen = require("boxen");
-  boxen = _boxen.default || _boxen;
-  if (typeof boxen !== "function") boxen = null;
-} catch (e) {
-  boxen = null;
-}
-if (!boxen) {
-  // Fallback tự vẽ khung, không phụ thuộc package ESM
-  boxen = (content, opts = {}) => {
-    const padding = typeof opts.padding === "number" ? opts.padding : 1;
-    const lines = String(content).split("\n");
-    const width = Math.max(...lines.map(l => l.length));
-    const pad = " ".repeat(padding);
-    const top = "╭" + "─".repeat(width + padding * 2) + "╮";
-    const bottom = "╰" + "─".repeat(width + padding * 2) + "╯";
-    const body = lines.map(l => {
-      const space = " ".repeat(width - l.length);
-      return opts.align === "center"
-        ? "│" + pad + " ".repeat(Math.floor(space.length / 2)) + l + " ".repeat(Math.ceil(space.length / 2)) + pad + "│"
-        : "│" + pad + l + space + pad + "│";
-    });
-    return [top, ...body, bottom].join("\n");
-  };
 }
 
 let screenshot = null;
@@ -185,65 +226,106 @@ class Utils {
   }
 
   static ensureRoot() {
+    let uid = "";
     try {
-      const uid = execSync("id -u").toString().trim();
-      if (uid !== "0") {
-        const node = execSync("which node").toString().trim();
-        console.log("Cần quyền root, chuyển qua su...");
-        execSync(`su -c "${node} ${__filename}"`, { stdio: "inherit" });
-        process.exit(0);
-      }
+      uid = execSync("id -u", { encoding: "utf8" }).trim();
     } catch (e) {
-      console.error("Không thể chạy với quyền root:", e.message);
+      console.error("Không kiểm tra được quyền hiện tại:", e.message);
       process.exit(1);
     }
+    if (uid === "0") return;
+
+    console.log("Cần quyền root, chuyển qua su...");
+    // Truyền CONFIG_DIR sang tiến trình root để cả 2 phía luôn dùng chung 1 thư mục config
+    // (dưới su, HOME có thể khác -> trước đây dễ "mất" cấu hình). Mọi tham số đều được bọc dấu nháy.
+    const env = [["ROBLOX_REJOIN_HOME", CONFIG_DIR]];
+    for (const key of ["TERM", "NO_COLOR", "FORCE_COLOR", "REJOIN_NO_ANIM"]) {
+      if (process.env[key]) env.push([key, process.env[key]]);
+    }
+    const command = [
+      ...env.map(([k, v]) => `${k}=${shQuote(v)}`),
+      shQuote(process.execPath),
+      shQuote(__filename),
+      ...process.argv.slice(2).map(shQuote)
+    ].join(" ");
+
+    const result = spawnSync("su", ["-c", command], { stdio: "inherit" });
+    if (result.error) {
+      console.error("Không thể chạy với quyền root:", result.error.message);
+      process.exit(1);
+    }
+    process.exit(typeof result.status === "number" ? result.status : 1);
   }
 
+  /** "off" | "pending" | "on" | "failed" — để menu cảnh báo nếu wake lock không bật được. */
+  static wakeLockState = "off";
+
   static enableWakeLock() {
-    try {
-      exec("termux-wake-lock");
-      console.log("Wake lock bật");
-    } catch {
-      console.warn("Không bật được wake lock");
-    }
+    Utils.wakeLockState = "pending";
+    exec("termux-wake-lock", (err) => {
+      Utils.wakeLockState = err ? "failed" : "on";
+    });
   }
 
   static disableWakeLock() {
+    if (Utils.wakeLockState === "off") return;
+    Utils.wakeLockState = "off";
     try {
       execSync("termux-wake-unlock", { stdio: "ignore", timeout: 5000 });
     } catch (_) { }
   }
 
+  /**
+   * Mở game bằng `am start`. Không đi qua shell (tránh injection), kiểm tra đầu vào,
+   * thử `am` rồi `/system/bin/am`, và đọc cả nội dung "Error:" mà am vẫn trả exit code 0.
+   * Trả về { ok, error? } — không in log, để màn giám sát tự ghi vào NHẬT KÝ.
+   */
   static async launch(placeId, linkCode = null, packageName) {
+    if (!/^[A-Za-z0-9_.]+$/.test(String(packageName || ""))) {
+      return { ok: false, error: "Tên package không hợp lệ" };
+    }
+    if (!/^\d+$/.test(String(placeId || ""))) {
+      return { ok: false, error: "Place ID không hợp lệ" };
+    }
+    if (linkCode && !/^[\w-]+$/.test(String(linkCode))) {
+      return { ok: false, error: "Mã server VIP không hợp lệ" };
+    }
+
     const url = linkCode
       ? `roblox://placeID=${placeId}&linkCode=${linkCode}`
       : `roblox://placeID=${placeId}`;
 
-    console.log(` [${packageName}] Đang mở: ${url}`);
-    if (linkCode) console.log(` [${packageName}] Đã join bằng linkCode: ${linkCode}`);
-
-
-    // Activity: dùng giá trị tùy chỉnh nếu có, ngược lại luôn dùng mặc định cố định
-    // (không ghép theo prefix package nữa).
-    let activity;
-    const customActivity = this.loadActivityConfig();
-
-    if (customActivity) {
-      activity = customActivity;
-      console.log(` [${packageName}] Sử dụng activity tùy chỉnh: ${activity}`);
-    } else {
+    // Activity: dùng giá trị tùy chỉnh nếu hợp lệ, ngược lại luôn dùng mặc định cố định.
+    let activity = Utils.loadActivityConfig();
+    if (!activity || !/^[A-Za-z_$][\w$]*(\.[A-Za-z_$][\w$]*)+$/.test(activity)) {
       activity = DEFAULT_ACTIVITY;
-      console.log(` [${packageName}] Sử dụng activity mặc định: ${activity}`);
     }
 
-    const command = `am start -n ${packageName}/${activity} -a android.intent.action.VIEW -d "${url}" --activity-clear-top`;
+    const args = [
+      "start", "-n", `${packageName}/${activity}`,
+      "-a", "android.intent.action.VIEW",
+      "-d", url,
+      "--activity-clear-top"
+    ];
 
-    try {
-      execSync(command, { stdio: 'pipe' });
-      console.log(`[+] [${packageName}] Launch command executed!`);
-    } catch (e) {
-      console.error(`[-] [${packageName}] Launch failed: ${e.message}`);
+    let lastError = "không rõ nguyên nhân";
+    for (const bin of ["am", "/system/bin/am"]) {
+      try {
+        const { stdout, stderr } = await execFileAsync(bin, args, { timeout: 20000, maxBuffer: 1024 * 1024 });
+        const output = `${stdout || ""}\n${stderr || ""}`;
+        const bad = output.split("\n").find((l) => /^\s*(Error|Exception|java\.lang\.)/i.test(l));
+        if (bad) {
+          lastError = bad.trim();
+          continue;
+        }
+        return { ok: true };
+      } catch (e) {
+        // am fallback không tồn tại (ENOENT) thì giữ lại lỗi thật của lần thử trước.
+        if (e.code === "ENOENT" && lastError !== "không rõ nguyên nhân") continue;
+        lastError = String(e.message || e).split("\n")[0];
+      }
     }
+    return { ok: false, error: lastError };
   }
 
   static ask(rl, msg) {
@@ -263,9 +345,17 @@ class Utils {
   static loadMultiConfigs() {
     if (!fs.existsSync(CONFIG_PATH)) return {};
     try {
-      const raw = fs.readFileSync(CONFIG_PATH);
-      return JSON.parse(raw);
-    } catch {
+      const parsed = JSON.parse(fs.readFileSync(CONFIG_PATH, "utf8"));
+      if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) return parsed;
+      throw new Error("sai định dạng");
+    } catch (e) {
+      // Trước đây file hỏng bị âm thầm coi là rỗng rồi bị ghi đè -> mất sạch cấu hình.
+      // Giờ dời sang file .corrupt-* để còn khôi phục thủ công được.
+      try {
+        const backup = `${CONFIG_PATH}.corrupt-${Date.now()}`;
+        fs.renameSync(CONFIG_PATH, backup);
+        console.error(`[-] multi_configs.json bị hỏng (${e.message}); đã giữ lại bản sao: ${path.basename(backup)}`);
+      } catch (_) { }
       return {};
     }
   }
@@ -283,24 +373,59 @@ class Utils {
   static loadWebhookConfig() {
     if (!fs.existsSync(WEBHOOK_CONFIG_PATH)) return null;
     try {
-      const raw = fs.readFileSync(WEBHOOK_CONFIG_PATH);
-      const config = JSON.parse(raw);
-
-
-      if (config && typeof config.enabled === 'undefined') {
-        config.enabled = true;
-      }
-
+      const config = JSON.parse(fs.readFileSync(WEBHOOK_CONFIG_PATH, "utf8"));
+      if (!config || typeof config !== "object") return null;
+      if (typeof config.enabled === "undefined") config.enabled = true;
       return config;
     } catch {
       return null;
     }
   }
 
+  static removeWebhookConfig() {
+    try {
+      if (fs.existsSync(WEBHOOK_CONFIG_PATH)) fs.unlinkSync(WEBHOOK_CONFIG_PATH);
+      return true;
+    } catch (e) {
+      console.error(UIRenderer.message("error", `Không thể xóa cấu hình webhook: ${e.message}`));
+      return false;
+    }
+  }
+
+  /**
+   * Chỉ nhận webhook Discord thật (https + đúng tên miền + đúng đường dẫn). Trước đây chỉ kiểm tra
+   * chuỗi con "discord.com/api/webhooks/" nên một URL lạ chứa chuỗi đó vẫn lọt và nhận cả ảnh chụp màn hình.
+   * Trả về URL chuẩn hóa, hoặc null nếu không hợp lệ.
+   */
+  static parseDiscordWebhook(input) {
+    try {
+      const u = new URL(String(input || "").trim());
+      if (u.protocol !== "https:") return null;
+      const hosts = ["discord.com", "discordapp.com", "ptb.discord.com", "canary.discord.com"];
+      if (!hosts.includes(u.hostname.toLowerCase())) return null;
+      if (!/^\/api(\/v\d+)?\/webhooks\/\d+\/[\w-]+\/?$/.test(u.pathname)) return null;
+      return u.toString();
+    } catch {
+      return null;
+    }
+  }
+
+  static webhookId(url) {
+    const m = String(url || "").match(/\/webhooks\/(\d+)\//);
+    return m ? m[1] : "unknown";
+  }
+
+  static isValidPrefix(prefix) {
+    return /^[A-Za-z][A-Za-z0-9_]*(\.[A-Za-z0-9_]+)*$/.test(String(prefix || ""));
+  }
+
+  static _prefixCache = null;
+
   static savePackagePrefixConfig(prefix) {
     try {
-      const config = { prefix: prefix };
-      Utils.writeJsonAtomic(PREFIX_CONFIG_PATH, config);
+      if (!Utils.isValidPrefix(prefix)) throw new Error("prefix chỉ gồm chữ, số, dấu _ và dấu chấm");
+      Utils.writeJsonAtomic(PREFIX_CONFIG_PATH, { prefix });
+      Utils._prefixCache = null;
       return true;
     } catch (e) {
       console.error(UIRenderer.message("error", `Không thể lưu prefix: ${e.message}`));
@@ -308,17 +433,39 @@ class Utils {
     }
   }
 
+  /** Có cache 3 giây: packageLabel() được gọi mỗi giây cho từng instance, không cần đọc đĩa liên tục. */
   static loadPackagePrefixConfig() {
-    if (!fs.existsSync(PREFIX_CONFIG_PATH)) {
-
-      return "com.roblox";
-    }
+    const cached = Utils._prefixCache;
+    if (cached && Date.now() - cached.at < 3000) return cached.value;
+    let value = "com.roblox";
     try {
-      const raw = fs.readFileSync(PREFIX_CONFIG_PATH);
-      const config = JSON.parse(raw);
-      return config.prefix || "com.roblox";
+      if (fs.existsSync(PREFIX_CONFIG_PATH)) {
+        const config = JSON.parse(fs.readFileSync(PREFIX_CONFIG_PATH, "utf8"));
+        if (config && Utils.isValidPrefix(config.prefix)) value = config.prefix;
+      }
+    } catch (_) { }
+    Utils._prefixCache = { value, at: Date.now() };
+    return value;
+  }
+
+  static loadUiConfig() {
+    const base = { theme: "midnight", font: "auto", anim: true };
+    try {
+      if (!fs.existsSync(UI_CONFIG_PATH)) return base;
+      const parsed = JSON.parse(fs.readFileSync(UI_CONFIG_PATH, "utf8"));
+      return parsed && typeof parsed === "object" ? { ...base, ...parsed } : base;
     } catch {
-      return "com.roblox";
+      return base;
+    }
+  }
+
+  static saveUiConfig(config) {
+    try {
+      Utils.writeJsonAtomic(UI_CONFIG_PATH, config);
+      return true;
+    } catch (e) {
+      console.error(UIRenderer.message("error", `Không thể lưu giao diện: ${e.message}`));
+      return false;
     }
   }
 
@@ -348,144 +495,143 @@ class Utils {
   }
 
   static async takeScreenshot() {
-    try {
+    const stamp = new Date().toISOString().replace(/[:.]/g, "-");
+    const isPng = (buf) =>
+      Buffer.isBuffer(buf) && buf.length > 8 &&
+      buf[0] === 0x89 && buf[1] === 0x50 && buf[2] === 0x4e && buf[3] === 0x47;
 
-      const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
-      const filename = `screenshot_${timestamp}.png`;
-      const filepath = path.join(__dirname, filename);
+    // Lỗi cũ: execSync mặc định chỉ nhận 1MB stdout, mà ảnh PNG cả màn hình điện thoại thường 1.5–5MB
+    // -> ENOBUFS -> tính năng chụp ảnh gần như luôn rơi xuống file thông tin hệ thống. Nâng lên 64MB.
+    const opts = { stdio: ["ignore", "pipe", "pipe"], maxBuffer: 64 * 1024 * 1024, timeout: 20000 };
+    const attempts = [
+      () => execFileSync("screencap", ["-p"], opts),
+      () => execFileSync("su", ["-c", "screencap -p"], opts),
+    ];
 
-
-      const screencapCommand = `su -c "screencap -p"`;
-      const imgBuffer = execSync(screencapCommand, { stdio: 'pipe' });
-
-      fs.writeFileSync(filepath, imgBuffer);
-      console.log(`[*] Đã chụp ảnh: ${filename}`);
-      return filepath;
-    } catch (e) {
-      console.error(`[-] Lỗi khi chụp ảnh với screencap: ${e.message}`);
-
-
+    let lastError = null;
+    for (const run of attempts) {
       try {
-        if (!screenshot) throw new Error("screenshot-desktop không khả dụng");
-        const img = await screenshot();
-        const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
-        const filename = `screenshot_${timestamp}.png`;
-        const filepath = path.join(__dirname, filename);
-
-        fs.writeFileSync(filepath, img);
-        console.log(`[*] Đã chụp ảnh (fallback): ${filename}`);
+        const img = run();
+        if (!isPng(img)) throw new Error("dữ liệu ảnh không hợp lệ");
+        const filepath = path.join(TMP_DIR, `screenshot_${stamp}.png`);
+        fs.writeFileSync(filepath, img, { mode: 0o600 });
+        console.log(`[*] Đã chụp ảnh màn hình (${Math.round(img.length / 1024)} KB)`);
         return filepath;
-      } catch (e2) {
-        console.log(`[-] Không thể chụp ảnh - Tạo file thông tin hệ thống`);
-
-        try {
-          const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
-          const filename = `system_info_${timestamp}.txt`;
-          const filepath = path.join(__dirname, filename);
-
-
-          const systemInfo = {
-            platform: os.platform(),
-            arch: os.arch(),
-            nodeVersion: process.version,
-            uptime: os.uptime(),
-            totalMemory: os.totalmem(),
-            freeMemory: os.freemem(),
-            cpuCount: os.cpus().length,
-            timestamp: new Date().toISOString(),
-            environment: process.env.TERMUX_VERSION ? 'Termux' : 'Other'
-          };
-
-          const content = `=== SYSTEM INFORMATION ===
-Platform: ${systemInfo.platform}
-Architecture: ${systemInfo.arch}
-Node.js Version: ${systemInfo.nodeVersion}
-Uptime: ${Math.floor(systemInfo.uptime / 3600)}h ${Math.floor((systemInfo.uptime % 3600) / 60)}m
-Total Memory: ${Math.round(systemInfo.totalMemory / 1024 / 1024)} MB
-Free Memory: ${Math.round(systemInfo.freeMemory / 1024 / 1024)} MB
-CPU Cores: ${systemInfo.cpuCount}
-Environment: ${systemInfo.environment}
-Timestamp: ${systemInfo.timestamp}
-========================`;
-
-          fs.writeFileSync(filepath, content);
-          console.log(`[*] Đã tạo file thông tin hệ thống: ${filename}`);
-          return filepath;
-        } catch (e3) {
-          console.error(`[-] Không thể tạo file thông tin: ${e3.message}`);
-          return null;
-        }
+      } catch (e) {
+        lastError = e;
       }
+    }
+    console.error(`[-] Lỗi khi chụp ảnh với screencap: ${lastError ? lastError.message : "không rõ"}`);
+
+    try {
+      if (!screenshot) throw new Error("screenshot-desktop không khả dụng");
+      const img = await screenshot();
+      const filepath = path.join(TMP_DIR, `screenshot_${stamp}.png`);
+      fs.writeFileSync(filepath, img, { mode: 0o600 });
+      return filepath;
+    } catch (_) {
+      // Không chụp được -> gửi file thông tin hệ thống để báo cáo vẫn có thêm dữ liệu.
+    }
+
+    try {
+      const filepath = path.join(TMP_DIR, `system_info_${stamp}.txt`);
+      const mb = (v) => Math.round(v / 1024 / 1024);
+      const content = [
+        "=== SYSTEM INFORMATION ===",
+        `Platform: ${os.platform()}`,
+        `Architecture: ${os.arch()}`,
+        `Node.js Version: ${process.version}`,
+        `Uptime: ${Math.floor(os.uptime() / 3600)}h ${Math.floor((os.uptime() % 3600) / 60)}m`,
+        `Total Memory: ${mb(os.totalmem())} MB`,
+        `Free Memory: ${mb(os.freemem())} MB`,
+        `CPU Cores: ${(os.cpus() || []).length}`,
+        `Environment: ${process.env.TERMUX_VERSION ? "Termux" : "Other"}`,
+        `Timestamp: ${new Date().toISOString()}`,
+        "========================"
+      ].join("\n");
+      fs.writeFileSync(filepath, content, { mode: 0o600 });
+      return filepath;
+    } catch (e3) {
+      console.error(`[-] Không thể tạo file thông tin: ${e3.message}`);
+      return null;
     }
   }
 
   static deleteScreenshot(filepath) {
-    // Chỉ xóa file tạm do chính tool tạo trong thư mục script.
+    // Chỉ xóa file tạm do chính tool tạo (thư mục tmp riêng, hoặc thư mục script của phiên bản cũ).
     try {
       const resolved = path.resolve(filepath || "");
-      const allowed = path.dirname(resolved) === path.resolve(__dirname)
-        && /^(screenshot_|system_info_).+\.(png|txt)$/i.test(path.basename(resolved));
-      if (allowed && fs.existsSync(resolved)) {
+      const dir = path.dirname(resolved);
+      const allowedDir = dir === path.resolve(TMP_DIR) || dir === path.resolve(__dirname);
+      const allowedName = /^(screenshot_|system_info_).+\.(png|txt)$/i.test(path.basename(resolved));
+      if (allowedDir && allowedName && fs.existsSync(resolved)) {
         fs.unlinkSync(resolved);
-        console.log(`[-] Đã dọn file tạm: ${path.basename(resolved)}`);
       }
     } catch (e) {
       console.error(`[-] Lỗi khi dọn file tạm: ${e.message}`);
     }
   }
 
+  /**
+   * Gửi embed (kèm ảnh nếu có) tới webhook Discord. Ảnh PNG được nhúng thẳng vào embed
+   * (attachment://...) thay vì đính kèm rời. Luôn dọn file tạm kể cả khi gửi lỗi.
+   */
   static async sendWebhookEmbed(webhookUrl, embedData, screenshotPath = null) {
+    const safeUrl = Utils.parseDiscordWebhook(webhookUrl);
     try {
-      const payload = {
-        embeds: [embedData]
-      };
+      if (!safeUrl) {
+        console.error("[-] URL webhook không hợp lệ, bỏ qua việc gửi.");
+        return false;
+      }
+
+      const embed = { ...embedData };
+      const payload = { username: "REJOIN TOOL", embeds: [embed] };
+      const requestOpts = { timeout: 30000, maxBodyLength: Infinity, maxContentLength: Infinity };
 
       if (screenshotPath && fs.existsSync(screenshotPath)) {
-        const screenshotBuffer = fs.readFileSync(screenshotPath);
-        const fileExt = path.extname(screenshotPath).toLowerCase();
-        const contentType = fileExt === '.png' ? 'image/png' : 'text/plain';
-        const boundary = '----WebKitFormBoundary' + Math.random().toString(16).substr(2);
+        const fileName = path.basename(screenshotPath);
+        const isPngFile = path.extname(fileName).toLowerCase() === ".png";
+        if (isPngFile) embed.image = { url: `attachment://${fileName}` };
 
-        let body = '';
-        body += `--${boundary}\r\n`;
-        body += `Content-Disposition: form-data; name="payload_json"\r\n`;
-        body += `Content-Type: application/json\r\n\r\n`;
-        body += JSON.stringify(payload) + '\r\n';
-        body += `--${boundary}\r\n`;
-        body += `Content-Disposition: form-data; name="file"; filename="${path.basename(screenshotPath)}"\r\n`;
-        body += `Content-Type: ${contentType}\r\n\r\n`;
+        const fileBuffer = fs.readFileSync(screenshotPath);
+        const boundary = "----RejoinBoundary" + Math.random().toString(16).slice(2);
+        const head =
+          `--${boundary}\r\n` +
+          `Content-Disposition: form-data; name="payload_json"\r\n` +
+          `Content-Type: application/json\r\n\r\n` +
+          JSON.stringify(payload) + "\r\n" +
+          `--${boundary}\r\n` +
+          `Content-Disposition: form-data; name="files[0]"; filename="${fileName}"\r\n` +
+          `Content-Type: ${isPngFile ? "image/png" : "text/plain"}\r\n\r\n`;
 
         const multipartBody = Buffer.concat([
-          Buffer.from(body, 'utf8'),
-          screenshotBuffer,
-          Buffer.from(`\r\n--${boundary}--\r\n`, 'utf8')
+          Buffer.from(head, "utf8"),
+          fileBuffer,
+          Buffer.from(`\r\n--${boundary}--\r\n`, "utf8")
         ]);
 
-        await axios.post(webhookUrl, multipartBody, {
+        await axios.post(safeUrl, multipartBody, {
+          ...requestOpts,
           headers: {
-            'Content-Type': `multipart/form-data; boundary=${boundary}`,
-            'Content-Length': multipartBody.length
-          },
-        });
-      } else {
-
-        await axios.post(webhookUrl, payload, {
-          headers: {
-            'Content-Type': 'application/json'
+            "Content-Type": `multipart/form-data; boundary=${boundary}`,
+            "Content-Length": multipartBody.length
           }
         });
+      } else {
+        await axios.post(safeUrl, payload, {
+          ...requestOpts,
+          headers: { "Content-Type": "application/json" }
+        });
       }
 
-      console.log(`[+] Đã gửi webhook thành công!`);
-
-
-      if (screenshotPath) {
-        setTimeout(() => {
-          this.deleteScreenshot(screenshotPath);
-        }, 5000);
-      }
+      console.log("[+] Đã gửi webhook thành công!");
+      return true;
     } catch (e) {
-      console.error(`[-] Lỗi khi gửi webhook: ${e.message}`);
+      const status = e.response && e.response.status ? ` (HTTP ${e.response.status})` : "";
+      console.error(`[-] Lỗi khi gửi webhook${status}: ${e.message}`);
+      return false;
+    } finally {
+      if (screenshotPath) Utils.deleteScreenshot(screenshotPath);
     }
   }
 
@@ -553,7 +699,7 @@ Timestamp: ${systemInfo.timestamp}
       }
 
       const lines = result.split('\n');
-      const packagePattern = new RegExp(`package:(${prefix.replace(/\./g, '\\.')}[^\\s]*)`);
+      const packagePattern = new RegExp(`package:(${escapeRegExp(prefix)}[^\\s]*)`);
 
       let foundAny = false;
       let matchedCount = 0;
@@ -681,53 +827,86 @@ Timestamp: ${systemInfo.timestamp}
   }
 
   static getRobloxCookie(packageName) {
-    console.log(`[*] [${packageName}] Đang lấy cookie ROBLOSECURITY...`);
+    console.log(`[*] [${Utils.packageLabel(packageName)}] Đang lấy cookie ROBLOSECURITY...`);
 
-    try {
-      const cookiesPath = `/data/data/${packageName}/app_webview/Default/Cookies`;
-      const sdcardPath = `/sdcard/cookies_temp_${Date.now()}.db`;
+    if (!/^[A-Za-z0-9_.]+$/.test(String(packageName || ""))) {
+      console.error(`[-] Tên package không hợp lệ: ${packageName}`);
+      return null;
+    }
 
+    const srcDb = `/data/data/${packageName}/app_webview/Default/Cookies`;
+    const stamp = `${process.pid}_${Date.now()}`;
+    // Ưu tiên thư mục riêng tư (0700). /sdcard chỉ là phương án cuối vì mọi app đều đọc được ở đó.
+    const candidates = [
+      path.join(TMP_DIR, `ck_${stamp}.db`),
+      `/sdcard/cookies_temp_${stamp}.db`
+    ];
 
+    const copyFile = (from, to) => {
       try {
-        execSync(`cp "${cookiesPath}" "${sdcardPath}"`);
+        execFileSync("cp", [from, to], { stdio: "pipe" });
+        return true;
       } catch {
-
-        execSync(`su -c "cp '${cookiesPath}' '${sdcardPath}'"`);
+        try {
+          execFileSync("su", ["-c", `cp ${shQuote(from)} ${shQuote(to)}`], { stdio: "pipe" });
+          return true;
+        } catch {
+          return false;
+        }
       }
+    };
 
+    const created = [];
+    let dbCopy = null;
+    try {
+      for (const target of candidates) {
+        if (copyFile(srcDb, target)) {
+          dbCopy = target;
+          created.push(target);
+          break;
+        }
+      }
+      if (!dbCopy) {
+        console.error(`[-] [${Utils.packageLabel(packageName)}] Không sao chép được database cookie (cần quyền root).`);
+        return null;
+      }
+      try { fs.chmodSync(dbCopy, 0o600); } catch (_) { }
+
+      // Sao chép kèm journal/wal (nếu có) để không bỏ sót dữ liệu chưa ghi hẳn vào file chính.
+      for (const suffix of ["-journal", "-wal"]) {
+        if (copyFile(`${srcDb}${suffix}`, `${dbCopy}${suffix}`)) created.push(`${dbCopy}${suffix}`);
+      }
 
       let cookieValue;
       try {
-        const result = execSync(`sqlite3 "${sdcardPath}" "SELECT value FROM cookies WHERE name = '.ROBLOSECURITY' LIMIT 1"`).toString().trim();
-
-        if (!result) {
-          console.error(`[-] [${packageName}] Không tìm được cookie ROBLOSECURITY trong database!`);
-          try { execSync(`rm -f "${sdcardPath}"`); } catch { }
-          return null;
-        }
-
-        cookieValue = result;
+        cookieValue = execFileSync(
+          "sqlite3",
+          [dbCopy, "SELECT value FROM cookies WHERE name = '.ROBLOSECURITY' LIMIT 1"],
+          { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] }
+        ).trim();
       } catch (err) {
-        console.error(`[-] [${packageName}] Lỗi khi query sqlite3: ${err.message}`);
-        try { execSync(`rm -f "${sdcardPath}"`); } catch { }
+        console.error(`[-] [${Utils.packageLabel(packageName)}] Lỗi khi query sqlite3: ${String(err.message).split("\n")[0]}`);
         return null;
       }
 
-
-      try {
-        execSync(`rm -f "${sdcardPath}"`);
-      } catch { }
-
-
-      if (!cookieValue.startsWith("_")) {
-        cookieValue = "_" + cookieValue;
+      if (!cookieValue) {
+        console.error(`[-] [${Utils.packageLabel(packageName)}] Không tìm được cookie ROBLOSECURITY (đã đăng nhập chưa?).`);
+        return null;
       }
 
+      if (!cookieValue.startsWith("_")) cookieValue = "_" + cookieValue;
       return `.ROBLOSECURITY=${cookieValue}`;
-
     } catch (e) {
-      console.error(`[-] [${packageName}] Lỗi khi lấy cookie: ${e.message}`);
+      console.error(`[-] [${Utils.packageLabel(packageName)}] Lỗi khi lấy cookie: ${e.message}`);
       return null;
+    } finally {
+      for (const file of created) {
+        try {
+          fs.unlinkSync(file);
+        } catch {
+          try { execFileSync("rm", ["-f", file], { stdio: "ignore" }); } catch (_) { }
+        }
+      }
     }
   }
 
@@ -739,63 +918,64 @@ Timestamp: ${systemInfo.timestamp}
   }
 
   static async openEditor(rl, initialContent = "") {
+    let hasNano = false;
     try {
-      const tempFile = path.join(__dirname, `temp_script_${Date.now()}.txt`);
-      fs.writeFileSync(tempFile, initialContent);
+      execSync("command -v nano", { stdio: "ignore" });
+      hasNano = true;
+    } catch (_) { }
 
-      execSync('command -v nano', { stdio: 'ignore' });
+    if (hasNano) {
+      const tempFile = path.join(TMP_DIR, `script_${Date.now()}.txt`);
+      try {
+        fs.writeFileSync(tempFile, initialContent, { mode: 0o600 });
+        console.log(UIRenderer.infoCard([
+          ["Trình soạn thảo", "Nano"],
+          ["Thời gian mở", "Sau 3 giây"],
+          ["Hướng dẫn", "Dán script, Ctrl+O lưu, Ctrl+X thoát"]
+        ], "CHUẨN BỊ NHẬP SCRIPT"));
+        await sleep(3000);
 
-      console.log(UIRenderer.infoCard([
-        ["Trình soạn thảo", "Nano"],
-        ["Thời gian mở", "Sau 5 giây"],
-        ["Hướng dẫn", "Dán script, lưu và đóng Nano"]
-      ], "CHUẨN BỊ NHẬP SCRIPT"));
-      await new Promise(resolve => setTimeout(resolve, 5000));
-
-      console.log(UIRenderer.message("info", "Đang mở Nano Editor..."));
-      execSync(`export TERM=xterm && nano "${tempFile}"`, { stdio: 'inherit' });
-
-      if (fs.existsSync(tempFile)) {
-        const content = fs.readFileSync(tempFile, 'utf8');
-        fs.unlinkSync(tempFile);
-        return content;
+        console.log(UIRenderer.message("info", "Đang mở Nano Editor..."));
+        const term = process.env.TERM && process.env.TERM !== "dumb" ? process.env.TERM : "xterm";
+        execFileSync("nano", [tempFile], { stdio: "inherit", env: { ...process.env, TERM: term } });
+        return fs.readFileSync(tempFile, "utf8");
+      } catch (e) {
+        console.log(UIRenderer.message("warning", `Nano gặp lỗi (${String(e.message).split("\n")[0]}); chuyển sang nhập thủ công.`));
+      } finally {
+        // Trước đây file tạm bị bỏ lại trong thư mục script nếu nano lỗi / không có.
+        try { fs.unlinkSync(tempFile); } catch (_) { }
       }
-    } catch (e) {
+    } else {
       console.log(UIRenderer.message("warning", "Nano không khả dụng; chuyển sang nhập thủ công."));
-      console.log(UIRenderer.infoCard([
-        ["Kết thúc", "Gõ EXIT ở một dòng mới"],
-        ["Nội dung cũ", initialContent ? "Đã nạp" : "Không có"]
-      ], "NHẬP SCRIPT THỦ CÔNG"));
-
-      let lines = [];
-      if (initialContent) {
-        console.log(UIRenderer.divider("Nội dung hiện tại"));
-        console.log(initialContent);
-        console.log(UIRenderer.divider());
-        lines = initialContent.split('\n');
-      }
-
-      while (true) {
-        const line = await Utils.ask(rl, "");
-        if (line.trim() === "EXIT") break;
-        lines.push(line);
-      }
-      return lines.join("\n");
     }
-    return initialContent;
+
+    console.log(UIRenderer.infoCard([
+      ["Kết thúc", "Gõ EXIT ở một dòng mới"],
+      ["Nội dung cũ", initialContent ? "Đã nạp" : "Không có"]
+    ], "NHẬP SCRIPT THỦ CÔNG"));
+
+    let lines = [];
+    if (initialContent) {
+      console.log(UIRenderer.divider("Nội dung hiện tại"));
+      console.log(initialContent);
+      console.log(UIRenderer.divider());
+      lines = initialContent.split("\n");
+    }
+
+    while (true) {
+      const line = await Utils.ask(rl, "");
+      if (line.trim() === "EXIT") break;
+      lines.push(line);
+    }
+    return lines.join("\n");
   }
 }
 
 class GameLauncher {
+  /** Trả về kết quả của Utils.launch ({ ok, error? }) để vòng giám sát ghi nhật ký đúng. */
   static async handleGameLaunch(shouldLaunch, placeId, linkCode, packageName, rejoinOnly = false) {
-    if (shouldLaunch) {
-      console.log(` [${packageName}] Starting launch process...`);
-
-
-      await Utils.launch(placeId, linkCode, packageName);
-
-      console.log(`[+] [${packageName}] Launch process completed!`);
-    }
+    if (!shouldLaunch) return { ok: false, skipped: true };
+    return Utils.launch(placeId, linkCode, packageName);
   }
 }
 
@@ -804,6 +984,7 @@ class RobloxUser {
     this.username = username;
     this.userId = userId;
     this.cookie = cookie;
+    this.csrf = null;
   }
 
   async fetchAuthenticatedUser() {
@@ -811,9 +992,10 @@ class RobloxUser {
       const res = await axios.get("https://users.roblox.com/v1/users/authenticated", {
         headers: {
           Cookie: this.cookie,
-          "User-Agent": "Mozilla/5.0 (Linux; Android 10; Termux)",
+          "User-Agent": USER_AGENT,
           Accept: "application/json",
         },
+        timeout: HTTP_TIMEOUT,
       });
 
       const { name, id } = res.data;
@@ -827,87 +1009,89 @@ class RobloxUser {
     }
   }
 
-  async getPresence() {
+  /**
+   * Hỏi trạng thái online của tài khoản.
+   * BẢO MẬT: trước đây cookie .ROBLOSECURITY bị gửi tới presence.roproxy.com (bên thứ ba) — chủ proxy
+   * có thể ghi lại cookie và chiếm tài khoản. Giờ chỉ gọi thẳng presence.roblox.com (kèm X-CSRF-TOKEN).
+   * Trả về { presence, error?, status?, authFailed? } — phân biệt rõ "mạng lỗi" với "user offline".
+   */
+  async checkPresence() {
+    const url = "https://presence.roblox.com/v1/presence/users";
+    const body = { userIds: [Number(this.userId)] };
+    const headers = () => ({
+      Cookie: this.cookie,
+      "User-Agent": USER_AGENT,
+      Accept: "application/json",
+      "Content-Type": "application/json",
+      ...(this.csrf ? { "X-CSRF-TOKEN": this.csrf } : {})
+    });
+
     try {
-      const r = await axios.post(
-        "https://presence.roproxy.com/v1/presence/users",
-        { userIds: [this.userId] },
-        {
-          headers: {
-            Cookie: this.cookie,
-            "User-Agent": "Mozilla/5.0 (Linux; Android 10; Termux)",
-            Accept: "application/json",
-          },
+      let res;
+      try {
+        res = await axios.post(url, body, { headers: headers(), timeout: HTTP_TIMEOUT });
+      } catch (e) {
+        const token = e.response && e.response.headers && e.response.headers["x-csrf-token"];
+        if (e.response && e.response.status === 403 && token) {
+          this.csrf = token;
+          res = await axios.post(url, body, { headers: headers(), timeout: HTTP_TIMEOUT });
+        } else {
+          throw e;
         }
-      );
-      return r.data.userPresences?.[0];
-    } catch {
-      return null;
+      }
+      const presence = res.data && res.data.userPresences && res.data.userPresences[0];
+      if (!presence) return { presence: null, error: "Phản hồi không có dữ liệu presence" };
+      return { presence, error: null };
+    } catch (e) {
+      const status = e.response && e.response.status;
+      let error;
+      if (status === 401) error = "Cookie không còn hiệu lực (401)";
+      else if (status === 429) error = "Roblox giới hạn tốc độ (429)";
+      else if (status) error = `HTTP ${status}`;
+      else if (e.code === "ECONNABORTED" || e.code === "ETIMEDOUT") error = "Hết thời gian chờ";
+      else if (["ENOTFOUND", "EAI_AGAIN", "ECONNREFUSED", "ENETUNREACH", "ECONNRESET"].includes(e.code)) error = "Mất kết nối mạng";
+      else error = e.message;
+      return { presence: null, error, status };
     }
+  }
+
+  /** Giữ lại cho tương thích: chỉ trả về presence (hoặc null nếu lỗi). */
+  async getPresence() {
+    const result = await this.checkPresence();
+    return result.presence || null;
   }
 }
 
 class GameSelector {
-  constructor() {
-    this.GAMES = {
-      "1": ["126884695634066", "Grow-a-Garden"],
-      "2": ["2753915549", "Blox-Fruits"],
-      "3": ["6284583030", "Pet-Simulator-X"],
-      "4": ["126244816328678", "DIG"],
-      "5": ["116495829188952", "Dead-Rails-Alpha"],
-      "6": ["8737602449", "PLS-DONATE"],
-      "7": ["920587237", "Adopt Me!"],
-      "8": ["79546208627805", "99 Night In The Forests"],
-      "9": ["109983668079237", "Steal-a-Brainrot"],
-      "10": ["127742093697776", "Plants-Vs-Brainrots"],
-      "11": ["121864768012064", "Fish-It"],
-      "12": ["16732694052", "Fisch"],
-      "0": ["custom", "Tùy chỉnh"],
-    };
-  }
-
   async chooseGame(rl, cookie = null) {
     // Có cookie -> thử lấy danh sách game tài khoản hay chơi.
-    // Lỗi / không có dữ liệu -> tự dùng danh sách có sẵn bên dưới.
+    // Lỗi / không có dữ liệu -> nhập Place ID hoặc link server thủ công.
     if (cookie) {
-      console.log(UIRenderer.message("info", "Đang lấy danh sách game tài khoản hay chơi..."));
-      const recent = await GameSelector.fetchRecentGames(cookie);
+      // Warning của fetchRecentGames được gom lại, in sau khi spinner dừng để không bị vỡ dòng.
+      const notes = [];
+      const spin = UIRenderer.spinner("Đang lấy danh sách game tài khoản hay chơi...");
+      let recent = [];
+      try {
+        recent = await GameSelector.fetchRecentGames(cookie, RECENT_GAMES_LIMIT, (line) => notes.push(line));
+      } finally {
+        spin.stop();
+      }
+      notes.forEach((line) => console.log(line));
       if (recent.length) {
-        const picked = await this.chooseFromRecent(rl, recent);
-        if (picked) return picked;
+        return this.chooseFromRecent(rl, recent, cookie);
       }
     }
 
-    const maxKey = Math.max(...Object.keys(this.GAMES).map(Number));
-    console.log(UIRenderer.renderSection("Chọn game", "Điểm đến Auto Rejoin"));
-    console.log(UIRenderer.options([
-      ...Object.entries(this.GAMES).filter(([key]) => key !== "0").map(([key, game]) => ({
-        key,
-        label: game[1],
-        description: `Place ID: ${game[0]}`
-      })),
-      { key: "0", label: "Tùy chỉnh", description: "Nhập Place ID hoặc link private server", color: "1;35" }
-    ]));
-
-    const ans = (await Utils.ask(rl, UIRenderer.prompt(`Chọn game [0-${maxKey}]`))).trim();
-
-    if (ans === "0") {
-      return this.chooseCustom(rl);
-    }
-
-    if (this.GAMES[ans]) {
-      return {
-        placeId: this.GAMES[ans][0],
-        name: this.GAMES[ans][1],
-        linkCode: null,
-      };
-    }
-
-    throw new Error(`[-] Không hợp lệ!`);
+    // Không có game gần đây (hoặc không lấy được) -> vào thẳng ô nhập Place ID / link server.
+    console.log(UIRenderer.renderSection("Chọn game", "Nhập Place ID hoặc link server"));
+    return this.chooseCustom(rl, cookie);
   }
 
-  /** Menu game tài khoản hay chơi. Trả về null nếu người dùng muốn xem danh sách có sẵn. */
-  async chooseFromRecent(rl, recent) {
+  static customHint = "Nhập Place ID hoặc dán link server (đã hoặc chưa chuyển hướng)";
+
+  /** Menu game tài khoản hay chơi. Mục nhập Game ID / link server nằm ở số cuối. */
+  async chooseFromRecent(rl, recent, cookie = null) {
+    const customKey = String(recent.length + 1);
     console.log(UIRenderer.renderSection("Chọn game", "Game tài khoản này hay chơi"));
     console.log(UIRenderer.options([
       ...recent.map((game, index) => ({
@@ -915,14 +1099,12 @@ class GameSelector {
         label: game.name,
         description: `Place ID: ${game.placeId}`
       })),
-      { key: "L", label: "Danh sách có sẵn", description: "Xem danh sách game mặc định của tool", color: "1;36" },
-      { key: "0", label: "Tùy chỉnh", description: "Nhập Place ID hoặc link private server", color: "1;35" }
+      { key: customKey, label: "Game ID / Link server", description: GameSelector.customHint, color: "1;35" }
     ]));
 
-    const ans = (await Utils.ask(rl, UIRenderer.prompt(`Chọn game [0-${recent.length} / L]`))).trim();
+    const ans = (await Utils.ask(rl, UIRenderer.prompt(`Chọn game [1-${customKey}]`))).trim();
 
-    if (ans.toLowerCase() === "l") return null;
-    if (ans === "0") return this.chooseCustom(rl);
+    if (ans === customKey) return this.chooseCustom(rl, cookie);
 
     const picked = recent[parseInt(ans, 10) - 1];
     if (picked && /^\d+$/.test(ans)) {
@@ -931,44 +1113,161 @@ class GameSelector {
     throw new Error(`[-] Không hợp lệ!`);
   }
 
-  /** Nhập Place ID thủ công hoặc link private server. */
-  async chooseCustom(rl) {
-    console.log(UIRenderer.options([
-      { key: "1", label: "Nhập Place ID", description: "Dùng ID game thủ công" },
-      { key: "2", label: "Private Server", description: "Dán link redirect sau khi vào private server", color: "1;35" }
-    ], { footer: "Chọn cách thêm game tùy chỉnh" }));
-    const sub = (await Utils.ask(rl, UIRenderer.prompt("Lựa chọn [1-2]"))).trim();
-    if (sub === "1") {
-      const pid = (await Utils.ask(rl, UIRenderer.prompt("Place ID"))).trim();
-      return { placeId: pid, name: "Tùy chỉnh", linkCode: null };
-    }
-    if (sub === "2") {
-      console.log(UIRenderer.infoCard([
-        ["Cách lấy", "Dán link redirect sau khi vào private server"],
-        ["Ví dụ", "https://www.roblox.com/games/2753915549/Blox-Fruits?privateServerLinkCode=77455530946706396026289495938493"]
-      ], "PRIVATE SERVER"));
-      while (true) {
-        const link = await Utils.ask(rl, UIRenderer.prompt("Dán link redirect đã chuyển hướng"));
-        const m = link.match(/\/games\/(\d+)[^?]*\?[^=]*=([\w-]+)/);
-        if (!m) {
-          console.log(UIRenderer.message("error", "Link không hợp lệ!"));
-          continue;
-        }
-        return {
-          placeId: m[1],
-          name: "Private Server",
-          linkCode: m[2],
-        };
+  /**
+   * Nhập Place ID hoặc link server. Nhận cả link đã chuyển hướng
+   * (.../games/ID/Tên?privateServerLinkCode=...) lẫn link chưa chuyển hướng (.../share?code=...&type=Server).
+   * Để trống rồi Enter để hủy.
+   */
+  async chooseCustom(rl, cookie = null) {
+    console.log(UIRenderer.infoCard([
+      ["Place ID", "Chỉ nhập số, ví dụ 2753915549"],
+      ["Đã chuyển", "roblox.com/games/ID/Tên?privateServerLinkCode=..."],
+      ["Chưa chuyển", "roblox.com/share?code=...&type=Server"],
+      ["Hủy", "Để trống rồi Enter"]
+    ], "GAME ID / LINK SERVER"));
+
+    while (true) {
+      const input = (await Utils.ask(rl, UIRenderer.prompt("Place ID hoặc link server"))).trim();
+      if (!input) throw new Error("[-] Đã hủy chọn game.");
+
+      const parsed = GameSelector.parseTarget(input);
+      const spin = parsed && parsed.kind === "share"
+        ? UIRenderer.spinner("Đang đổi link chưa chuyển hướng sang link server...")
+        : null;
+      try {
+        const game = await GameSelector.resolveTarget(input, cookie);
+        if (spin) spin.stop();
+        console.log(UIRenderer.message(
+          "success",
+          `${game.name} • Place ID ${game.placeId}${game.linkCode ? " • server VIP" : ""}`
+        ));
+        return game;
+      } catch (e) {
+        if (spin) spin.stop();
+        console.log(UIRenderer.message("error", e.message));
       }
     }
-    throw new Error(`[-] Không hợp lệ!`);
+  }
+
+  /**
+   * Tách Place ID / link server từ chuỗi người dùng nhập. Hàm thuần, không gọi mạng.
+   * kind: "place" | "private" (link đã chuyển hướng) | "share" (link chưa chuyển hướng)
+   *       | "incomplete" (có mã server nhưng thiếu Place ID) | null (không nhận ra).
+   */
+  static parseTarget(input) {
+    const text = String(input ?? "").trim().replace(/^[<"'\s]+|[>"'\s]+$/g, "");
+    if (!text) return null;
+
+    if (/^\d{3,}$/.test(text)) return { kind: "place", placeId: text, name: "Tùy chỉnh" };
+
+    const pick = (re) => {
+      const m = text.match(re);
+      return m ? m[1] : null;
+    };
+
+    // Link chưa chuyển hướng: https://www.roblox.com/share?code=...&type=Server
+    // (hoặc roblox://navigation/share_links?code=...&type=Server)
+    const shareCode = pick(/[?&]code=([\w-]+)/i);
+    if (shareCode && /[?&]type=server/i.test(text)) {
+      return { kind: "share", shareCode };
+    }
+
+    const placeId = pick(/\/games\/(\d+)/i) || pick(/placeId=(\d+)/i);
+    const linkCode = pick(/privateServerLinkCode=([\w-]+)/i) || pick(/[?&]linkCode=([\w-]+)/i);
+
+    if (placeId && linkCode) {
+      return { kind: "private", placeId, linkCode, name: "Private Server" };
+    }
+    if (linkCode) return { kind: "incomplete" };
+    if (placeId) {
+      let name = "Tùy chỉnh";
+      const slug = pick(/\/games\/\d+\/([^/?#]+)/i);
+      if (slug) {
+        try { name = decodeURIComponent(slug); } catch (_) { name = slug; }
+      }
+      return { kind: "place", placeId, name };
+    }
+    return null;
+  }
+
+  /**
+   * Đổi chuỗi nhập thành { placeId, name, linkCode }. Ném Error có nội dung hiển thị được cho người dùng.
+   * cookie có thể là chuỗi hoặc hàm trả về chuỗi (chỉ đọc cookie khi thật sự cần đổi link chia sẻ).
+   */
+  static async resolveTarget(input, cookie = null) {
+    const target = GameSelector.parseTarget(input);
+    if (!target) {
+      throw new Error("Không nhận ra Place ID hoặc link server. Nhập số Place ID, hoặc dán link .../games/ID/...?privateServerLinkCode=... hay .../share?code=...&type=Server.");
+    }
+    if (target.kind === "incomplete") {
+      throw new Error("Link có mã server nhưng thiếu Place ID. Hãy dán đủ link .../games/ID/...?privateServerLinkCode=...");
+    }
+    if (target.kind === "share") {
+      const value = typeof cookie === "function" ? cookie() : cookie;
+      const info = await GameSelector.resolveShareLink(target.shareCode, value);
+      return { placeId: info.placeId, name: "Private Server", linkCode: info.linkCode };
+    }
+    return {
+      placeId: target.placeId,
+      name: target.name,
+      linkCode: target.kind === "private" ? target.linkCode : null
+    };
+  }
+
+  /**
+   * Link chưa chuyển hướng (share?code=...&type=Server) -> Place ID + mã server VIP.
+   * Dùng API chia sẻ link của Roblox (không chính thức, cần cookie tài khoản); lỗi thì báo để người dùng dán link đã chuyển hướng.
+   */
+  static async resolveShareLink(shareCode, cookie) {
+    if (!cookie) {
+      throw new Error("Không đọc được cookie tài khoản nên chưa đổi được link này. Hãy dán link đã chuyển hướng (.../games/ID/...?privateServerLinkCode=...).");
+    }
+    const url = "https://apis.roblox.com/sharelinks/v1/resolve-link";
+    const body = { linkId: shareCode, linkType: "Server" };
+    const headers = {
+      Cookie: cookie,
+      "User-Agent": "Mozilla/5.0 (Linux; Android 10; Termux)",
+      Accept: "application/json",
+      "Content-Type": "application/json",
+    };
+
+    let res;
+    try {
+      try {
+        res = await axios.post(url, body, { headers, timeout: 15000 });
+      } catch (e) {
+        // Roblox đòi X-CSRF-TOKEN: lấy token từ phản hồi 403 rồi thử lại 1 lần.
+        const token = e.response && e.response.headers && e.response.headers["x-csrf-token"];
+        if (e.response && e.response.status === 403 && token) {
+          res = await axios.post(url, body, {
+            headers: { ...headers, "X-CSRF-TOKEN": token },
+            timeout: 15000
+          });
+        } else {
+          throw e;
+        }
+      }
+    } catch (e) {
+      const status = e.response && e.response.status ? ` (HTTP ${e.response.status})` : "";
+      throw new Error(`Không đổi được link chưa chuyển hướng${status}: ${e.message}. Hãy mở link trong trình duyệt rồi dán link đã chuyển hướng.`);
+    }
+
+    const data = res && res.data && res.data.privateServerInviteData;
+    if (!data) throw new Error("Link này không phải link private server.");
+    if (data.status && data.status !== "Valid") {
+      throw new Error(`Link server không dùng được (trạng thái: ${data.status}).`);
+    }
+    if (!data.placeId || !data.linkCode) {
+      throw new Error("Roblox không trả về đủ Place ID và mã server.");
+    }
+    return { placeId: String(data.placeId), linkCode: String(data.linkCode) };
   }
 
   /**
    * Lấy game tài khoản hay chơi (mục "Continue / Recently played" ở trang chủ Roblox).
-   * API này không chính thức nên mọi lỗi đều trả về [] để tool dùng danh sách có sẵn.
+   * API này không chính thức nên mọi lỗi đều trả về [] để tool chuyển sang nhập Place ID / link server thủ công.
    */
-  static async fetchRecentGames(cookie, limit = 10) {
+  static async fetchRecentGames(cookie, limit = RECENT_GAMES_LIMIT, log = (line) => console.log(line)) {
     const headers = {
       Cookie: cookie,
       "User-Agent": "Mozilla/5.0 (Linux; Android 10; Termux)",
@@ -1018,7 +1317,7 @@ class GameSelector {
             }
           }
         } catch (e) {
-          console.log(UIRenderer.message("warning", `Không đổi được universeId sang placeId: ${e.message}`));
+          log(UIRenderer.message("warning", `Không đổi được universeId sang placeId: ${e.message}`));
         }
       }
 
@@ -1031,18 +1330,18 @@ class GameSelector {
 
       if (!games.length) {
         const topics = parsed.topics.length ? parsed.topics.join(", ") : "không có";
-        console.log(UIRenderer.message("warning", `Không thấy game gần đây của tài khoản (các mục Roblox trả về: ${topics}). Dùng danh sách có sẵn.`));
+        log(UIRenderer.message("warning", `Không thấy game gần đây của tài khoản (các mục Roblox trả về: ${topics}). Nhập Place ID hoặc link server thủ công.`));
       }
       return games;
     } catch (e) {
       const status = e.response && e.response.status ? ` (HTTP ${e.response.status})` : "";
-      console.log(UIRenderer.message("warning", `Không lấy được game gần đây${status}: ${e.message}. Dùng danh sách có sẵn.`));
+      log(UIRenderer.message("warning", `Không lấy được game gần đây${status}: ${e.message}. Nhập Place ID hoặc link server thủ công.`));
       return [];
     }
   }
 
   /** Tách game từ phản hồi omni-recommendation. Hàm thuần, không gọi mạng. */
-  static parseRecentGames(data, limit = 10) {
+  static parseRecentGames(data, limit = RECENT_GAMES_LIMIT) {
     const out = { games: [], missingUniverseIds: [], topics: [] };
     const sorts = Array.isArray(data && data.sorts) ? data.sorts : [];
     const label = (s) => Object.entries(s || {})
@@ -1080,11 +1379,11 @@ class StatusHandler {
   constructor() {
     this.hasLaunched = false;
     this.joinedAt = 0;
+    this.failStreak = 0;
   }
 
+  /** Phân tích dữ liệu presence thuần (không xét lỗi mạng / thời gian chờ). */
   analyzePresence(presence, targetRootPlaceId) {
-    const now = Date.now();
-
     if (!presence || presence.userPresenceType === undefined) {
       return {
         status: "Không rõ",
@@ -1093,7 +1392,6 @@ class StatusHandler {
         rejoinOnly: true
       };
     }
-
 
     if (presence.userPresenceType === 0) {
       return {
@@ -1104,7 +1402,6 @@ class StatusHandler {
       };
     }
 
-
     if (presence.userPresenceType === 1) {
       return {
         status: "Online nhưng không trong game",
@@ -1113,7 +1410,6 @@ class StatusHandler {
         rejoinOnly: true
       };
     }
-
 
     if (presence.userPresenceType !== 2) {
       return {
@@ -1124,16 +1420,26 @@ class StatusHandler {
       };
     }
 
-
-    if (!presence.rootPlaceId || presence.rootPlaceId.toString() !== targetRootPlaceId.toString()) {
+    // Đang trong game. Roblox đôi khi không trả Place ID (cài đặt riêng tư) -> không thể so map;
+    // trước đây bị coi là "Sai map" và mở lại game liên tục mỗi chu kỳ.
+    const actual = presence.rootPlaceId ?? presence.placeId;
+    if (actual === undefined || actual === null || actual === "") {
       return {
-        status: "Sai map",
-        info: `User đang trong game nhưng sai rootPlaceId (${presence.rootPlaceId}). Đã rejoin đúng map! `,
-        shouldLaunch: true,
+        status: "Trong game",
+        info: "Đang trong game (Roblox không trả Place ID nên không so được map)",
+        shouldLaunch: false,
         rejoinOnly: true
       };
     }
 
+    if (String(actual) !== String(targetRootPlaceId)) {
+      return {
+        status: "Sai map",
+        info: `User đang trong game nhưng sai rootPlaceId (${actual}). Đã rejoin đúng map! `,
+        shouldLaunch: true,
+        rejoinOnly: true
+      };
+    }
 
     return {
       status: "Online [+]",
@@ -1141,6 +1447,40 @@ class StatusHandler {
       shouldLaunch: false,
       rejoinOnly: true
     };
+  }
+
+  /**
+   * Quyết định cuối cùng cho 1 lần kiểm tra.
+   *  - Lỗi mạng / lỗi xác thực: KHÔNG mở lại game (trước đây mọi lỗi mạng đều bị coi là offline -> đóng/mở lại game vô cớ).
+   *  - Vừa mở game xong: chờ LAUNCH_GRACE_MS để game kịp load, tránh mở lại đè lên lần đang vào.
+   */
+  evaluate(check, targetPlaceId, now = Date.now()) {
+    if (check && check.error) {
+      this.failStreak++;
+      const auth = check.status === 401;
+      return {
+        status: auth ? "Cookie hết hạn" : "Lỗi mạng",
+        info: auth
+          ? "Cookie không còn hiệu lực — đăng nhập lại Roblox trên package này"
+          : `${check.error}; giữ nguyên game, thử lại sau`,
+        shouldLaunch: false,
+        rejoinOnly: true,
+        failed: true
+      };
+    }
+    this.failStreak = 0;
+
+    const analysis = this.analyzePresence(check ? check.presence : null, targetPlaceId);
+    if (analysis.shouldLaunch && this.hasLaunched && now - this.joinedAt < LAUNCH_GRACE_MS) {
+      const left = Math.ceil((LAUNCH_GRACE_MS - (now - this.joinedAt)) / 1000);
+      return {
+        status: "Đang vào game",
+        info: `Vừa gửi lệnh mở game, chờ ${left}s để game load rồi mới kiểm tra lại`,
+        shouldLaunch: false,
+        rejoinOnly: true
+      };
+    }
+    return analysis;
   }
 
   updateJoinStatus(shouldLaunch) {
@@ -1181,6 +1521,304 @@ class UIRenderer {
     "1;37": "text",
     "2;37": "dim"
   };
+
+  // Dải gradient banner / thanh tiến trình: cyan -> xanh -> tím nhạt (mã màu 256).
+  static gradientStops = [87, 81, 75, 69, 105, 141, 147, 183];
+  static spinnerFrames = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+
+  static themeName = "midnight";
+  static uiFont = "auto";
+  static animOn = true;
+
+  // Mỗi theme gồm bảng màu 256 + dải gradient cho banner / thanh tiến trình.
+  static themes = {
+    midnight: {
+      label: "Midnight Cyan",
+      desc: "Xanh cyan → tím nhạt (mặc định)",
+      palette: {
+        accent: "1;38;5;87", violet: "1;38;5;147", blue: "1;38;5;75", good: "1;38;5;121",
+        warn: "1;38;5;221", bad: "1;38;5;203", text: "38;5;255", dim: "38;5;245",
+        border: "38;5;63", muted: "38;5;60"
+      },
+      stops: [87, 81, 75, 69, 105, 141, 147, 183]
+    },
+    aurora: {
+      label: "Aurora",
+      desc: "Xanh lá → ngọc → xanh dương, dịu mắt",
+      palette: {
+        accent: "1;38;5;86", violet: "1;38;5;115", blue: "1;38;5;79", good: "1;38;5;120",
+        warn: "1;38;5;221", bad: "1;38;5;203", text: "38;5;255", dim: "38;5;245",
+        border: "38;5;30", muted: "38;5;65"
+      },
+      stops: [120, 84, 49, 43, 37, 38, 74, 110]
+    },
+    sunset: {
+      label: "Sunset",
+      desc: "Vàng → cam → hồng → tím, ấm",
+      palette: {
+        accent: "1;38;5;215", violet: "1;38;5;218", blue: "1;38;5;180", good: "1;38;5;150",
+        warn: "1;38;5;228", bad: "1;38;5;203", text: "38;5;255", dim: "38;5;245",
+        border: "38;5;137", muted: "38;5;95"
+      },
+      stops: [229, 222, 216, 210, 204, 198, 169, 135]
+    }
+  };
+
+  static applyTheme(name) {
+    const key = this.themes[name] ? name : "midnight";
+    this.themeName = key;
+    this.palette = { ...this.themes[key].palette };
+    this.gradientStops = [...this.themes[key].stops];
+  }
+
+  /** Áp cấu hình giao diện đã lưu (theme / phông chữ banner / hoạt ảnh). */
+  static applyUiConfig(config = {}) {
+    this.applyTheme(config.theme);
+    this.uiFont = String(config.font || "auto");
+    this.animOn = config.anim !== false;
+    this._bannerCache.clear();
+  }
+
+  /** Dải màu minh họa của 1 theme (dùng ở màn chọn bảng màu). */
+  static _swatch(key) {
+    const t = this.themes[key];
+    if (!t) return "";
+    return t.stops.map((i) => this._fg(i, "━━")).join("");
+  }
+
+  // Chữ khối 5 hàng cho banner khi figlet không có hoặc terminal hẹp (REJOIN rộng 35 cột).
+  static _blockFont = {
+    R: ["████ ", "█   █", "████ ", "█  █ ", "█   █"],
+    E: ["█████", "█    ", "████ ", "█    ", "█████"],
+    J: ["  ███", "    █", "    █", "█   █", " ███ "],
+    O: [" ███ ", "█   █", "█   █", "█   █", " ███ "],
+    I: ["█████", "  █  ", "  █  ", "  █  ", "█████"],
+    N: ["█   █", "██  █", "█ █ █", "█  ██", "█   █"]
+  };
+
+  // Phông 3 hàng (kiểu Calvin S) vẽ bằng ký tự khung đôi: chỉ rộng 15 cột nên vừa cả màn hình điện thoại hẹp / thấp.
+  static _miniFont = {
+    R: ["╦═╗", "╠╦╝", "╩╚═"],
+    E: ["╔═╗", "║╣ ", "╚═╝"],
+    J: [" ╦", " ║", "╚╝"],
+    O: ["╔═╗", "║ ║", "╚═╝"],
+    I: ["╦", "║", "╩"],
+    N: ["╔╗╔", "║║║", "╝╚╝"]
+  };
+
+  // Phông figlet gợi ý (chỉ hiện trong menu nếu figlet thật sự có phông đó).
+  static figletFonts = ["ANSI Shadow", "ANSI Regular", "Slant", "Big", "Standard", "Doom", "Calvin S", "Small"];
+
+  static _bannerCache = new Map();
+
+  static _colorOn() {
+    return (
+      process.env.NO_COLOR === undefined &&
+      (Boolean(process.stdout.isTTY) || Boolean(process.env.FORCE_COLOR))
+    );
+  }
+
+  /** Hoạt ảnh chỉ chạy trên terminal thật. Tắt bằng REJOIN_NO_ANIM=1 hoặc trong menu 8. Giao diện. */
+  static _motionOn() {
+    return (
+      this.animOn !== false &&
+      Boolean(process.stdout.isTTY) &&
+      process.env.NO_COLOR === undefined &&
+      process.env.TERM !== "dumb" &&
+      !process.env.REJOIN_NO_ANIM
+    );
+  }
+
+  /** Số hàng tối đa dành cho banner: phần còn lại của màn hình phải đủ chỗ cho menu (~24 dòng). */
+  static _bannerBudget() {
+    return (process.stdout.rows || 0) - 24;
+  }
+
+  /** Màn hình đủ cao để hiện banner lớn (bàn phím ảo trên điện thoại thường làm màn thấp). */
+  static _tall() {
+    return this._banner(this._width() - 4, this._bannerBudget()).length > 0;
+  }
+
+  static _toneIndex(tone) {
+    const key = this.legacyColors[tone] || tone;
+    const code = this.palette[key] || key;
+    const m = /38;5;(\d+)/.exec(String(code));
+    return m ? Number(m[1]) : null;
+  }
+
+  static _fg(index, text, bold = true) {
+    if (!this._colorOn()) return String(text);
+    return `\x1b[${bold ? "1;" : ""}38;5;${index}m${text}\x1b[0m`;
+  }
+
+  static _gradAt(t) {
+    const stops = this.gradientStops;
+    return stops[Math.round(clamp(t, 0, 1) * (stops.length - 1))];
+  }
+
+  /**
+   * Tô gradient theo cột. sweep = vị trí cột của vệt sáng đang quét (null = không quét);
+   * row làm vệt sáng nghiêng nhẹ khi vẽ nhiều dòng.
+   */
+  static gradient(text, { sweep = null, row = 0 } = {}) {
+    const chars = this._chars(text);
+    if (!this._colorOn()) return chars.join("");
+    const last = Math.max(1, chars.length - 1);
+    let out = "";
+    chars.forEach((ch, i) => {
+      if (ch === " ") {
+        out += ch;
+        return;
+      }
+      let index = this._gradAt(i / last);
+      if (sweep !== null) {
+        const dist = Math.abs(i - (sweep - row * 2));
+        if (dist <= 1) index = 231;
+        else if (dist <= 3) index = 195;
+      }
+      out += `\x1b[1;38;5;${index}m${ch}\x1b[0m`;
+    });
+    return out;
+  }
+
+  /** Nhãn phím dạng chip nền màu: " 1 ". Không có màu thì quay về "[1]" (cùng độ rộng). */
+  static _chip(key, tone = "accent") {
+    const label = String(key);
+    const index = this._toneIndex(tone);
+    if (!this._colorOn() || index === null) return `[${label}]`;
+    return `\x1b[1;38;5;16;48;5;${index}m ${label} \x1b[0m`;
+  }
+
+  /**
+   * Vẽ lại cả khung hình tại chỗ (không xoá màn hình trước) nên không bị nháy.
+   * fit=true: cắt bớt khung cho vừa chiều cao terminal — trước đây khung dài hơn màn hình làm nội dung
+   * cuộn lên và dội hình chồng chéo mỗi giây (rất hay gặp trên điện thoại khi chạy nhiều instance).
+   */
+  static paint(frame, { hideCursor = false, fit = false } = {}) {
+    if (!process.stdout.isTTY) {
+      process.stdout.write(String(frame) + "\n");
+      return;
+    }
+    let lines = String(frame).split("\n");
+    const rows = process.stdout.rows || 0;
+    if (fit && rows > 4 && lines.length > rows - 1) {
+      const keep = rows - 2;
+      const hidden = lines.length - keep;
+      lines = lines.slice(0, keep);
+      lines.push(this.color("dim", `  … còn ${hidden} dòng (thu nhỏ cỡ chữ hoặc xoay ngang để xem đủ)`));
+    }
+    const body = lines.map((line) => line + "\x1b[K").join("\n");
+    process.stdout.write((hideCursor ? "\x1b[?25l" : "") + "\x1b[H" + body + "\n\x1b[J");
+  }
+
+  /** Spinner cho tác vụ chờ mạng. Ngoài terminal thật thì chỉ in 1 dòng thông tin. */
+  static spinner(text) {
+    if (!this._motionOn()) {
+      console.log(this.message("info", text));
+      return { update() {}, stop(finalMessage) { if (finalMessage) console.log(finalMessage); } };
+    }
+    let label = String(text);
+    let i = 0;
+    const draw = () => {
+      const room = Math.max(10, this._width() - 6);
+      process.stdout.write(
+        "\r\x1b[K" +
+        this.color("accent", `  ${this.spinnerFrames[i++ % this.spinnerFrames.length]} `) +
+        this.color("text", this.fit(label, room).trimEnd())
+      );
+    };
+    process.stdout.write("\x1b[?25l");
+    draw();
+    const timer = setInterval(draw, 80);
+    return {
+      update(next) { label = String(next); },
+      stop(finalMessage) {
+        clearInterval(timer);
+        process.stdout.write("\r\x1b[K\x1b[?25h");
+        if (finalMessage) console.log(finalMessage);
+      }
+    };
+  }
+
+  /** Ghép chữ REJOIN từ phông tích hợp ("block" 5 hàng, "mini" 3 hàng). */
+  static _glyphRows(font) {
+    const glyphs = font === "mini" ? this._miniFont : this._blockFont;
+    const height = glyphs.R.length;
+    const rows = Array.from({ length: height }, () => "");
+    const gap = font === "mini" ? "" : " ";
+    for (const ch of "REJOIN") {
+      glyphs[ch].forEach((line, i) => {
+        rows[i] += (rows[i] ? gap : "") + line;
+      });
+    }
+    return rows;
+  }
+
+  /** Vẽ chữ REJOIN bằng 1 phông (tích hợp hoặc figlet). null nếu phông không dùng được. */
+  static _renderFont(name) {
+    if (name === "block" || name === "mini") return this._glyphRows(name);
+    if (!figlet) return null;
+    try {
+      const out = figlet
+        .textSync("REJOIN", { font: name })
+        .split("\n")
+        .map((l) => l.replace(/\s+$/, ""));
+      while (out.length && !out[out.length - 1].trim()) out.pop();
+      while (out.length && !out[0].trim()) out.shift();
+      return out.length ? out : null;
+    } catch (_) {
+      return null; // thiếu phông
+    }
+  }
+
+  /**
+   * Banner chữ lớn theo phông người dùng chọn; không vừa (rộng/cao) thì tự lùi về phông nhỏ hơn:
+   * <chọn> → ANSI Shadow → block → mini. Hẹp / thấp quá thì [] (dùng tiêu đề gọn).
+   */
+  static _banner(maxWidth, maxHeight = Infinity) {
+    const font = this.uiFont || "auto";
+    const key = `${font}|${maxWidth}|${maxHeight}`;
+    if (this._bannerCache.has(key)) return this._bannerCache.get(key);
+
+    const fits = (rows) =>
+      Array.isArray(rows) && rows.length > 0 &&
+      rows.length <= maxHeight &&
+      Math.max(...rows.map((l) => this._len(l))) <= maxWidth;
+
+    const chain = [...new Set([
+      ...(font === "auto" ? [] : [font]),
+      "ANSI Shadow", "block", "mini"
+    ])];
+
+    let rows = [];
+    for (const name of chain) {
+      const candidate = this._renderFont(name);
+      if (fits(candidate)) {
+        rows = candidate;
+        break;
+      }
+    }
+    this._bannerCache.set(key, rows);
+    return rows;
+  }
+
+  /** Danh sách phông cho menu Giao diện, kèm kích thước thực tế của từng phông. */
+  static fontChoices() {
+    const budget = this._width() - 4;
+    const describe = (rows) => {
+      const w = Math.max(...rows.map((l) => this._len(l)));
+      return `${rows.length} dòng • ${w} cột` + (w > budget ? " • quá rộng, sẽ tự dùng phông nhỏ hơn" : "");
+    };
+    const choices = [{ key: "auto", label: "Tự động", desc: "Chọn phông lớn nhất vừa màn hình" }];
+    const add = (key, label) => {
+      const rows = this._renderFont(key);
+      if (rows) choices.push({ key, label, desc: describe(rows) });
+    };
+    add("block", "Khối (tích hợp)");
+    add("mini", "Mini (tích hợp)");
+    for (const name of this.figletFonts) add(name, name);
+    return choices;
+  }
 
   static color(code, text) {
     const value = String(text ?? "");
@@ -1273,7 +1911,7 @@ class UIRenderer {
     const B = (text) => this.color("border", text);
 
     const heading = title ? this.fit(" " + title, inner - 2).trimEnd() : "";
-    const prefix = heading ? "─" + heading : "";
+    const prefix = heading ? "─" + heading + " " : "";
     const top = prefix + "─".repeat(Math.max(0, inner - this._len(prefix)));
 
     const body = lines.map((line) => {
@@ -1292,32 +1930,78 @@ class UIRenderer {
     ].join("\n");
   }
 
-  static renderTitle() {
+  /**
+   * Tiêu đề. big=true: banner chữ lớn (menu chính). Mặc định: bản gọn cho các màn con.
+   * reveal / sweep / done chỉ dùng cho hoạt ảnh mở đầu.
+   */
+  static renderTitle({ big = false, reveal = Infinity, sweep = null, done = true, preview = false } = {}) {
     const width = this._width();
     const contentWidth = width - 4;
     const subtitle =
       width >= 60
         ? "ANDROID  /  MULTI INSTANCE  /  LIVE MONITOR"
         : "ANDROID / LIVE MONITOR";
+    const subtitleLine = done
+      ? this.color("violet", this._center(subtitle, contentWidth))
+      : "";
 
-    return "\n" + this._panel("CONTROL CENTER", [
-      this.color("accent", this._center("R E J O I N", contentWidth)),
-      this.color("violet", this._center(subtitle, contentWidth))
-    ], width);
+    const rows = big ? this._banner(contentWidth, preview ? Infinity : this._bannerBudget()) : [];
+    const lines = [];
+
+    if (rows.length) {
+      const bannerWidth = Math.max(...rows.map((l) => this._len(l)));
+      const pad = " ".repeat(Math.max(0, Math.floor((contentWidth - bannerWidth) / 2)));
+      rows.forEach((row, i) => {
+        lines.push(i < reveal ? pad + this.gradient(row, { sweep, row: i }) : "");
+      });
+      lines.push(subtitleLine);
+    } else {
+      const word = "R E J O I N";
+      const pad = " ".repeat(Math.max(0, Math.floor((contentWidth - word.length) / 2)));
+      lines.push(pad + this.gradient(word, { sweep }));
+      lines.push(subtitleLine);
+    }
+
+    return "\n" + this._panel("CONTROL CENTER", lines, width);
+  }
+
+  /** Hoạt ảnh mở đầu: banner hiện từng dòng rồi một vệt sáng quét qua. Chạy 1 lần khi mở tool. */
+  static async intro() {
+    if (!this._motionOn() || !this._tall()) return;
+    const rows = this._banner(this._width() - 4, this._bannerBudget());
+    const bannerWidth = Math.max(...rows.map((l) => this._len(l)));
+    const sweepSteps = 10;
+    process.stdout.write("\x1b[?25l");
+    try {
+      for (let step = 0; step < rows.length + sweepSteps; step++) {
+        const reveal = Math.min(rows.length, step + 1);
+        const sweep = step < rows.length
+          ? null
+          : ((step - rows.length) / (sweepSteps - 1)) * (bannerWidth + 8) - 4;
+        this.paint(this.renderTitle({ big: true, reveal, sweep, done: reveal >= rows.length }));
+        await sleep(45);
+      }
+    } finally {
+      process.stdout.write("\x1b[?25h");
+    }
   }
 
   static renderSection(title, subtitle = "") {
     const width = this._width();
     const lines = [
       "",
-      this.color("accent", `  ◆ ${String(title).toUpperCase()}`)
+      "  " + this._fg(this.gradientStops[0], "◆ ") + this.gradient(String(title))
     ];
     if (subtitle) {
       lines.push(
         ...this._wrap(subtitle, width - 2).map((l) => this.color("dim", `  ${l}`))
       );
     }
-    lines.push(this.color("muted", "─".repeat(width)));
+    const lead = Math.min(8, width);
+    lines.push(
+      this._fg(this.gradientStops[2], "━".repeat(lead)) +
+      this.color("muted", "─".repeat(width - lead))
+    );
     return lines.join("\n");
   }
 
@@ -1395,13 +2079,13 @@ class UIRenderer {
     const lines = [];
 
     items.forEach((item, index) => {
-      const badge = `[${item.key}]`;
+      const badgeLen = this._len(String(item.key)) + 2;
       lines.push(
-        this.color(item.color || accent, badge) +
+        this._chip(item.key, item.color || accent) +
         " " +
         this.color(
           "text",
-          this.fit(item.label || "", Math.max(1, contentWidth - this._len(badge) - 1))
+          this.fit(item.label || "", Math.max(1, contentWidth - badgeLen - 1))
         )
       );
       if (item.description) {
@@ -1438,10 +2122,12 @@ class UIRenderer {
     const length = Math.max(1, Math.floor(size));
     const ratio = total > 0 ? clamp(value / total, 0, 1) : 0;
     const filled = Math.round(ratio * length);
-    return (
-      this.color("accent", "━".repeat(filled)) +
-      this.color("muted", "━".repeat(length - filled))
-    );
+    let bar = "";
+    for (let i = 0; i < filled; i++) {
+      bar += this._fg(this._gradAt(length > 1 ? i / (length - 1) : 0), "━");
+    }
+    // Phần chưa đầy dùng nét mảnh để vẫn phân biệt được khi terminal không có màu.
+    return bar + this.color("muted", "─".repeat(length - filled));
   }
 
   static step(current, total, label) {
@@ -1454,7 +2140,7 @@ class UIRenderer {
   }
 
   /** MENU CHÍNH: LUÔN 2 CỘT NGANG (trái 1-4, phải 5-0). */
-  static renderMainMenu({ configCount, prefix, webhook, autoexec }) {
+  static renderMainMenu({ configCount, prefix, webhook, autoexec, wakeOff = false }) {
     const width = this._width();
     const contentWidth = width - 4;
     const leftWidth = Math.floor((width - 3) / 2);
@@ -1473,24 +2159,40 @@ class UIRenderer {
       ["5", "Activity", "Mặc định hoặc tùy chỉnh", "violet"],
       ["6", "Webhook", "Báo cáo trạng thái Discord", "accent"],
       ["7", "Autoexec", "Quản lý script executor", "warn"],
-      ["0", "Thoát", "Dừng tool và tắt wake lock", "bad"]
+      ["8", "Giao diện", "Phông chữ, màu, hoạt ảnh", "blue"]
     ];
 
+    const cfgTone = configCount > 0 ? "good" : "warn";
+    const labelOf = (text) => this.color("dim", this.fit(text, 9));
+    const valueRoom = Math.max(1, contentWidth - 12);
+    const webhookOn = Boolean(webhook?.enabled);
+    const autoexecOn = Boolean(autoexec?.executor);
+    const seg = (on, text) =>
+      this.color(on ? "good" : "muted", "●") + " " +
+      this.color(on ? "text" : "dim", this.fit(text, Math.max(1, contentWidth - 2)).trimEnd());
+    const webhookText = `Webhook ${webhookOn ? "bật" : "tắt"}`;
+    const autoexecText = `Autoexec ${autoexecOn ? autoexec.executor : "tắt"}`;
+    const sideBySide =
+      this._len(webhookText) + this._len(autoexecText) + 7 <= contentWidth;
+
     const meta = [
-      ...this._wrap(
-        `CẤU HÌNH: ${configCount}  /  ${configCount > 0 ? "ĐÃ THIẾT LẬP" : "CHƯA THIẾT LẬP"}`,
-        contentWidth
-      ).map((l) => this.color(configCount > 0 ? "good" : "warn", l)),
-      ...this._wrap(`PREFIX: ${prefix || "com.roblox"}`, contentWidth)
-        .map((l) => this.color("dim", l)),
-      ...this._wrap(
-        `WEBHOOK: ${webhook?.enabled ? "BẬT" : "TẮT"}  /  AUTOEXEC: ${autoexec?.executor || "TẮT"}`,
-        contentWidth
-      ).map((l) => this.color("violet", l))
+      this.color(cfgTone, "●") + " " + labelOf("Cấu hình") + " " +
+        this.color(cfgTone, this.fit(
+          configCount > 0 ? `${configCount} đã thiết lập` : "Chưa thiết lập",
+          valueRoom
+        ).trimEnd()),
+      this.color("blue", "●") + " " + labelOf("Prefix") + " " +
+        this.color("text", this.fit(prefix || "com.roblox", valueRoom).trimEnd()),
+      ...(sideBySide
+        ? [seg(webhookOn, webhookText) + "   " + seg(autoexecOn, autoexecText)]
+        : [seg(webhookOn, webhookText), seg(autoexecOn, autoexecText)]),
+      ...(wakeOff
+        ? [this.color("warn", "!") + " " + this.color("warn", this.fit("Wake lock chưa bật — máy có thể ngủ làm tool dừng", Math.max(1, contentWidth - 2)).trimEnd())]
+        : [])
     ];
 
     const cell = ([key, label, description, tone], w) => [
-      ` ${this.color(tone, `[${key}]`)} ${this.color("text", this.fit(label, Math.max(1, w - 6)))} `,
+      ` ${this._chip(key, tone)} ${this.color("text", this.fit(label, Math.max(1, w - 6)))} `,
       this.color("dim", ` ${this.fit(description, Math.max(1, w - 2))} `)
     ];
 
@@ -1515,7 +2217,7 @@ class UIRenderer {
     }
 
     lines.push(B(`╰${ruleL}┴${ruleR}╯`));
-    lines.push(this.color("dim", "  Nhập số để chọn • 0 / Q để thoát"));
+    lines.push(this._chip("0", "bad") + this.color("dim", " Thoát (hoặc Q)") + this.color("muted", "  │  ") + this.color("dim", "Nhập số để chọn"));
     return lines.join("\n");
   }
 
@@ -1557,16 +2259,25 @@ class UIRenderer {
   }
 
   static _statusTone(status) {
-    const v = String(status || "");
+    const v = String(status || "").trim();
     if (v === "Online [+]" || v === "Trong game") return "good";
-    if (v === "Offline" || v === "Sai map") return "bad";
+    if (v === "Offline" || v === "Sai map" || v === "Cookie hết hạn" || v === "Lỗi mở game") return "bad";
     if (v === "Lỗi mạng") return "warn";
-    if (v.includes("Khởi tạo") || v === "Đang xác nhận") return "accent";
+    if (v.includes("Khởi tạo") || v === "Đang xác nhận" || v === "Đang vào game") return "accent";
     return "violet";
   }
 
-  static statusColor(status) {
-    return this.color(this._statusTone(status), String(status || "Không rõ"));
+  /** Chấm trạng thái: đang xử lý -> spinner, đang chạy -> nhịp tim, còn lại -> chấm đặc. */
+  static _dot(status, frame = 0) {
+    const tone = this._statusTone(status);
+    if (tone === "accent") return this.spinnerFrames[frame % this.spinnerFrames.length];
+    if (tone === "good") return frame % 4 === 3 ? "○" : "●";
+    return "●";
+  }
+
+  static statusColor(status, frame = 0) {
+    const text = String(status || "Không rõ");
+    return this.color(this._statusTone(status), `${this._dot(status, frame)} ${text}`);
   }
 
   static formatCountdown(seconds) {
@@ -1625,70 +2336,116 @@ class UIRenderer {
     return table.toString();
   }
 
-  static renderMultiInstanceTable(instances, startTime = null) {
+  /** Ghép 2 đoạn (trái / phải) vào cùng 1 dòng rộng `width` cột. */
+  static _split(left, right, width) {
+    const gap = Math.max(1, width - this._len(left) - this._len(right));
+    return left + " ".repeat(gap) + right;
+  }
+
+  /** Tiêu đề 2 dòng cho màn giám sát (thay cho banner 9 dòng cũ, nhường chỗ cho dữ liệu). */
+  static renderLiveHeader(frame = 0) {
     const width = this._width(118);
-    const contentWidth = width - 4;
+    const left = "  " + this._fg(this.gradientStops[0], "◆ ") + this.gradient("R E J O I N");
+    const beat = this.color("good", frame % 4 === 3 ? "○" : "●");
+    const right = this.color("dim", "LIVE ") + beat + this.color("dim", ` ${this._clock(Date.now())}  `);
+    const lead = Math.min(8, width);
+    const rule = this._fg(this.gradientStops[2], "━".repeat(lead)) + this.color("muted", "─".repeat(width - lead));
+    return this._split(left, right, width) + "\n" + rule;
+  }
+
+  /** Bảng tổng quan 3 dòng: CPU/RAM, uptime/rejoin/lỗi, thanh tiến trình số instance trong game. */
+  static _summaryPanel(instances, startTime, frame, width) {
+    const inner = width - 4;
     const stats = this.getSystemStats();
+    const inGame = instances.filter((x) => isInGameStatus(x.status)).length;
+    const errors = instances.filter((x) => ERROR_STATUSES.has(String(x.status || "").trim())).length;
+    const rejoins = instances.reduce((s, x) => s + (Number(x.rejoinCount) || 0), 0);
 
-    const inGame = instances.filter(
-      (x) => x.status === "Online [+]" || x.status === "Trong game"
-    ).length;
-    const errors = instances.filter((x) => x.status === "Lỗi mạng").length;
-    const rejoins = instances.reduce(
-      (s, x) => s + (Number(x.rejoinCount) || 0),
-      0
-    );
+    const uptime = startTime ? Math.max(0, Math.floor((Date.now() - startTime) / 1000)) : 0;
+    const p = (n) => String(n).padStart(2, "0");
+    const up = `${p(Math.floor(uptime / 3600))}:${p(Math.floor((uptime % 3600) / 60))}:${p(uptime % 60)}`;
 
-    const uptime = startTime
-      ? Math.max(0, Math.floor((Date.now() - startTime) / 1000))
-      : 0;
-    const h = Math.floor(uptime / 3600);
-    const m = Math.floor((uptime % 3600) / 60);
-    const s = uptime % 60;
+    const beat = this.color("good", frame % 4 === 3 ? "○" : "●");
+    const row1 = `CPU ${stats.cpuUsage}%  •  RAM ${stats.ramUsage}`;
+    const row2 = `UP ${up}  •  ↻ ${rejoins}  •  lỗi ${errors}`;
+    const label = `${inGame}/${instances.length} trong game`;
+    const size = clamp(inner - this._len(label) - 2, 4, 18);
 
-    const summary = this._panel("SYSTEM / LIVE", [
-      ...this._wrap(
-        `CPU ${stats.cpuUsage}%  •  RAM ${stats.ramUsage}`,
-        contentWidth
-      ).map((l) => this.color("accent", l)),
-      ...this._wrap(
-        `REJOIN ${rejoins}  •  LỖI MẠNG ${errors}`,
-        contentWidth
-      ).map((l) => this.color(errors > 0 ? "warn" : "violet", l)),
-      this.color("dim", `UPTIME ${h}h ${m}m ${s}s`),
-      this.progressBar(
-        inGame,
-        instances.length,
-        Math.min(18, Math.max(6, width - 26))
-      ) + `  ${this.color("good", `${inGame}/${instances.length} trong game`)}`
+    return this._panel("TỔNG QUAN", [
+      ...this._wrap(row1, inner).map((l) => this.color("accent", l)),
+      ...this._wrap(row2, inner - 2).map((l, i) =>
+        (i === 0 ? beat + " " : "  ") + this.color(errors ? "warn" : "dim", l)),
+      this.progressBar(inGame, instances.length, size) + "  " + this.color("good", label)
     ], width);
+  }
+
+  /** Mỗi instance 2 dòng: [chấm package user ... ↻n · đếm ngược] + [trạng thái — thông tin]. */
+  static _instancePanel(instances, frame, width) {
+    const inner = width - 4;
+    const lines = [];
+
+    instances.forEach((instance, index) => {
+      const tone = this._statusTone(instance.status);
+      const status = String(instance.status || "Không rõ").trim();
+      const user = Utils.maskSensitiveInfo(
+        (instance.config && instance.config.username) ||
+        (instance.user && instance.user.username) || "Unknown"
+      );
+      const pkg = Utils.packageLabel(instance.packageName);
+      const dot = this._dot(instance.status, frame);
+
+      const meta = `↻${instance.rejoinCount || 0} · ${this.formatCountdown(instance.countdownSeconds)}`;
+      const left = Math.max(6, inner - this._len(meta) - 1);
+      const pkgW = clamp(Math.floor(left * 0.45), 4, 14);
+      const userW = left - 2 - pkgW - 1;
+      let head = this.color(tone, dot) + " " + this.color("accent", this.fit(pkg, pkgW).trimEnd());
+      if (userW >= 3) head = this.color(tone, dot) + " " + this.color("accent", this.fit(pkg, pkgW)) + " " +
+        this.color("dim", this.fit(user, userW).trimEnd());
+      lines.push(this._split(head, this.color("violet", meta), inner));
+
+      const room = inner - 2;
+      const st = this.fit(status, Math.min(this._len(status), room)).trimEnd();
+      const infoRoom = room - this._len(st) - 2;
+      lines.push(
+        "  " + this.color(tone, st) +
+        (infoRoom >= 6 ? "  " + this.color("dim", this.fit(instance.info || "-", infoRoom).trimEnd()) : "")
+      );
+
+      if (index < instances.length - 1) lines.push(this.color("muted", "┄".repeat(inner)));
+    });
+
+    return this._panel(`INSTANCES ${instances.length}`, lines, width);
+  }
+
+  /** Nhật ký sự kiện (rejoin, đổi trạng thái, lỗi...) — thay cho log in chen vào khung hình. */
+  static renderEventLog(events, maxLines) {
+    const width = this._width(118);
+    const inner = width - 4;
+    const shown = (events || []).slice(-Math.max(1, maxLines));
+    const icons = {
+      error: ["bad", "✕"], warning: ["warn", "!"], success: ["good", "✓"], info: ["accent", "•"]
+    };
+    const lines = shown.map((ev) => {
+      const [tone, icon] = icons[ev.level] || icons.info;
+      return (
+        this.color("dim", this._clock(ev.at)) + " " + this.color(tone, icon) + " " +
+        this.color("text", this.fit(ev.text, Math.max(1, inner - 11)).trimEnd())
+      );
+    });
+    return this._panel("NHẬT KÝ", lines, width);
+  }
+
+  static renderMultiInstanceTable(instances, startTime = null, frame = 0) {
+    const width = this._width(118);
+    const summary = this._summaryPanel(instances, startTime, frame, width);
 
     if (!instances.length) {
       return summary + "\n" + this.message("warning", "Chưa có instance đang chạy.");
     }
 
-    // Màn hình hẹp: dùng thẻ thay vì bảng, tránh tràn cột.
+    // Màn hình hẹp: thẻ gọn 2 dòng/instance (trước đây mỗi instance 9 dòng, 3 instance là tràn màn hình).
     if (width < 96) {
-      const cards = instances.map((instance, index) => {
-        const config = instance.config || {};
-        const username =
-          config.username ||
-          (instance.user && instance.user.username) ||
-          "Unknown";
-        return this.infoCard(
-          [
-            ["Package", Utils.packageLabel(instance.packageName), "accent"],
-            ["Tài khoản", Utils.maskSensitiveInfo(username)],
-            ["Trạng thái", instance.status || "Không rõ", this._statusTone(instance.status)],
-            ["Thông tin", instance.info || "-", "dim"],
-            ["Kiểm tra", this.formatCountdown(instance.countdownSeconds), "violet"],
-            ["Cập nhật", this._clock(instance.lastCheck), "dim"],
-            ["Rejoin", String(instance.rejoinCount || 0), "warn"]
-          ],
-          `INSTANCE ${String(index + 1).padStart(2, "0")}`
-        );
-      });
-      return summary + "\n\n" + cards.join("\n\n");
+      return summary + "\n" + this._instancePanel(instances, frame, width);
     }
 
     const rows = instances.map((instance) => {
@@ -1699,7 +2456,7 @@ class UIRenderer {
       return [
         Utils.packageLabel(instance.packageName),
         Utils.maskSensitiveInfo(username),
-        this.statusColor(instance.status),
+        this.statusColor(instance.status, frame),
         instance.info || "-",
         this._clock(instance.lastCheck),
         this.color("violet", this.formatCountdown(instance.countdownSeconds))
@@ -1708,7 +2465,7 @@ class UIRenderer {
 
     return (
       summary +
-      "\n\n" +
+      "\n" +
       this._table(
         ["PACKAGE", "USER", "TRẠNG THÁI", "THÔNG TIN", "CẬP NHẬT", "QUÉT SAU"],
         rows,
@@ -1835,8 +2592,8 @@ class AutoexecManager {
       description: this.EXECUTORS[ex]
     })), { footer: "Chọn executor muốn cấu hình", accent: "1;35" }));
 
-    const choice = parseInt(await Utils.ask(rl, UIRenderer.prompt("Executor [1-4]"))) - 1;
-    if (choice < 0 || choice >= executors.length) {
+    const choice = parseInt(await Utils.ask(rl, UIRenderer.prompt(`Executor [1-${executors.length}]`)), 10) - 1;
+    if (!Number.isInteger(choice) || choice < 0 || choice >= executors.length) {
       console.log(UIRenderer.message("error", "Lựa chọn executor không hợp lệ."));
       return;
     }
@@ -1915,6 +2672,8 @@ class MultiRejoinTool {
     this.isRunning = false;
     this.startTime = Date.now();
     this.notice = null;
+    this.events = [];
+    this.rlExpectedClose = false;
   }
 
   /** Thông báo 1 dòng hiện ở menu chính ngay sau khi một chức năng hoàn tất. */
@@ -1925,8 +2684,14 @@ class MultiRejoinTool {
   async start() {
     Utils.ensureRoot();
     Utils.enableWakeLock();
+    UIRenderer.applyUiConfig(Utils.loadUiConfig());
 
     const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
+    // Trước đây Ctrl+C ở menu chỉ âm thầm đóng readline (không có handler) nên tool treo / không nhả wake lock.
+    rl.on("SIGINT", () => gracefulShutdown("SIGINT"));
+    rl.on("close", () => {
+      if (!this.rlExpectedClose) gracefulShutdown("EOF");
+    });
 
     const actions = {
       "1": () => this.startAutoRejoin(rl),
@@ -1936,12 +2701,14 @@ class MultiRejoinTool {
       "5": () => this.configureActivity(rl),
       "6": () => this.setupWebhook(rl),
       "7": () => this.setupAutoexec(rl),
+      "8": () => this.configureUi(rl),
     };
 
     try {
+      await UIRenderer.intro();
       while (!this.isRunning) {
         console.clear();
-        console.log(UIRenderer.renderTitle());
+        console.log(UIRenderer.renderTitle({ big: UIRenderer._tall() }));
         if (this.notice) {
           console.log(UIRenderer.message(this.notice.type, this.notice.text));
           this.notice = null;
@@ -1951,9 +2718,10 @@ class MultiRejoinTool {
           prefix: Utils.loadPackagePrefixConfig(),
           webhook: Utils.loadWebhookConfig(),
           autoexec: new AutoexecManager().loadConfig(),
+          wakeOff: Utils.wakeLockState === "failed",
         }));
 
-        const choice = (await Utils.ask(rl, UIRenderer.prompt("Chọn chức năng [0-7]"))).trim();
+        const choice = (await Utils.ask(rl, UIRenderer.prompt("Chọn chức năng [0-8]"))).trim();
         if (choice === "0" || choice.toLowerCase() === "q") break;
         const action = actions[choice];
         if (!action) {
@@ -1978,6 +2746,7 @@ class MultiRejoinTool {
         }
       }
     } finally {
+      this.rlExpectedClose = true;
       rl.close();
       if (!this.isRunning) Utils.disableWakeLock();
     }
@@ -2039,7 +2808,8 @@ class MultiRejoinTool {
     }
 
 
-    const configs = {};
+    // Giữ lại cấu hình của các package KHÔNG được chọn lần này (trước đây bị ghi đè mất sạch).
+    const configs = Utils.loadMultiConfigs();
     let configuredCount = 0;
     const skippedPackages = [];
 
@@ -2073,7 +2843,16 @@ class MultiRejoinTool {
       ], "XÁC THỰC THÀNH CÔNG"));
 
       const selector = new GameSelector();
-      const game = await selector.chooseGame(rl, cookie);
+      let game;
+      try {
+        game = await selector.chooseGame(rl, cookie);
+      } catch (error) {
+        // Hủy chọn game ở 1 package không được làm mất công cấu hình các package còn lại.
+        const reason = String(error.message || error).replace(/^\[-\]\s*/, "");
+        console.log(UIRenderer.message("warning", `${reason} — bỏ qua ${packageInfo.displayName}.`));
+        skippedPackages.push(packageInfo.displayName);
+        continue;
+      }
 
       let delaySec;
       while (true) {
@@ -2199,10 +2978,10 @@ class MultiRejoinTool {
       let newPrefix;
       while (true) {
         newPrefix = await Utils.ask(rl, UIRenderer.prompt("Prefix mới"));
-        if (newPrefix.trim()) {
+        if (Utils.isValidPrefix(newPrefix.trim())) {
           break;
         }
-        console.log(UIRenderer.message("error", "Prefix không được để trống."));
+        console.log(UIRenderer.message("error", "Prefix không hợp lệ: chỉ gồm chữ, số, dấu _ và dấu chấm (vd: com.roblox)."));
       }
 
       const saved = Utils.savePackagePrefixConfig(newPrefix.trim());
@@ -2307,6 +3086,75 @@ class MultiRejoinTool {
     }
   }
 
+  /** MỤC 8 — GIAO DIỆN: phông chữ banner, bảng màu, hoạt ảnh (lưu vào ui_config.json). */
+  async configureUi(rl) {
+    while (true) {
+      const cfg = Utils.loadUiConfig();
+      UIRenderer.applyUiConfig(cfg);
+
+      console.clear();
+      console.log(UIRenderer.renderTitle({ big: true, preview: true }));
+      console.log(UIRenderer.renderSection("Giao diện", "Phông chữ banner, bảng màu, hoạt ảnh"));
+
+      const fonts = UIRenderer.fontChoices();
+      const fontLabel = (fonts.find((f) => f.key === cfg.font) || fonts[0]).label;
+      const theme = UIRenderer.themes[cfg.theme] || UIRenderer.themes.midnight;
+      console.log(UIRenderer.infoCard([
+        ["Phông chữ", fontLabel, "accent"],
+        ["Bảng màu", theme.label, "violet"],
+        ["Hoạt ảnh", cfg.anim === false ? "TẮT" : "BẬT", cfg.anim === false ? "dim" : "good"],
+        ["Figlet", figlet ? "CÓ — nhiều phông banner" : "KHÔNG — chỉ phông tích hợp", figlet ? "good" : "warn"]
+      ], "HIỆN TẠI"));
+      console.log(UIRenderer.options([
+        { key: "1", label: "Phông chữ banner", description: "Đổi kiểu chữ REJOIN" },
+        { key: "2", label: "Bảng màu", description: "Midnight Cyan / Aurora / Sunset", color: "1;35" },
+        { key: "3", label: "Hoạt ảnh mở đầu", description: "Bật / tắt hiệu ứng banner", color: "1;33" },
+        { key: "0", label: "Quay lại", description: "Trở về menu chính", color: "1;31" }
+      ]));
+
+      const choice = (await Utils.ask(rl, UIRenderer.prompt("Lựa chọn [0-3]"))).trim();
+      if (choice === "0" || choice.toLowerCase() === "q") return true;
+
+      if (choice === "1") {
+        console.log(UIRenderer.options(
+          fonts.map((f, i) => ({ key: String(i + 1), label: f.label, description: f.desc })),
+          { footer: "Nhập số để chọn phông, Enter để giữ nguyên" }
+        ));
+        const pick = (await Utils.ask(rl, UIRenderer.prompt(`Phông [1-${fonts.length}]`))).trim();
+        const chosen = fonts[parseInt(pick, 10) - 1];
+        if (chosen) {
+          Utils.saveUiConfig({ ...cfg, font: chosen.key });
+        } else if (pick) {
+          console.log(UIRenderer.message("warning", "Lựa chọn không hợp lệ."));
+          await sleep(900);
+        }
+      } else if (choice === "2") {
+        const keys = Object.keys(UIRenderer.themes);
+        console.log(UIRenderer.options(
+          keys.map((k, i) => ({
+            key: String(i + 1),
+            label: `${UIRenderer.themes[k].label}  ${UIRenderer._swatch(k)}`,
+            description: UIRenderer.themes[k].desc
+          })),
+          { footer: "Nhập số để chọn bảng màu, Enter để giữ nguyên" }
+        ));
+        const pick = (await Utils.ask(rl, UIRenderer.prompt(`Bảng màu [1-${keys.length}]`))).trim();
+        const chosen = keys[parseInt(pick, 10) - 1];
+        if (chosen) {
+          Utils.saveUiConfig({ ...cfg, theme: chosen });
+        } else if (pick) {
+          console.log(UIRenderer.message("warning", "Lựa chọn không hợp lệ."));
+          await sleep(900);
+        }
+      } else if (choice === "3") {
+        Utils.saveUiConfig({ ...cfg, anim: cfg.anim === false });
+      } else {
+        console.log(UIRenderer.message("warning", "Lựa chọn không hợp lệ."));
+        await sleep(900);
+      }
+    }
+  }
+
   async startAutoRejoin(rl) {
     UIRenderer.screen("Khởi động Auto Rejoin", "Chọn instance cần chạy");
     const configs = Utils.loadMultiConfigs();
@@ -2368,15 +3216,15 @@ class MultiRejoinTool {
         return;
       }
 
-      selectedPackages = indices.map(i => packageList[i]);
+      selectedPackages = [...new Set(indices.map(i => packageList[i]))];
       console.log(UIRenderer.selectionCard(selectedPackages.map((pkg) => Utils.packageLabel(pkg)), "PACKAGE SẼ CHẠY"));
     }
 
     console.log(UIRenderer.message("info", "Đang khởi tạo hệ thống multi-instance..."));
-    await this.initializeSelectedInstances(selectedPackages, configs);
+    await this.initializeSelectedInstances(selectedPackages, configs, rl);
   }
 
-  async initializeSelectedInstances(selectedPackages, configs) {
+  async initializeSelectedInstances(selectedPackages, configs, rl) {
     // Cho phép khởi chạy lại trong cùng process mà không nhân đôi instance cũ.
     this.instances = [];
     this.startTime = Date.now();
@@ -2429,120 +3277,231 @@ class MultiRejoinTool {
     await new Promise(resolve => setTimeout(resolve, 3000));
 
     this.isRunning = true;
-    await this.runMultiInstanceLoop();
+    await this.runMultiInstanceLoop(rl);
   }
 
-  async runMultiInstanceLoop() {
-    let renderCounter = 0;
+  /** Ghi 1 dòng vào NHẬT KÝ của màn giám sát. */
+  logEvent(level, text) {
+    const clean = UIRenderer.stripAnsi(String(text)).replace(/\s+/g, " ").trim();
+    if (!clean) return;
+    this.events.push({ at: Date.now(), level, text: clean });
+    if (this.events.length > 60) this.events.splice(0, this.events.length - 60);
+  }
+
+  /** Bắt mọi console.log/error chen ngang vào nhật ký thay vì in thẳng ra làm vỡ khung hình. */
+  _captureLogs() {
+    return captureConsole((method, text) => {
+      let level = method === "error" ? "error" : method === "warn" ? "warning" : "info";
+      if (/^\s*\[\+\]/.test(text)) level = "success";
+      else if (/^\s*\[-\]/.test(text)) level = "error";
+      this.logEvent(level, text.replace(/^\s*\[[+\-*!]\]\s*/, ""));
+    });
+  }
+
+  /**
+   * Phím tắt khi giám sát: Q / Ctrl+C = dừng an toàn, R = kiểm tra ngay.
+   * Đóng readline để các phím gõ vào không bị in lên làm vỡ khung hình.
+   */
+  _bindLiveKeys(rl) {
+    if (!process.stdin.isTTY) return () => { };
+    this.rlExpectedClose = true;
+    try { rl.close(); } catch (_) { }
+
+    const onData = (buf) => {
+      const s = String(buf);
+      if (s.includes("\x03")) return gracefulShutdown("SIGINT");
+      if (/q/i.test(s)) return gracefulShutdown("Q");
+      if (/r/i.test(s)) {
+        this.instances.forEach((i) => { i.lastCheck = 0; });
+        this.logEvent("info", "Kiểm tra ngay theo yêu cầu (phím R)");
+      }
+    };
+    try { process.stdin.setRawMode(true); } catch (_) { }
+    process.stdin.resume();
+    process.stdin.on("data", onData);
+    return () => {
+      process.stdin.off("data", onData);
+      try { process.stdin.setRawMode(false); } catch (_) { }
+      process.stdin.pause();
+    };
+  }
+
+  /** Kiểm tra 1 instance; nếu cookie hết hạn thì thử đọc lại cookie mới (tối đa 1 lần / 3 phút). */
+  async _checkInstance(instance) {
+    let check = await instance.user.checkPresence();
+    if (check.error && check.status === 401) {
+      const now = Date.now();
+      if (now - (instance.cookieRefreshAt || 0) >= COOKIE_REFRESH_MS) {
+        instance.cookieRefreshAt = now;
+        const fresh = Utils.getRobloxCookie(instance.packageName);
+        if (fresh && fresh !== instance.user.cookie) {
+          instance.user.cookie = fresh;
+          instance.user.csrf = null;
+          check = await instance.user.checkPresence();
+        }
+      }
+    }
+    return check;
+  }
+
+  /** Một nhịp giám sát: kiểm tra song song các instance đến hạn, rồi mở lại game tuần tự (giãn cách). */
+  async _tick() {
+    const now = Date.now();
+    const due = [];
+    for (const instance of this.instances) {
+      const delayMs = Math.max(15, Number(instance.config.delaySec) || 30) * 1000;
+      const since = now - instance.lastCheck;
+      instance.countdownSeconds = Math.ceil(Math.max(0, delayMs - since) / 1000);
+      if (since >= delayMs && !instance.checking) due.push(instance);
+    }
+    if (!due.length) return;
+
+    // Trước đây kiểm tra lần lượt và không có timeout: 1 request treo là cả tool đứng hình.
+    const results = await Promise.all(due.map(async (instance) => {
+      instance.checking = true;
+      try {
+        return { instance, check: await this._checkInstance(instance) };
+      } catch (e) {
+        return { instance, check: { presence: null, error: e.message } };
+      } finally {
+        instance.checking = false;
+      }
+    }));
+
+    let launched = 0;
+    for (const { instance, check } of results) {
+      const { config, statusHandler } = instance;
+      const label = Utils.packageLabel(instance.packageName);
+      const analysis = statusHandler.evaluate(check, config.placeId);
+      const previous = String(instance.status || "").trim();
+
+      instance.lastCheck = Date.now();
+      instance.status = analysis.status;
+      instance.info = analysis.info;
+      instance.presenceType = check && check.presence && check.presence.userPresenceType !== undefined
+        ? String(check.presence.userPresenceType)
+        : "Unknown";
+
+      if (previous !== analysis.status) {
+        const tone = UIRenderer._statusTone(analysis.status);
+        const level = tone === "good" ? "success" : tone === "bad" ? "error" : tone === "warn" ? "warning" : "info";
+        const arrow = previous && !previous.includes("Khởi tạo") ? `${previous} → ` : "";
+        this.logEvent(level, `${label}: ${arrow}${analysis.status}`);
+      }
+
+      if (analysis.shouldLaunch) {
+        if (launched++ > 0) await sleep(LAUNCH_STAGGER_MS);
+        const result = await GameLauncher.handleGameLaunch(
+          true, config.placeId, config.linkCode, config.packageName, true
+        );
+        if (result.ok) {
+          statusHandler.updateJoinStatus(true);
+          instance.rejoinCount = (instance.rejoinCount || 0) + 1;
+          this.logEvent("success", `${label}: đã gửi lệnh mở game${config.linkCode ? " (server VIP)" : ""} — lần ${instance.rejoinCount}`);
+        } else {
+          instance.status = "Lỗi mở game";
+          instance.info = result.error || "am start thất bại";
+          this.logEvent("error", `${label}: mở game thất bại — ${instance.info}`);
+        }
+      }
+    }
+  }
+
+  _buildLiveFrame({ frame, webhookConfig, webhookOn, nextWebhookAt }) {
+    const rows = process.stdout.rows || 0;
+    const parts = [
+      UIRenderer.renderLiveHeader(frame),
+      UIRenderer.renderMultiInstanceTable(this.instances, this.startTime, frame)
+    ];
+
+    const width = UIRenderer._width(118);
+    if (webhookConfig && webhookConfig.url) {
+      const left = Math.max(0, Math.ceil((nextWebhookAt - Date.now()) / 1000));
+      const text = webhookOn
+        ? `Webhook ${Utils.webhookId(webhookConfig.url)} • gửi tiếp sau ${UIRenderer.formatCountdown(left)}`
+        : "Webhook đang tắt";
+      parts.push(
+        UIRenderer.color(webhookOn ? "good" : "muted", "●") + " " +
+        UIRenderer.color("dim", UIRenderer.fit(text, Math.max(1, width - 2)).trimEnd())
+      );
+    }
+
+    const used = parts.join("\n").split("\n").length;
+    const room = rows ? clamp(rows - used - 4, 0, 8) : 4;
+    if (room >= 3 && this.events.length) {
+      parts.push(UIRenderer.renderEventLog(this.events, room - 2));
+    }
+
+    const keys = process.stdin.isTTY
+      ? `${UIRenderer.color("text", "Q")} dừng   ${UIRenderer.color("text", "R")} kiểm tra ngay`
+      : `${UIRenderer.color("text", "CTRL+C")} dừng`;
+    parts.push(UIRenderer.color("dim", "  ") + keys);
+    return parts.join("\n");
+  }
+
+  async runMultiInstanceLoop(rl) {
     const webhookManager = new WebhookManager();
     const webhookConfig = Utils.loadWebhookConfig();
-
-    let webhookCounter = 0;
+    const webhookOn = Boolean(webhookConfig && webhookConfig.enabled && Utils.parseDiscordWebhook(webhookConfig.url));
+    const intervalMin = Number(webhookConfig && webhookConfig.intervalMinutes);
+    const webhookPeriod = (intervalMin >= 1 ? intervalMin : 30) * 60 * 1000;
+    let nextWebhookAt = Date.now() + webhookPeriod;
+    let webhookBusy = false;
 
     const autoexecManager = new AutoexecManager();
     const autoexecConfig = autoexecManager.loadConfig();
     let nextAutoexecCheck = Date.now() + 15 * 60 * 1000;
 
-    while (this.isRunning) {
-      const now = Date.now();
+    this.events = [];
+    const restoreConsole = this._captureLogs();
+    const unbindKeys = this._bindLiveKeys(rl);
+    let renderCounter = 0;
 
-      if (autoexecConfig && now >= nextAutoexecCheck) {
-        autoexecManager.checkAndFix(autoexecConfig);
-        nextAutoexecCheck = now + 15 * 60 * 1000;
-      }
+    try {
+      this.logEvent("info", `Bắt đầu giám sát ${this.instances.length} instance`);
 
-      for (const instance of this.instances) {
-        const { config, user, statusHandler } = instance;
-        const delayMs = config.delaySec * 1000;
+      while (this.isRunning) {
+        const tickStart = Date.now();
 
-        const timeSinceLastCheck = now - instance.lastCheck;
-
-        const timeLeft = Math.max(0, delayMs - timeSinceLastCheck);
-        instance.countdownSeconds = Math.ceil(timeLeft / 1000);
-
-        if (timeSinceLastCheck >= delayMs) {
-          const presence = await user.getPresence();
-
-          let presenceTypeDisplay = "Unknown";
-          if (presence && presence.userPresenceType !== undefined) {
-            presenceTypeDisplay = presence.userPresenceType.toString();
+        try {
+          if (autoexecConfig && tickStart >= nextAutoexecCheck) {
+            autoexecManager.checkAndFix(autoexecConfig);
+            nextAutoexecCheck = tickStart + 15 * 60 * 1000;
           }
 
-          const analysis = statusHandler.analyzePresence(presence, config.placeId);
+          await this._tick();
 
-          if (analysis.shouldLaunch) {
-            GameLauncher.handleGameLaunch(
-              analysis.shouldLaunch,
-              config.placeId,
-              config.linkCode,
-              config.packageName,
-              true
-            );
-            statusHandler.updateJoinStatus(analysis.shouldLaunch);
-            instance.rejoinCount = (instance.rejoinCount || 0) + 1;
+          // Lên lịch theo thời gian thật (trước đây đếm số vòng lặp nên bị lệch khi mỗi vòng chạy lâu hơn 1 giây),
+          // và gửi nền để không chặn việc giám sát trong lúc chụp ảnh / tải lên.
+          if (webhookOn && !webhookBusy && Date.now() >= nextWebhookAt) {
+            nextWebhookAt = Date.now() + webhookPeriod;
+            webhookBusy = true;
+            this.logEvent("info", "Đang gửi báo cáo webhook...");
+            webhookManager.sendStatusWebhook(this.instances, this.startTime)
+              .catch((e) => this.logEvent("error", `Webhook: ${e.message}`))
+              .finally(() => { webhookBusy = false; });
           }
-
-          instance.status = analysis.status;
-          instance.info = analysis.info;
-          instance.presenceType = presenceTypeDisplay;
-          instance.lastCheck = now;
-        }
-
-        if (!instance.presenceType) {
-          instance.presenceType = "Unknown";
-        }
-      }
-
-      if (webhookConfig && webhookConfig.enabled && webhookCounter % (webhookConfig.intervalMinutes * 60) === 0 && webhookCounter > 0) {
-        console.log(`\n Đang gửi webhook status...`);
-        try {
-          await webhookManager.sendStatusWebhook(this.instances, this.startTime);
         } catch (e) {
-          console.error(`[-] Lỗi gửi webhook: ${e.message}`);
+          this.logEvent("error", `Lỗi vòng giám sát: ${e.message}`);
         }
+
+        // Ngoài terminal thật (ghi ra file / pipe) chỉ in 1 khung mỗi 30 giây cho đỡ spam.
+        if (process.stdout.isTTY || renderCounter % 30 === 0) {
+          let frame;
+          try {
+            frame = this._buildLiveFrame({ frame: renderCounter, webhookConfig, webhookOn, nextWebhookAt });
+          } catch (e) {
+            frame = "\n  R E J O I N\n  " + e.message;
+          }
+          UIRenderer.paint(frame, { hideCursor: true, fit: true });
+        }
+
+        renderCounter++;
+        await sleep(Math.max(100, 1000 - (Date.now() - tickStart)));
       }
-
-      if (renderCounter % 5 === 0) {
-        console.clear();
-        try {
-          console.log(UIRenderer.renderTitle());
-        } catch (e) {
-          console.log(`
-╭────────────────────────────╮
-│        REJOIN TOOL         │
-╰────────────────────────────╯`);
-        }
-
-        console.log(UIRenderer.renderSection("Giám sát trực tiếp", `${this.instances.length} instance đang hoạt động`));
-        console.log(UIRenderer.renderMultiInstanceTable(this.instances, this.startTime));
-
-        if (webhookConfig && webhookConfig.url) {
-          const urlParts = webhookConfig.url.split('/');
-          const webhookId = urlParts[urlParts.length - 2] || 'unknown';
-          const statusText = webhookConfig.enabled
-            ? UIRenderer.color("1;32", "BẬT")
-            : UIRenderer.color("1;31", "TẮT");
-          const nextWebhookText = webhookConfig.enabled
-            ? (() => {
-                const period = webhookConfig.intervalMinutes * 60;
-                const nextWebhookIn = period - (webhookCounter % period);
-                return `${Math.floor(nextWebhookIn / 60)}m ${nextWebhookIn % 60}s`;
-              })()
-            : "Đã tắt";
-          console.log(UIRenderer.infoCard([
-            ["Webhook ID", webhookId],
-            ["Trạng thái", webhookConfig.enabled ? "ĐANG BẬT" : "ĐANG TẮT", webhookConfig.enabled ? "1;32" : "1;31"],
-            ["Lần gửi tiếp", nextWebhookText],
-            ["Chu kỳ", `${webhookConfig.intervalMinutes} phút`]
-          ], "WEBHOOK"));
-        }
-
-        console.log(`\n${UIRenderer.color("2;37", "CTRL+C")}  ${UIRenderer.color("1;37", "Dừng chương trình an toàn")}`);
-      }
-
-      renderCounter++;
-      webhookCounter++;
-      await sleep(1000);
+    } finally {
+      restoreConsole();
+      unbindKeys();
     }
   }
 }
@@ -2594,10 +3553,12 @@ class WebhookManager {
     let webhookUrl;
     while (true) {
       webhookUrl = await Utils.ask(rl, UIRenderer.prompt("URL webhook Discord"));
-      if (webhookUrl.trim() && webhookUrl.includes('discord.com/api/webhooks/')) {
+      const safeUrl = Utils.parseDiscordWebhook(webhookUrl);
+      if (safeUrl) {
+        webhookUrl = safeUrl;
         break;
       }
-      console.log(UIRenderer.message("error", "URL webhook không hợp lệ. Vui lòng nhập lại."));
+      console.log(UIRenderer.message("error", "URL webhook không hợp lệ. Dạng đúng: https://discord.com/api/webhooks/ID/TOKEN"));
     }
 
     console.log(UIRenderer.step(2, 2, "Thiết lập chu kỳ báo cáo"));
@@ -2647,10 +3608,12 @@ class WebhookManager {
         webhookUrl = this.webhookConfig.url;
         break;
       }
-      if (webhookUrl.includes('discord.com/api/webhooks/')) {
+      const safeUrl = Utils.parseDiscordWebhook(webhookUrl);
+      if (safeUrl) {
+        webhookUrl = safeUrl;
         break;
       }
-      console.log(UIRenderer.message("error", "URL webhook không hợp lệ. Vui lòng nhập lại."));
+      console.log(UIRenderer.message("error", "URL webhook không hợp lệ. Dạng đúng: https://discord.com/api/webhooks/ID/TOKEN"));
     }
 
     let intervalMinutes;
@@ -2729,7 +3692,7 @@ class WebhookManager {
     const confirm = await Utils.ask(rl, UIRenderer.prompt("Chắc chắn xóa webhook? [y/N]"));
 
     if (confirm.toLowerCase() === 'y' || confirm.toLowerCase() === 'yes') {
-      const saved = Utils.saveWebhookConfig(null);
+      const saved = Utils.removeWebhookConfig();
       if (saved) this.webhookConfig = null;
       console.log(UIRenderer.infoCard([
         ["Webhook ID", webhookId],
@@ -2744,7 +3707,7 @@ class WebhookManager {
   }
 
   async sendStatusWebhook(instances, startTime) {
-    if (!this.webhookConfig || !this.webhookConfig.enabled) return;
+    if (!this.webhookConfig || !this.webhookConfig.enabled) return false;
 
     try {
       const stats = UIRenderer.getSystemStats();
@@ -2753,61 +3716,49 @@ class WebhookManager {
       const minutes = Math.floor((uptimeMs % (1000 * 60 * 60)) / (1000 * 60));
       const seconds = Math.floor((uptimeMs % (1000 * 60)) / 1000);
 
+      // Trước đây dùng status.includes("Online") nên "Online nhưng không trong game" cũng bị tính là đang chạy.
+      const total = instances.length;
+      const active = instances.filter((i) => isInGameStatus(i.status)).length;
+      const errors = instances.filter((i) => ERROR_STATUSES.has(String(i.status || "").trim())).length;
+      const rejoins = instances.reduce((s, i) => s + (Number(i.rejoinCount) || 0), 0);
 
-      const activePackages = instances.filter(instance =>
-        instance.status === "Online [+]" || instance.status.includes("Online")
-      ).length;
+      const iconOf = (status) => {
+        const tone = UIRenderer._statusTone(status);
+        return tone === "good" ? "🟢" : tone === "bad" ? "🔴" : tone === "warn" ? "🟠" : tone === "accent" ? "🟡" : "⚪";
+      };
+      const packageList = instances.map((i) =>
+        `${iconOf(i.status)} **${Utils.packageLabel(i.packageName)}** — ${String(i.status || "Không rõ").trim()} (↻${i.rejoinCount || 0})`
+      ).join("\n") || "Chưa có instance";
 
-
-      const packageList = instances.map(instance => {
-        const packageDisplay = Utils.packageLabel(instance.packageName, ' ');
-        return `${packageDisplay}: ${instance.status}`;
-      }).join('\n');
+      const color = total > 0 && active === total ? 0x2ecc71 : active === 0 ? 0xe74c3c : 0xf1c40f;
 
       const embed = {
-        title: "REJOIN TOOL Status Report",
-        color: 0x00ff00,
+        title: "🎮 REJOIN TOOL • Báo cáo trạng thái",
+        description: total
+          ? `**${active}/${total}** instance đang ở trong game` + (errors ? ` • ⚠️ ${errors} lỗi` : "")
+          : "Chưa có instance nào đang chạy",
+        color,
         timestamp: new Date().toISOString(),
         fields: [
+          { name: "🖥️ CPU", value: `${stats.cpuUsage}%`, inline: true },
+          { name: "💾 RAM", value: stats.ramUsage, inline: true },
+          { name: "⏱️ Uptime", value: `${hours}h ${minutes}m ${seconds}s`, inline: true },
+          { name: "🔁 Tổng rejoin", value: String(rejoins), inline: true },
           {
-            name: " CPU Usage",
-            value: `${stats.cpuUsage}%`,
-            inline: true
-          },
-          {
-            name: " RAM Usage",
-            value: stats.ramUsage,
-            inline: true
-          },
-          {
-            name: "⏱️ Uptime",
-            value: `${hours}h ${minutes}m ${seconds}s`,
-            inline: true
-          },
-          {
-            name: " Active Instances",
-            value: `${activePackages}/${instances.length}`,
-            inline: true
-          },
-          {
-            name: " Package Status",
+            name: "📦 Instances",
             value: packageList.length > 1024 ? packageList.substring(0, 1021) + "..." : packageList,
             inline: false
           }
         ],
-        footer: {
-          text: "REJOIN TOOL"
-        }
+        footer: { text: "REJOIN TOOL • báo cáo tự động" }
       };
 
-
       const screenshotPath = await Utils.takeScreenshot();
-
-
-      await Utils.sendWebhookEmbed(this.webhookConfig.url, embed, screenshotPath);
-
+      // sendWebhookEmbed tự dọn file ảnh tạm kể cả khi gửi lỗi.
+      return await Utils.sendWebhookEmbed(this.webhookConfig.url, embed, screenshotPath);
     } catch (e) {
       console.error(`[-] Lỗi khi gửi webhook: ${e.message}`);
+      return false;
     }
   }
 }
@@ -2947,28 +3898,42 @@ class ConfigEditor {
 
               case "3":
                 console.log(UIRenderer.infoCard([
-                  ["Cách lấy", "Dán link redirect sau khi vào private server"],
-                  ["Ví dụ", "https://www.roblox.com/games/2753915549/Blox-Fruits?privateServerLinkCode=77455530946706396026289495938493"]
+                  ["Đã chuyển", "roblox.com/games/ID/Tên?privateServerLinkCode=..."],
+                  ["Chưa chuyển", "roblox.com/share?code=...&type=Server"],
+                  ["Bỏ qua", "Để trống rồi Enter"]
                 ], "PRIVATE SERVER"));
                 while (true) {
                   try {
-                    const link = await Utils.ask(rl, UIRenderer.prompt("Dán link redirect đã chuyển hướng"));
-                    const m = link.match(/\/games\/(\d+)[^?]*\?[^=]*=([\w-]+)/);
-                    if (!m) {
-                      console.log(UIRenderer.message("error", "Link không hợp lệ!"));
+                    const link = (await Utils.ask(rl, UIRenderer.prompt("Dán link server"))).trim();
+                    if (!link) {
+                      console.log(UIRenderer.message("info", "Giữ nguyên server VIP hiện tại."));
+                      break;
+                    }
+                    const parsed = GameSelector.parseTarget(link);
+                    const spin = parsed && parsed.kind === "share"
+                      ? UIRenderer.spinner("Đang đổi link chưa chuyển hướng sang link server...")
+                      : null;
+                    let game;
+                    try {
+                      game = await GameSelector.resolveTarget(link, () => Utils.getRobloxCookie(packageName));
+                    } finally {
+                      if (spin) spin.stop();
+                    }
+                    if (!game.linkCode) {
+                      console.log(UIRenderer.message("error", "Đây là Place ID / link game thường, không có mã server VIP."));
                       continue;
                     }
-                    config.placeId = m[1];
+                    config.placeId = game.placeId;
                     config.gameName = "Private Server";
-                    config.linkCode = m[2];
+                    config.linkCode = game.linkCode;
                     console.log(UIRenderer.infoCard([
-                      ["Place ID", m[1], "1;36"],
+                      ["Place ID", game.placeId, "1;36"],
                       ["Link code", "ĐÃ CẬP NHẬT"],
                       ["Kết quả", "ĐÃ CẬP NHẬT", "1;32"]
                     ], "PRIVATE SERVER"));
                     break;
                   } catch (error) {
-                    console.log(UIRenderer.message("error", `Không thể xử lý link: ${error.message}`));
+                    console.log(UIRenderer.message("error", error.message));
                   }
                 }
                 break;
@@ -3027,15 +3992,23 @@ class ConfigEditor {
 }
 
 
+// Giữ console.log gốc: lúc giám sát trực tiếp console bị chuyển vào NHẬT KÝ, nhưng lời chào thoát vẫn phải hiện.
+const rawLog = console.log.bind(console);
 let shuttingDown = false;
 function gracefulShutdown(signal = "SIGINT") {
   if (shuttingDown) return;
   shuttingDown = true;
-  console.log(`\n\n Đang dừng chương trình (${signal})...`);
+  rawLog(`\n\n Đang dừng chương trình (${signal})...`);
   Utils.disableWakeLock();
-  console.log(' Đã tắt wake lock. REJOIN TOOL đã dừng.');
+  rawLog(' Đã tắt wake lock. REJOIN TOOL đã dừng.');
   process.exit(0);
 }
+// Luôn trả con trỏ về dù thoát bằng cách nào (spinner / giám sát trực tiếp có ẩn con trỏ).
+process.on('exit', () => {
+  if (process.stdout.isTTY) process.stdout.write('\x1b[?25h');
+  try { if (process.stdin.isTTY && process.stdin.isRaw) process.stdin.setRawMode(false); } catch (_) { }
+  Utils.disableWakeLock(); // luôn nhả wake lock dù thoát bằng cách nào (Ctrl+D, lỗi...)
+});
 process.on('SIGINT', () => gracefulShutdown('SIGINT'));
 process.on('SIGTERM', () => gracefulShutdown('SIGTERM'));
 
