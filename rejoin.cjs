@@ -1914,6 +1914,12 @@ class MultiRejoinTool {
     this.instances = [];
     this.isRunning = false;
     this.startTime = Date.now();
+    this.notice = null;
+  }
+
+  /** Thông báo 1 dòng hiện ở menu chính ngay sau khi một chức năng hoàn tất. */
+  notify(type, text) {
+    this.notice = { type, text };
   }
 
   async start() {
@@ -1936,6 +1942,10 @@ class MultiRejoinTool {
       while (!this.isRunning) {
         console.clear();
         console.log(UIRenderer.renderTitle());
+        if (this.notice) {
+          console.log(UIRenderer.message(this.notice.type, this.notice.text));
+          this.notice = null;
+        }
         console.log(UIRenderer.renderMainMenu({
           configCount: Object.keys(Utils.loadMultiConfigs()).length,
           prefix: Utils.loadPackagePrefixConfig(),
@@ -1952,16 +1962,18 @@ class MultiRejoinTool {
           continue;
         }
 
+        // Quy ước: chức năng trả về false (hoặc ném lỗi) = có lỗi cần người dùng đọc.
+        // Thành công thì tự quay lại menu, kết quả hiện thành 1 dòng thông báo ở menu.
+        let needAck = false;
         try {
-          await action();
+          const result = await action();
+          if (result === false) needAck = true;
         } catch (error) {
-          console.error(`\n[-] Không thể hoàn tất: ${error.message}`);
+          console.error(UIRenderer.message("error", `Không thể hoàn tất: ${error.message}`));
+          needAck = true;
         }
 
-        // Không xóa thông báo ngay khi một chức năng kết thúc hoặc gặp lỗi.
-        // Điều này đặc biệt hữu ích khi mục Rejoin không tạo được instance
-        // (ví dụ: không đọc được cookie hoặc package không còn tồn tại).
-        if (!this.isRunning) {
+        if (needAck && !this.isRunning) {
           await Utils.ask(rl, UIRenderer.prompt("Nhấn Enter để quay lại menu"));
         }
       }
@@ -1981,8 +1993,7 @@ class MultiRejoinTool {
         ["Kết quả", "KHÔNG TÌM THẤY", "1;31"],
         ["Gợi ý", "Kiểm tra prefix ở mục 4"]
       ], "QUÉT PACKAGE"));
-      await new Promise(resolve => setTimeout(resolve, 2000));
-      return;
+      return false;
     }
 
     const packageList = [];
@@ -2017,8 +2028,7 @@ class MultiRejoinTool {
 
       if (indices.length === 0) {
         console.log(UIRenderer.message("error", "Không có package hợp lệ được chọn."));
-        await sleep(900);
-        return;
+        return false;
       }
 
       selectedPackages = [...new Map(indices.map(i => [packageList[i].packageName, packageList[i]])).values()];
@@ -2112,9 +2122,11 @@ class MultiRejoinTool {
         : "Không có package mới nào được cấu hình hoàn chỉnh."
     ));
 
-    console.log(UIRenderer.message("info", "Đang quay lại menu chính..."));
-    await sleep(900);
-    return;
+    // Có package bị bỏ qua / lưu lỗi -> giữ màn hình để người dùng đọc (chờ Enter).
+    if (!saved || configuredCount === 0 || skippedPackages.length > 0) return false;
+
+    this.notify("success", `Đã thiết lập ${configuredCount} package.`);
+    return true;
   }
 
   async editConfigs(rl) {
