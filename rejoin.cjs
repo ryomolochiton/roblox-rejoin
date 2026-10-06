@@ -174,11 +174,6 @@ try {
 }
 
 class Utils {
-  // Bọc chuỗi an toàn cho shell (single-quote escaping)
-  static shq(s) {
-    return "'" + String(s).replace(/'/g, `'\\''`) + "'";
-  }
-
   /** Ghi JSON theo kiểu atomic để tránh hỏng config khi app bị dừng giữa lúc ghi. */
   static writeJsonAtomic(filePath, value) {
     const tempPath = `${filePath}.${process.pid}.tmp`;
@@ -186,95 +181,17 @@ class Utils {
     fs.renameSync(tempPath, filePath);
   }
 
-  // Termux PREFIX
-  static termuxPrefix() {
-    return process.env.PREFIX || "/data/data/com.termux/files/usr";
-  }
-
-  /**
-   * Tìm binary `node` THẬT.
-   *
-   * Lưu ý quan trọng trên Termux/Android:
-   * process.execPath có thể trả về "/apex/com.android.runtime/bin/linker64"
-   * (khi node được nạp qua dynamic linker). Nếu dùng thẳng giá trị đó làm
-   * lệnh chạy thì linker64 sẽ nhận rejoin.cjs làm ELF và báo:
-   *   "has bad ELF magic: 23212f75"   (23 21 2f 75 == "#!/u")
-   * -> Phải chạy: linker64 <node> <script.cjs>, KHÔNG BAO GIỜ là linker64 <script.cjs>
-   */
-  static resolveNodeBinary() {
-    const prefix = Utils.termuxPrefix();
-    const exec = process.execPath || "";
-    const isLinker = /(^|\/)linker(64)?$/.test(exec);
-
-    const candidates = [];
-    if (exec && !isLinker) candidates.push(exec);
-    candidates.push(path.join(prefix, "bin", "node"));
-    candidates.push("/data/data/com.termux/files/usr/bin/node");
-    candidates.push("/usr/bin/node", "/usr/local/bin/node");
-
-    for (const c of candidates) {
-      try {
-        if (c && fs.existsSync(c) && fs.statSync(c).isFile()) return c;
-      } catch { }
-    }
-
-    try {
-      const found = execSync("command -v node", { encoding: "utf8" }).trim();
-      if (found) return found;
-    } catch { }
-
-    return exec || "node";
-  }
-
   static ensureRoot() {
-    let uid = "";
     try {
-      uid = execSync("id -u", { encoding: "utf8" }).trim();
+      const uid = execSync("id -u").toString().trim();
+      if (uid !== "0") {
+        const node = execSync("which node").toString().trim();
+        console.log("Cần quyền root, chuyển qua su...");
+        execSync(`su -c "${node} ${__filename}"`, { stdio: "inherit" });
+        process.exit(0);
+      }
     } catch (e) {
-      console.warn(`[!] Không xác định được uid: ${e.message}`);
-      return;
-    }
-
-    if (uid === "0") return;
-
-    // Chống lặp vô hạn: nếu đã thử su 1 lần mà vẫn không phải root thì dừng
-    if (process.env.DAWN_REJOIN_SU === "1") {
-      console.error("[-] Đã thử chuyển sang root nhưng vẫn không có quyền root.");
-      console.error("[-] Vui lòng cấp quyền root cho Termux rồi chạy lại.");
-      process.exit(1);
-    }
-
-    const q = Utils.shq;
-    const prefix = Utils.termuxPrefix();
-    const home = process.env.HOME || "/data/data/com.termux/files/home";
-    const node = Utils.resolveNodeBinary();
-    const script = __filename;
-    const args = process.argv.slice(2);
-
-    // Shell của `su` không kế thừa env Termux -> phải export lại,
-    // nếu không node sẽ chết vì thiếu LD_LIBRARY_PATH / PREFIX / TMPDIR.
-    const inner = [
-      `export PREFIX=${q(prefix)}`,
-      `export HOME=${q(home)}`,
-      `export TMPDIR=${q(path.join(prefix, "tmp"))}`,
-      `export LD_LIBRARY_PATH=${q(path.join(prefix, "lib"))}`,
-      `export PATH=${q(path.join(prefix, "bin"))}:$PATH`,
-      `export DAWN_REJOIN_SU=1`,
-      `cd ${q(path.dirname(script))}`,
-      `exec ${q(node)} ${q(script)}${args.length ? " " + args.map(q).join(" ") : ""}`
-    ].join("; ");
-
-    console.log("Cần quyền root, chuyển qua su...");
-    try {
-      execSync(`su -c ${q(inner)}`, {
-        stdio: "inherit",
-        env: { ...process.env, DAWN_REJOIN_SU: "1" }
-      });
-      process.exit(0);
-    } catch (e) {
-      console.error(`[-] Không thể chạy với quyền root: ${e.message}`);
-      console.error(`[-] node binary dùng để chạy: ${node}`);
-      console.error("[-] Kiểm tra lại quyền su cho Termux (Magisk/KernelSU): thử `su -c id`.");
+      console.error("Không thể chạy với quyền root:", e.message);
       process.exit(1);
     }
   }
@@ -292,36 +209,6 @@ class Utils {
     try {
       execSync("termux-wake-unlock", { stdio: "ignore", timeout: 5000 });
     } catch (_) { }
-  }
-
-  /**
-   * Env sạch để gọi binary Android (am / pm / monkey / am force-stop).
-   * Termux export LD_PRELOAD + LD_LIBRARY_PATH trỏ vào $PREFIX/lib, khiến
-   * app_process (mà `am` gọi) không link được -> `am start` chết âm thầm,
-   * bot tưởng đã rejoin nhưng thực tế app không hề mở.
-   */
-  static androidEnv() {
-    const env = { ...process.env };
-    delete env.LD_PRELOAD;
-    delete env.LD_LIBRARY_PATH;
-    env.PATH = `/system/bin:/system/xbin:${env.PATH || ""}`;
-    return env;
-  }
-
-  /** Chạy 1 lệnh shell, trả về {ok, out}. Không ném exception. */
-  static _run(cmd, timeout = 15000) {
-    try {
-      const out = execSync(cmd, {
-        stdio: "pipe",
-        encoding: "utf8",
-        env: Utils.androidEnv(),
-        timeout
-      });
-      return { ok: true, out: String(out || "") };
-    } catch (e) {
-      const out = ((e.stdout || "") + "\n" + (e.stderr || "") + "\n" + (e.message || "")).toString();
-      return { ok: false, out };
-    }
   }
 
   static async launch(placeId, linkCode = null, packageName) {
@@ -369,180 +256,6 @@ class Utils {
 
   static ask(rl, msg) {
     return new Promise((r) => rl.question(msg, r));
-  }
-
-  /**
-   * Phân tích link người dùng dán vào.
-   * Hỗ trợ 2 dạng:
-   *  1) Link ĐÃ chuyển hướng:
-   *     https://www.roblox.com/games/2753915549/Blox-Fruits?privateServerLinkCode=7745...
-   *  2) Link CHƯA chuyển hướng (share link):
-   *     https://www.roblox.com/share?code=639f43b65925484c842425b544167a2f&type=Server
-   *     (cũng nhận ro.blox.com/Ebh5?..., type=ExperienceInvite, hoặc chỉ dán code 32 ký tự)
-   *
-   * @returns {{kind:"direct"|"share", placeId?:string, linkCode?:string, code?:string, type?:string}|null}
-   */
-  static parseGameLink(raw) {
-    const link = (raw || "").trim();
-    if (!link) return null;
-
-    // Dạng 1: đã có placeId + linkCode ngay trong URL
-    const direct = link.match(/\/games\/(\d+)[^?]*\?[^#]*?(?:privateServerLinkCode|linkCode)=([\w-]+)/i);
-    if (direct) {
-      return { kind: "direct", placeId: direct[1], linkCode: direct[2] };
-    }
-    // roblox://placeID=...&linkCode=...
-    const deep = link.match(/place(?:ID|Id|id)=(\d+)[\s\S]*?linkCode=([\w-]+)/);
-    if (deep) {
-      return { kind: "direct", placeId: deep[1], linkCode: deep[2] };
-    }
-
-    // Dạng 2: share link chưa chuyển hướng
-    const shareCode = link.match(/[?&]code=([\w-]+)/i);
-    if (shareCode && /roblox\.com\/share|ro\.blox\.com|share\?/i.test(link)) {
-      const t = link.match(/[?&]type=([\w-]+)/i);
-      return { kind: "share", code: shareCode[1], type: t ? t[1] : "Server" };
-    }
-
-    // Chỉ dán riêng code (32 ký tự hex) -> mặc định coi là share link type=Server
-    if (/^[a-f0-9]{32}$/i.test(link)) {
-      return { kind: "share", code: link, type: "Server" };
-    }
-
-    return null;
-  }
-
-  static _robloxHeaders(cookie, extra = {}) {
-    return {
-      "User-Agent": "Mozilla/5.0 (Linux; Android 10; Termux)",
-      Accept: "application/json",
-      "Content-Type": "application/json",
-      ...(cookie ? { Cookie: cookie } : {}),
-      ...extra,
-    };
-  }
-
-  /** Lấy X-CSRF-TOKEN (Roblox trả token trong header của response 403). */
-  static async _getCsrfToken(cookie) {
-    try {
-      const response = await axios.post("https://auth.roblox.com/v2/logout", {}, {
-        headers: Utils._robloxHeaders(cookie),
-        timeout: 10000,
-        // Axios không ném lỗi khi đã cho phép mọi status, nên token phải đọc từ response.
-        validateStatus: () => true,
-      });
-      return response.headers && (response.headers["x-csrf-token"] || response.headers["X-CSRF-TOKEN"]) || null;
-    } catch (e) {
-      const tok = e.response && (e.response.headers["x-csrf-token"] || e.response.headers["X-CSRF-TOKEN"]);
-      return tok || null;
-    }
-  }
-
-  /**
-   * Đổi share code -> { placeId, linkCode } bằng API resolve-link của Roblox.
-   * Cần cookie đăng nhập (share link chỉ resolve được khi đã auth).
-   */
-  static async resolveShareLink(code, type = "Server", cookie = null) {
-    if (!cookie) {
-      console.log("[-] Không có cookie để giải share link (cần đăng nhập Roblox).");
-      return null;
-    }
-
-    const linkTypes = [];
-    const t = (type || "").toLowerCase();
-    if (t === "server") linkTypes.push("Server", "ExperienceInvite");
-    else if (t === "experienceinvite") linkTypes.push("ExperienceInvite", "Server");
-    else linkTypes.push("Server", "ExperienceInvite");
-
-    let csrf = await Utils._getCsrfToken(cookie);
-
-    for (const linkType of linkTypes) {
-      for (let attempt = 0; attempt < 2; attempt++) {
-        try {
-          const res = await axios.post(
-            "https://apis.roblox.com/sharelinks/v1/resolve-link",
-            { linkId: code, linkType },
-            {
-              headers: Utils._robloxHeaders(cookie, csrf ? { "X-CSRF-TOKEN": csrf } : {}),
-              timeout: 15000,
-            }
-          );
-
-          const data = res.data || {};
-          const invite =
-            data.privateServerInviteData ||
-            data.experienceInviteData ||
-            data.inviteData ||
-            {};
-
-          const placeId = invite.placeId || invite.universePlaceId || data.placeId;
-          const linkCode = invite.linkCode || invite.privateServerLinkCode || null;
-
-          if (placeId) {
-            if (invite.status && String(invite.status).toLowerCase() !== "valid") {
-              console.log(`[!] Share link trạng thái: ${invite.status}`);
-            }
-            return { placeId: String(placeId), linkCode: linkCode ? String(linkCode) : null };
-          }
-        } catch (e) {
-          const status = e.response && e.response.status;
-          const newCsrf = e.response && e.response.headers && e.response.headers["x-csrf-token"];
-          if (status === 403 && newCsrf && newCsrf !== csrf) {
-            csrf = newCsrf; // thử lại ngay với token mới
-            continue;
-          }
-          if (status === 400 || status === 404) break; // sai linkType -> thử linkType kế tiếp
-          console.log(`[-] Lỗi resolve share link: ${status || ""} ${e.message}`);
-          break;
-        }
-        break;
-      }
-    }
-
-    // Fallback: đi theo redirect của trang share (một số link trả Location chứa privateServerLinkCode)
-    try {
-      const res = await axios.get(`https://www.roblox.com/share?code=${encodeURIComponent(code)}&type=${encodeURIComponent(type || "Server")}`, {
-        headers: Utils._robloxHeaders(cookie, { Accept: "text/html" }),
-        maxRedirects: 0,
-        timeout: 15000,
-        validateStatus: (s) => s >= 200 && s < 400,
-      });
-      const loc = (res.headers && res.headers.location) || "";
-      const parsed = Utils.parseGameLink(loc);
-      if (parsed && parsed.kind === "direct") {
-        return { placeId: parsed.placeId, linkCode: parsed.linkCode };
-      }
-    } catch (e) {
-      const loc = e.response && e.response.headers && e.response.headers.location;
-      const parsed = loc ? Utils.parseGameLink(loc) : null;
-      if (parsed && parsed.kind === "direct") {
-        return { placeId: parsed.placeId, linkCode: parsed.linkCode };
-      }
-    }
-
-    return null;
-  }
-
-  /**
-   * Nhận link bất kỳ (đã chuyển hướng hoặc share link) -> { placeId, linkCode }.
-   * Trả null nếu không hợp lệ / không giải được.
-   */
-  static async resolveGameLink(raw, cookie = null) {
-    const parsed = Utils.parseGameLink(raw);
-    if (!parsed) return null;
-
-    if (parsed.kind === "direct") {
-      return { placeId: parsed.placeId, linkCode: parsed.linkCode };
-    }
-
-    console.log(`[*] Link chưa chuyển hướng, đang giải share code (${parsed.type})...`);
-    const resolved = await Utils.resolveShareLink(parsed.code, parsed.type, cookie);
-    if (!resolved) {
-      console.log("[-] Không giải được share link. Hãy mở link trên trình duyệt rồi dán link đã chuyển hướng.");
-      return null;
-    }
-    console.log(`[+] Đã giải: placeId=${resolved.placeId}${resolved.linkCode ? `, linkCode=${resolved.linkCode}` : " (server công khai)"}`);
-    return resolved;
   }
 
   static saveMultiConfigs(configs) {
@@ -812,74 +525,6 @@ Timestamp: ${systemInfo.timestamp}
     return packageName;
   }
 
-  /**
-   * Quét mọi app KHAI BÁO xử lý được scheme `roblox://`.
-   * (Dùng cho nhận diện prefix ở mục 4.)
-   * @returns {string[]} danh sách package name
-   */
-  static scanRobloxHandlers() {
-    const found = new Set();
-    const SYSTEM_DENY = /^(android$|com\.android\.|com\.google\.android\.|com\.samsung\.|com\.sec\.|com\.miui\.|com\.xiaomi\.|com\.huawei\.|com\.oppo\.|com\.vivo\.|com\.termux)/;
-
-    const cmds = [
-      `/system/bin/cmd package query-activities -a android.intent.action.VIEW -d "roblox://placeID=1"`,
-      `cmd package query-activities -a android.intent.action.VIEW -d "roblox://placeID=1"`,
-      `su -c ${Utils.shq(`unset LD_PRELOAD LD_LIBRARY_PATH; /system/bin/cmd package query-activities -a android.intent.action.VIEW -d 'roblox://placeID=1'`)}`,
-      `/system/bin/pm query-activities -a android.intent.action.VIEW -d "roblox://placeID=1"`
-    ];
-
-    for (const cmd of cmds) {
-      const r = Utils._run(cmd, 20000);
-      if (!r.ok || !r.out.trim()) continue;
-      const m = r.out.match(/[a-zA-Z][\w]*(?:\.[\w]+)+\/[\w.$]+/g) || [];
-      for (const x of m) {
-        const pkg = x.split("/")[0];
-        if (pkg && !SYSTEM_DENY.test(pkg)) found.add(pkg);
-      }
-      if (found.size) break;
-    }
-
-    return [...found];
-  }
-
-  /**
-   * Suy ra prefix chung từ danh sách package.
-   */
-  static derivePrefix(packages) {
-    const list = (packages || []).filter(Boolean).map(String);
-    if (list.length === 0) return null;
-
-    if (list.length === 1) {
-      const parts = list[0].split(".");
-      if (parts.length <= 1) return list[0];
-      // Bỏ segment cuối (thường là "client" / tên biến thể)
-      return parts.slice(0, -1).join(".");
-    }
-
-    // Nhiều package: lấy phần segment đầu chung nhau
-    const split = list.map((p) => p.split("."));
-    const common = [];
-    for (let i = 0; i < split[0].length; i++) {
-      const seg = split[0][i];
-      if (split.every((parts) => parts[i] === seg)) common.push(seg);
-      else break;
-    }
-
-    if (common.length === 0) return null;
-    // Nếu prefix chung ăn trọn 1 package thì lùi lại 1 segment
-    if (common.length === Math.min(...split.map((s) => s.length)) && common.length > 1) {
-      return common.slice(0, -1).join(".");
-    }
-    return common.join(".");
-  }
-
-  /** Quét handler roblox:// rồi suy ra prefix; null nếu không tìm được. */
-  static autoDetectPrefix() {
-    const handlers = Utils.scanRobloxHandlers();
-    if (!handlers.length) return { prefix: null, packages: [] };
-    return { prefix: Utils.derivePrefix(handlers), packages: handlers };
-  }
-
   static detectAllRobloxPackages() {
     const packages = {};
 
@@ -929,42 +574,36 @@ Timestamp: ${systemInfo.timestamp}
         if (match) {
           matchedCount++;
           const packageName = match[1];
+          let displayName = packageName;
+
+          if (packageName === `${prefix}.client`) {
+            displayName = 'Roblox Quốc tế';
+          } else if (packageName === `${prefix}.client.vnggames`) {
+            displayName = 'Roblox VNG';
+          } else {
+            displayName = `Roblox Custom (${packageName})`;
+          }
+
           packages[packageName] = {
             packageName,
-            displayName: Utils.describePackage(packageName, prefix)
+            displayName
           };
         }
       });
 
-      // Không package nào khớp prefix -> app mod đã đổi tên hoàn toàn.
-      // Quét theo scheme roblox:// để tìm chúng thay vì bắt user tự sửa prefix.
+      // Nếu tìm thấy packages nhưng không cái nào khớp prefix
       if (foundAny && matchedCount === 0) {
-        console.log(`\x1b[33m[!] Không có package nào bắt đầu bằng "${prefix}" — đang tự dò app xử lý roblox://\x1b[0m`);
+        console.log(`\x1b[33m[!] CẢNH BÁO: Tìm thấy packages hệ thống nhưng không cái nào bắt đầu bằng "${prefix}"\x1b[0m`);
+        console.log(`[!] Có vẻ bạn đang dùng Roblox mod (ví dụ: vip.xxx).`);
+        console.log(`[!] Vui lòng vào mục "4. Chỉnh prefix package" để đổi lại cho đúng.`);
 
-        const handlers = Utils.scanRobloxHandlers();
-        if (handlers.length > 0) {
-          for (const packageName of handlers) {
-            packages[packageName] = {
-              packageName,
-              displayName: Utils.describePackage(packageName, prefix)
-            };
-          }
-          const derived = Utils.derivePrefix(handlers);
-          console.log(`[+] Tự nhận diện được ${handlers.length} app Roblox: \x1b[32m${handlers.join(', ')}\x1b[0m`);
-          if (derived && derived !== prefix) {
-            console.log(`[*] Prefix gợi ý: \x1b[32m${derived}\x1b[0m — vào mục "4. Chỉnh prefix package" > "3. Tự động nhận diện prefix" để lưu lại.`);
-          }
-        } else {
-          console.log(`[!] Có vẻ bạn đang dùng Roblox mod (ví dụ: vip.xxx) nhưng không dò được qua roblox://.`);
-          console.log(`[!] Vui lòng vào mục "4. Chỉnh prefix package" để đổi lại cho đúng.`);
-
-          const samples = lines
-            .filter(l => l.includes('package:'))
-            .slice(0, 3)
-            .map(l => l.replace('package:', '').trim());
-          if (samples.length > 0) {
-            console.log(`[*] Gợi ý các package tìm thấy: \x1b[32m${samples.join(', ')}\x1b[0m`);
-          }
+        // Gợi ý 3 package đầu tiên tìm được để user biết prefix là gì
+        const samples = lines
+          .filter(l => l.includes('package:'))
+          .slice(0, 3)
+          .map(l => l.replace('package:', '').trim());
+        if (samples.length > 0) {
+          console.log(`[*] Gợi ý các package tìm thấy: \x1b[32m${samples.join(', ')}\x1b[0m`);
         }
       }
     } catch (e) {
@@ -1197,56 +836,22 @@ class RobloxUser {
   }
 
   async getPresence() {
-    // Gọi endpoint chính thức trước (kèm cookie để lấy đủ placeId),
-    // nếu lỗi mạng/chặn thì fallback sang roproxy (KHÔNG gửi cookie sang proxy bên thứ 3)
-    const body = { userIds: [Number(this.userId) || this.userId] };
-    let lastErr = null;
-
-    try {
-      const r = await axios.post(
-        "https://presence.roblox.com/v1/presence/users",
-        body,
-        {
-          timeout: 15000,
-          headers: {
-            ...(this.cookie ? { Cookie: this.cookie } : {}),
-            "User-Agent": "Mozilla/5.0 (Linux; Android 10; Termux)",
-            "Content-Type": "application/json",
-            Accept: "application/json",
-          },
-        }
-      );
-      const p = r.data?.userPresences?.[0];
-      if (p) return p;
-    } catch (e) {
-      lastErr = e;
-      // rơi xuống fallback
-    }
-
     try {
       const r = await axios.post(
         "https://presence.roproxy.com/v1/presence/users",
-        body,
+        { userIds: [this.userId] },
         {
-          timeout: 15000,
           headers: {
+            Cookie: this.cookie,
             "User-Agent": "Mozilla/5.0 (Linux; Android 10; Termux)",
-            "Content-Type": "application/json",
             Accept: "application/json",
           },
         }
       );
-      const p = r.data?.userPresences?.[0];
-      if (p) return p;
-    } catch (e) {
-      lastErr = e;
+      return r.data.userPresences?.[0];
+    } catch {
+      return null;
     }
-
-    // Cả 2 endpoint fail: KHÔNG trả null im lặng.
-    // Trả marker để vòng lặp biết đây là lỗi mạng (giữ trạng thái cũ),
-    // khác hẳn với "API trả về offline thật".
-    this.lastPresenceError = lastErr ? (lastErr.message || String(lastErr)) : "unknown";
-    return { __fetchFailed: true, error: this.lastPresenceError };
   }
 }
 
@@ -1255,15 +860,22 @@ class GameSelector {
     this.GAMES = {
       "1": ["126884695634066", "Grow-a-Garden"],
       "2": ["2753915549", "Blox-Fruits"],
+      "3": ["6284583030", "Pet-Simulator-X"],
+      "4": ["126244816328678", "DIG"],
+      "5": ["116495829188952", "Dead-Rails-Alpha"],
+      "6": ["8737602449", "PLS-DONATE"],
+      "7": ["920587237", "Adopt Me!"],
+      "8": ["79546208627805", "99 Night In The Forests"],
+      "9": ["109983668079237", "Steal-a-Brainrot"],
+      "10": ["127742093697776", "Plants-Vs-Brainrots"],
+      "11": ["121864768012064", "Fish-It"],
+      "12": ["16732694052", "Fisch"],
       "0": ["custom", "Tùy chỉnh"],
     };
   }
 
-  /**
-   * @param {readline.Interface} rl
-   * @param {string|null} cookie Cookie ROBLOSECURITY, dùng để giải share link chưa chuyển hướng.
-   */
-  async chooseGame(rl, cookie = null) {
+  async chooseGame(rl) {
+    const maxKey = Math.max(...Object.keys(this.GAMES).map(Number));
     console.log(UIRenderer.renderSection("Chọn game", "Điểm đến Auto Rejoin"));
     console.log(UIRenderer.options([
       ...Object.entries(this.GAMES).filter(([key]) => key !== "0").map(([key, game]) => ({
@@ -1274,12 +886,12 @@ class GameSelector {
       { key: "0", label: "Tùy chỉnh", description: "Nhập Place ID hoặc link private server", color: "1;35" }
     ]));
 
-    const ans = (await Utils.ask(rl, UIRenderer.prompt("Chọn game [0-2]"))).trim();
+    const ans = (await Utils.ask(rl, UIRenderer.prompt(`Chọn game [0-${maxKey}]`))).trim();
 
     if (ans === "0") {
       console.log(UIRenderer.options([
         { key: "1", label: "Nhập Place ID", description: "Dùng ID game thủ công" },
-        { key: "2", label: "Private Server", description: "Dán link hoặc share code", color: "1;35" }
+        { key: "2", label: "Private Server", description: "Dán link redirect sau khi vào private server", color: "1;35" }
       ], { footer: "Chọn cách thêm game tùy chỉnh" }));
       const sub = (await Utils.ask(rl, UIRenderer.prompt("Lựa chọn [1-2]"))).trim();
       if (sub === "1") {
@@ -1288,31 +900,35 @@ class GameSelector {
       }
       if (sub === "2") {
         console.log(UIRenderer.infoCard([
-          ["Hỗ trợ", "Link games, link share hoặc share code"],
-          ["Bảo mật", "Cookie chỉ gửi đến API Roblox"]
+          ["Cách lấy", "Dán link redirect sau khi vào private server"],
+          ["Ví dụ", "https://www.roblox.com/games/2753915549/Blox-Fruits?privateServerLinkCode=77455530946706396026289495938493"]
         ], "PRIVATE SERVER"));
         while (true) {
-          const link = await Utils.ask(rl, UIRenderer.prompt("Dán link private server"));
-          const resolved = await Utils.resolveGameLink(link, cookie);
-          if (!resolved) {
-            console.log(UIRenderer.message("error", "Link không hợp lệ hoặc không thể giải mã."));
+          const link = await Utils.ask(rl, UIRenderer.prompt("Dán link redirect đã chuyển hướng"));
+          const m = link.match(/\/games\/(\d+)[^?]*\?[^=]*=([\w-]+)/);
+          if (!m) {
+            console.log(UIRenderer.message("error", "Link không hợp lệ!"));
             continue;
           }
           return {
-            placeId: resolved.placeId,
-            name: resolved.linkCode ? "Private Server" : "Tùy chỉnh",
-            linkCode: resolved.linkCode,
+            placeId: m[1],
+            name: "Private Server",
+            linkCode: m[2],
           };
         }
       }
-      throw new Error("Lựa chọn game không hợp lệ");
+      throw new Error(`[-] Không hợp lệ!`);
     }
 
     if (this.GAMES[ans]) {
-      return { placeId: this.GAMES[ans][0], name: this.GAMES[ans][1], linkCode: null };
+      return {
+        placeId: this.GAMES[ans][0],
+        name: this.GAMES[ans][1],
+        linkCode: null,
+      };
     }
 
-    throw new Error("Lựa chọn game không hợp lệ");
+    throw new Error(`[-] Không hợp lệ!`);
   }
 }
 
@@ -2269,8 +1885,7 @@ class MultiRejoinTool {
     }
 
 
-    // Giữ lại config của các package không được chọn, tránh setup một app làm mất app khác.
-    const configs = Utils.loadMultiConfigs();
+    const configs = {};
     let configuredCount = 0;
     const skippedPackages = [];
 
@@ -2304,7 +1919,7 @@ class MultiRejoinTool {
       ], "XÁC THỰC THÀNH CÔNG"));
 
       const selector = new GameSelector();
-      const game = await selector.chooseGame(rl, cookie);
+      const game = await selector.chooseGame(rl);
 
       let delaySec;
       while (true) {
@@ -2414,11 +2029,10 @@ class MultiRejoinTool {
     console.log(UIRenderer.options([
       { key: "1", label: "Thay đổi prefix", description: "Nhập prefix package thủ công" },
       { key: "2", label: "Đặt lại mặc định", description: "Khôi phục về com.roblox" },
-      { key: "3", label: "Tự động nhận diện", description: "Quét ứng dụng xử lý roblox://", color: "1;32" },
-      { key: "4", label: "Quay lại", description: "Trở về bảng điều khiển", color: "1;31" }
+      { key: "3", label: "Quay lại", description: "Trở về bảng điều khiển", color: "1;31" }
     ]));
 
-    const choice = await Utils.ask(rl, UIRenderer.prompt("Lựa chọn [1-4]"));
+    const choice = await Utils.ask(rl, UIRenderer.prompt("Lựa chọn [1-3]"));
 
     if (choice.trim() === "1") {
       console.log(UIRenderer.infoCard([
@@ -2451,35 +2065,6 @@ class MultiRejoinTool {
       ], "PREFIX MẶC ĐỊNH"));
 
     } else if (choice.trim() === "3") {
-      console.log(UIRenderer.message("info", "Đang quét các ứng dụng xử lý scheme roblox://..."));
-      const { prefix: detected, packages: handlers } = Utils.autoDetectPrefix();
-
-      if (!handlers.length) {
-        console.log(UIRenderer.infoCard([
-          ["Kết quả", "KHÔNG TÌM THẤY", "1;31"],
-          ["Gợi ý", "Nhập prefix thủ công ở lựa chọn 1"]
-        ], "TỰ ĐỘNG NHẬN DIỆN"));
-      } else {
-        console.log(UIRenderer.selectionCard(handlers, "ỨNG DỤNG ĐÃ PHÁT HIỆN"));
-        console.log(UIRenderer.infoCard([
-          ["Số ứng dụng", String(handlers.length), "1;32"],
-          ["Prefix suy ra", detected, "1;36"]
-        ], "KẾT QUẢ NHẬN DIỆN"));
-
-        const ok = (await Utils.ask(rl, UIRenderer.prompt(`Lưu prefix "${detected}"? [Y/n]`))).trim().toLowerCase();
-        if (ok === "y" || ok === "yes" || ok === "") {
-          const saved = Utils.savePackagePrefixConfig(detected);
-          console.log(UIRenderer.infoCard([
-            ["Ứng dụng", String(handlers.length)],
-            ["Prefix", detected, saved ? "1;32" : "1;31"],
-            ["Kết quả", saved ? "ĐÃ LƯU" : "THẤT BẠI", saved ? "1;32" : "1;31"]
-          ], "NHẬN DIỆN PREFIX"));
-        } else {
-          console.log(UIRenderer.message("warning", "Đã hủy; prefix cũ được giữ nguyên."));
-        }
-      }
-
-    } else if (choice.trim() === "4") {
       console.log(UIRenderer.message("info", "Đang quay lại bảng điều khiển..."));
       await new Promise(resolve => setTimeout(resolve, 2000));
       return;
@@ -2579,7 +2164,14 @@ class MultiRejoinTool {
       return;
     }
 
-    // (Đã bỏ bước kiểm tra tính toàn vẹn — chạy luôn vào phần chọn package)
+    console.log(UIRenderer.message("info", "Kiểm tra toàn vẹn hệ thống..."));
+    const isValid = Utils.validatePackageIntegrity(configs);
+
+    if (!isValid) {
+      console.log(UIRenderer.message("warning", "Quay lại menu chính sau 5 giây..."));
+      await new Promise(resolve => setTimeout(resolve, 5000));
+      return;
+    }
 
     console.log(UIRenderer.renderSection("Danh sách cấu hình", `${Object.keys(configs).length} package sẵn sàng`));
     console.log(UIRenderer.displayConfiguredPackages(configs));
@@ -2615,11 +2207,12 @@ class MultiRejoinTool {
 
       if (indices.length === 0) {
         console.log(UIRenderer.message("error", "Lựa chọn không hợp lệ."));
-        await sleep(900);
+        await new Promise(resolve => setTimeout(resolve, 1000));
+        await this.startAutoRejoin(rl);
         return;
       }
 
-      selectedPackages = [...new Set(indices.map(i => packageList[i]))];
+      selectedPackages = indices.map(i => packageList[i]);
       console.log(UIRenderer.selectionCard(selectedPackages.map((pkg) => Utils.packageLabel(pkg)), "PACKAGE SẼ CHẠY"));
     }
 
@@ -2688,11 +2281,7 @@ class MultiRejoinTool {
     const webhookManager = new WebhookManager();
     const webhookConfig = Utils.loadWebhookConfig();
 
-    // Dùng mốc thời gian thực thay vì đếm vòng lặp (vòng lặp có await nên bị trôi)
-    const webhookIntervalMs = webhookConfig && webhookConfig.intervalMinutes
-      ? webhookConfig.intervalMinutes * 60 * 1000
-      : 0;
-    let nextWebhookAt = webhookIntervalMs ? Date.now() + webhookIntervalMs : 0;
+    let webhookCounter = 0;
 
     const autoexecManager = new AutoexecManager();
     const autoexecConfig = autoexecManager.loadConfig();
@@ -2716,10 +2305,7 @@ class MultiRejoinTool {
         instance.countdownSeconds = Math.ceil(timeLeft / 1000);
 
         if (timeSinceLastCheck >= delayMs) {
-          let presence = await user.getPresence();
-          // getPresence() của bản này trả marker __fetchFailed khi lỗi mạng;
-          // logic rejoin coi đó là "không lấy được presence" (null).
-          if (presence && presence.__fetchFailed) presence = null;
+          const presence = await user.getPresence();
 
           let presenceTypeDisplay = "Unknown";
           if (presence && presence.userPresenceType !== undefined) {
@@ -2751,14 +2337,13 @@ class MultiRejoinTool {
         }
       }
 
-      if (webhookConfig && webhookConfig.enabled && webhookIntervalMs && Date.now() >= nextWebhookAt) {
+      if (webhookConfig && webhookConfig.enabled && webhookCounter % (webhookConfig.intervalMinutes * 60) === 0 && webhookCounter > 0) {
         console.log(`\n Đang gửi webhook status...`);
         try {
           await webhookManager.sendStatusWebhook(this.instances, this.startTime);
         } catch (e) {
           console.error(`[-] Lỗi gửi webhook: ${e.message}`);
         }
-        nextWebhookAt = Date.now() + webhookIntervalMs;
       }
 
       if (renderCounter % 5 === 0) {
@@ -2781,9 +2366,10 @@ class MultiRejoinTool {
           const statusText = webhookConfig.enabled
             ? UIRenderer.color("1;32", "BẬT")
             : UIRenderer.color("1;31", "TẮT");
-          const nextWebhookText = webhookConfig.enabled && webhookIntervalMs
+          const nextWebhookText = webhookConfig.enabled
             ? (() => {
-                const nextWebhookIn = Math.max(0, Math.ceil((nextWebhookAt - Date.now()) / 1000));
+                const period = webhookConfig.intervalMinutes * 60;
+                const nextWebhookIn = period - (webhookCounter % period);
                 return `${Math.floor(nextWebhookIn / 60)}m ${nextWebhookIn % 60}s`;
               })()
             : "Đã tắt";
@@ -2799,6 +2385,7 @@ class MultiRejoinTool {
       }
 
       renderCounter++;
+      webhookCounter++;
       await sleep(1000);
     }
   }
@@ -3204,24 +2791,23 @@ class ConfigEditor {
 
               case "3":
                 console.log(UIRenderer.infoCard([
-                  ["Hỗ trợ", "Link games đã chuyển hướng"],
-                  ["Hỗ trợ", "Link share hoặc share code"],
-                  ["Bảo mật", "Cookie chỉ gửi đến API Roblox", "1;32"]
+                  ["Cách lấy", "Dán link redirect sau khi vào private server"],
+                  ["Ví dụ", "https://www.roblox.com/games/2753915549/Blox-Fruits?privateServerLinkCode=77455530946706396026289495938493"]
                 ], "PRIVATE SERVER"));
                 while (true) {
                   try {
-                    const link = await Utils.ask(rl, UIRenderer.prompt("Dán link private server"));
-                    const resolved = await Utils.resolveGameLink(link, Utils.getRobloxCookie(packageName));
-                    if (!resolved) {
-                      console.log(UIRenderer.message("error", "Link không hợp lệ hoặc không thể giải mã."));
+                    const link = await Utils.ask(rl, UIRenderer.prompt("Dán link redirect đã chuyển hướng"));
+                    const m = link.match(/\/games\/(\d+)[^?]*\?[^=]*=([\w-]+)/);
+                    if (!m) {
+                      console.log(UIRenderer.message("error", "Link không hợp lệ!"));
                       continue;
                     }
-                    config.placeId = resolved.placeId;
-                    config.gameName = resolved.linkCode ? "Private Server" : "Tùy chỉnh";
-                    config.linkCode = resolved.linkCode;
+                    config.placeId = m[1];
+                    config.gameName = "Private Server";
+                    config.linkCode = m[2];
                     console.log(UIRenderer.infoCard([
-                      ["Place ID", resolved.placeId, "1;36"],
-                      ["Link code", resolved.linkCode ? "ĐÃ CẬP NHẬT" : "KHÔNG CÓ"],
+                      ["Place ID", m[1], "1;36"],
+                      ["Link code", "ĐÃ CẬP NHẬT"],
                       ["Kết quả", "ĐÃ CẬP NHẬT", "1;32"]
                     ], "PRIVATE SERVER"));
                     break;
