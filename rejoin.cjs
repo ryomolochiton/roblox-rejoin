@@ -1831,10 +1831,48 @@ class GameSelector {
     return this.chooseJoinMode(rl, game);
   }
 
-  /** Hỏi kiểu join cho game vừa chọn. Server VIP có mã riêng nên bỏ qua câu hỏi. */
+  /**
+   * Hỏi kiểu join cho game vừa chọn. Server VIP có mã riêng nên bỏ qua câu hỏi.
+   * Join theo ID thì hỏi tiếp Place ID dùng để tìm server ít người nhất (Enter = giữ Place ID của game vừa chọn).
+   */
   async chooseJoinMode(rl, game, current = null) {
     if (!game || game.linkCode) return { ...game, joinMode: null };
-    return { ...game, joinMode: await GameSelector.askJoinMode(rl, current) };
+    const joinMode = await GameSelector.askJoinMode(rl, current);
+    if (joinMode === "normal") return { ...game, joinMode };
+    return { ...(await GameSelector.askJoinId(rl, game)), joinMode };
+  }
+
+  /**
+   * Ô nhập Place ID cho "Join theo ID": tool sẽ tìm server ÍT NGƯỜI NHẤT của đúng Place ID này mỗi lần rejoin.
+   * Enter = giữ Place ID hiện tại. Nhập ID khác (ví dụ ID world lấy ở mục 8 - Dò world) thì đổi sang ID đó và tra lại tên game.
+   * Trả về { ...game, placeId, name }.
+   */
+  static async askJoinId(rl, game) {
+    const current = String(game.placeId);
+    console.log(UIRenderer.infoCard([
+      ["ID hiện tại", current, "1;36"],
+      ["Nhập ID world", "Place ID của world muốn tìm server ít người (xem ở mục 8 - Dò world)"],
+      ["Giữ ID hiện tại", "Để trống rồi Enter"]
+    ], "ID WORLD ĐỂ TÌM SERVER ÍT NGƯỜI"));
+    while (true) {
+      const input = (await Utils.ask(rl, UIRenderer.prompt(`ID world [Enter = giữ ${current}]`))).trim();
+      if (!input) return game;
+      const target = GameSelector.parseTarget(input);
+      if (!target || target.kind !== "place") {
+        console.log(UIRenderer.message("error", "Chỉ nhập số Place ID (hoặc link roblox.com/games/ID/...), không dùng link server VIP."));
+        continue;
+      }
+      if (target.placeId === current) return game;
+      const spin = UIRenderer.spinner("Đang lấy tên game...");
+      let name = null;
+      try { name = await Utils.fetchGameName(target.placeId); } finally { spin.stop(); }
+      if (!name) {
+        name = target.name && target.name !== "Tùy chỉnh" ? target.name : `Place ${target.placeId}`;
+        console.log(UIRenderer.message("warning", "Chưa tra được tên game cho Place ID này (vẫn dùng bình thường nếu ID đúng)."));
+      }
+      console.log(UIRenderer.message("success", `${name} • Place ID ${target.placeId}`));
+      return { ...game, placeId: target.placeId, name };
+    }
   }
 
   /**
@@ -1855,7 +1893,7 @@ class GameSelector {
     console.log(UIRenderer.renderSection("Kiểu join", "Chọn cách vào game mỗi lần rejoin"));
     console.log(UIRenderer.options([
       { key: "1", label: "Join thường", description: "Vào thẳng Place ID, Roblox tự chọn server" },
-      { key: "2", label: "Join theo ID", description: "Tìm server ÍT NGƯỜI NHẤT của Place ID này rồi vào", color: "1;35" }
+      { key: "2", label: "Join theo ID", description: "Nhập ID world, tool tìm server ÍT NGƯỜI NHẤT trong world đó rồi vào", color: "1;35" }
     ], { footer: `Enter = ${fallback === "normal" ? "1 (join thường)" : "2 (join theo ID)"}` }));
     while (true) {
       const ans = await Utils.ask(rl, UIRenderer.prompt("Kiểu join [1-2]"));
@@ -2004,7 +2042,7 @@ class GameSelector {
       lookup ? "Danh sách world" : "Chọn world",
       `${gameName} có ${worlds.length} world${scan.truncated ? " (danh sách quá dài, chỉ quét được một phần)" : ""}. ` +
       (lookup
-        ? "Nhập số để xem Place ID của world, rồi dùng Place ID đó ở bước chọn game (mục 2 / mục 3)."
+        ? "Nhập số để xem Place ID của world, rồi nhập Place ID đó ở bước Join theo ID (mục 2 / mục 3)."
         : "Chọn world để tool tìm server ÍT NGƯỜI NHẤT trong world đó.")
     ));
 
@@ -3811,7 +3849,7 @@ class MultiRejoinTool {
 
   /**
    * Mục 8: Dò world. Nhập 1 Place ID (hoặc link game) -> quét và liệt kê các world của game kèm Place ID,
-   * để dùng ở bước chọn game (mục 2 / mục 3) khi muốn join đúng world. Không thay đổi cấu hình nào.
+   * để nhập vào ô Place ID của "Join theo ID" (mục 2 / mục 3) khi muốn join đúng world. Không thay đổi cấu hình nào.
    */
   async scanWorldIds(rl) {
     UIRenderer.screen("Dò world", "Liệt kê world của game để lấy Place ID");
@@ -5058,6 +5096,11 @@ class ConfigEditor {
                   break;
                 }
                 config.joinMode = await GameSelector.askJoinMode(rl, joinModeOf(config));
+                if (config.joinMode === "lowpop") {
+                  const target = await GameSelector.askJoinId(rl, { placeId: config.placeId, name: config.gameName || "Tùy chỉnh" });
+                  config.placeId = target.placeId;
+                  config.gameName = target.name;
+                }
                 console.log(UIRenderer.infoCard([
                   ["Game", config.gameName || "Unknown", "1;32"],
                   ["Place ID", config.placeId],
