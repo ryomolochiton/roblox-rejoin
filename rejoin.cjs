@@ -175,6 +175,7 @@ const LOWPOP_LIST_TTL_MS = 8000;       // join server ít người: danh sách s
 const LOWPOP_RESERVE_MS = 120000;      // server vừa được 1 tài khoản chọn thì tính thêm "1 người" trong 2 phút -> các tài khoản khác tự rải sang server ít người kế tiếp
 const WORLD_PLACE_PAGES = 3;           // quét world: liệt kê tối đa N trang x 100 place của 1 game
 const WORLD_PROBE_MAX = 30;            // quét world: chỉ dò server public của tối đa N place (game có hàng trăm place thì không dò hết)
+const WORLD_PROBE_CONCURRENCY = 2;     // quét world: số place dò server song song (request cùng host vẫn bị API_MIN_GAP_MS giãn cách nên không tăng nguy cơ 429)
 const WORLD_PROBE_BUDGET_MS = 30000;   // quét world: dò tuần tự, quá chừng này thì dừng (world còn lại hiện "chưa dò", bấm R để dò tiếp)
 const API_MIN_GAP_MS = 700;            // mọi request tới cùng 1 host Roblox đi tuần tự và cách nhau tối thiểu chừng này (chống 429 khi nhiều máy/tài khoản chung IP)
 const LOWPOP_STALE_MS = 180000;        // bị 429 mà không lấy được danh sách server mới thì dùng lại danh sách cũ (tối đa chừng này) thay vì join thường
