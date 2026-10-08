@@ -71,6 +71,9 @@ const path = require("path");
 const os = require("os");
 const Table = require("cli-table3");
 const util = require("util");
+const http = require("http");
+const https = require("https");
+const tls = require("tls");
 
 /**
  * Thư mục lưu cấu hình NGOÀI repo.
@@ -174,8 +177,9 @@ const LAUNCH_GRACE_MS = 75 * 1000;     // sau khi gửi lệnh mở game, chờ 
 const LOWPOP_LIST_TTL_MS = 8000;       // join server ít người: danh sách server còn chỗ của 1 world dùng chung 8s (nhiều tài khoản cùng rejoin chỉ tốn 1 request)
 const LOWPOP_RESERVE_MS = 120000;      // server vừa được 1 tài khoản chọn thì tính thêm "1 người" trong 2 phút -> các tài khoản khác tự rải sang server ít người kế tiếp
 const WORLD_PLACE_PAGES = 3;           // quét world: liệt kê tối đa N trang x 100 place của 1 game
-const WORLD_PROBE_MAX = 30;            // quét world: chỉ dò server public của tối đa N place (game có hàng trăm place thì không dò hết)
-const WORLD_PROBE_CONCURRENCY = 2;     // quét world: số place dò server song song (request cùng host vẫn bị API_MIN_GAP_MS giãn cách nên không tăng nguy cơ 429)
+const WORLD_PROBE_MAX = 15;            // quét world: chỉ dò server public của tối đa N place (game có hàng trăm place thì không dò hết)
+const WORLD_PROBE_CONCURRENCY = 1;     // quét world: dò TUẦN TỰ từng place (song song không nhanh hơn vì request cùng host đã xếp hàng, chỉ thêm nguy cơ 429)
+const WORLD_PROBE_GAP_MS = 1200;       // quét world: nghỉ giữa 2 lần dò place (endpoint servers/Public bị Roblox giới hạn rất gắt)
 const WORLD_PROBE_BUDGET_MS = 30000;   // quét world: dò tuần tự, quá chừng này thì dừng (world còn lại hiện "chưa dò", bấm R để dò tiếp)
 const API_MIN_GAP_MS = 700;            // mọi request tới cùng 1 host Roblox đi tuần tự và cách nhau tối thiểu chừng này (chống 429 khi nhiều máy/tài khoản chung IP)
 const LOWPOP_STALE_MS = 180000;        // bị 429 mà không lấy được danh sách server mới thì dùng lại danh sách cũ (tối đa chừng này) thay vì join thường
@@ -232,6 +236,272 @@ try {
 } catch (e) {
   screenshot = null;
 }
+
+// ---- proxy:begin ----
+/**
+ * PROXY cho các request CÔNG KHAI tới API Roblox (dò server / world / universe) khi bị 429.
+ * Chỉ request không cookie đi qua đây (Utils._get); cookie, đăng nhập và mở game luôn dùng IP máy.
+ *
+ * Nguồn proxy (HTTP / HTTPS-CONNECT, không hỗ trợ SOCKS):
+ *   - file  ~/.roblox-rejoin/proxies.txt  (mỗi dòng 1 proxy; dòng `free` = bật proxy miễn phí tự lấy)
+ *   - biến môi trường ROBLOX_PROXY="host:port,host:port,..."   ROBLOX_FREE_PROXY=1
+ * Định dạng 1 proxy: host:port | host:port:user:pass | user:pass@host:port | http://user:pass@host:port
+ *
+ * Request vẫn là HTTPS đầu-cuối qua đường hầm CONNECT (kiểm tra chứng chỉ như bình thường) nên proxy
+ * không đọc / sửa được nội dung. Proxy dính 429 / lỗi thì tạm nghỉ rồi đổi proxy khác; hết proxy thì dùng IP máy.
+ */
+const PROXY_LIST_PATH = cfgPath("proxies.txt");
+const PROXY_FREE_URL = "https://free-proxy-list.net/en/anonymous-proxy.html";
+const PROXY_PROBE_URL = "https://games.roblox.com/v1/games?universeIds=1"; // chỉ cần Roblox trả JSON (không cần dữ liệu thật)
+const PROXY_CONNECT_TIMEOUT_MS = 8000;
+const PROXY_PROBE_TIMEOUT_MS = 8000;
+const PROXY_PROBE_CONCURRENCY = 8;
+const PROXY_FREE_CANDIDATES = 40;        // tối đa N proxy miễn phí được thử mỗi lần làm mới
+const PROXY_FREE_KEEP = 8;               // giữ tối đa N proxy dùng được
+const PROXY_FREE_MIN_ALIVE = 2;          // còn ít hơn N proxy miễn phí sống thì lấy lại danh sách
+const PROXY_FREE_REFRESH_MS = 5 * 60 * 1000; // không lấy lại danh sách thường xuyên hơn chừng này
+const PROXY_COOLDOWN_429_MS = 90 * 1000; // proxy bị Roblox giới hạn tốc độ: nghỉ chừng này
+const PROXY_COOLDOWN_FREE_BAD_MS = 10 * 60 * 1000; // proxy miễn phí lỗi: nghỉ lâu (hay chết)
+const PROXY_COOLDOWN_FILE_BAD_MS = 2 * 60 * 1000;  // proxy của người dùng lỗi: nghỉ ngắn
+const PROXY_MAX_SWITCH = 4;              // mỗi request đổi proxy tối đa N lần rồi mới dùng IP máy
+
+/** Đường hầm HTTPS qua proxy HTTP: CONNECT host:port rồi bọc TLS (có kiểm tra chứng chỉ). Không cần package ngoài. */
+class ProxyTunnelAgent extends https.Agent {
+  constructor(proxy, tlsOptions = {}) {
+    super({ keepAlive: false });
+    this.proxy = proxy;
+    this.tlsOptions = tlsOptions;
+  }
+
+  createConnection(options, callback) {
+    const targetHost = options.hostname || options.host;
+    const targetPort = options.port || 443;
+    const headers = { Host: `${targetHost}:${targetPort}` };
+    if (this.proxy.auth) headers["Proxy-Authorization"] = `Basic ${Buffer.from(this.proxy.auth).toString("base64")}`;
+
+    let finished = false;
+    const done = (err, sock) => {
+      if (finished) return;
+      finished = true;
+      callback(err, sock);
+    };
+
+    const req = http.request({
+      host: this.proxy.host,
+      port: this.proxy.port,
+      method: "CONNECT",
+      path: `${targetHost}:${targetPort}`,
+      headers,
+      timeout: PROXY_CONNECT_TIMEOUT_MS
+    });
+    req.once("connect", (res, socket) => {
+      if (res.statusCode !== 200) {
+        socket.destroy();
+        const err = new Error(`proxy CONNECT ${res.statusCode}`);
+        err.code = "EPROXY";
+        err.proxyStatus = res.statusCode;
+        return done(err);
+      }
+      const secure = tls.connect({ ...this.tlsOptions, socket, servername: options.servername || targetHost });
+      secure.setTimeout(PROXY_CONNECT_TIMEOUT_MS, () => secure.destroy(new Error("proxy TLS timeout")));
+      secure.once("secureConnect", () => { secure.setTimeout(0); done(null, secure); });
+      secure.once("error", (e) => done(e));
+    });
+    req.once("timeout", () => req.destroy(new Error("proxy connect timeout")));
+    req.once("error", (e) => done(e));
+    req.end();
+  }
+}
+
+class ProxyPool {
+  static list = [];          // { host, port, auth, key, source: "file"|"free", coolUntil, fails, agent }
+  static loaded = false;
+  static freeOn = false;
+  static freeAt = 0;
+  static freeInflight = null;
+  static cursor = 0;
+
+  /** Hiểu 1 dòng proxy. Trả về null nếu sai định dạng / SOCKS. */
+  static parse(raw, source = "file") {
+    let s = String(raw || "").trim();
+    let scheme = "";
+    s = s.replace(/^[a-z][a-z0-9+.-]*:\/\//i, (m) => { scheme = m; return ""; });
+    if (/^socks/i.test(scheme) || !s) return null;
+    let auth = null;
+    let hostPort = s;
+    const at = s.lastIndexOf("@");
+    if (at >= 0) {
+      auth = s.slice(0, at);
+      hostPort = s.slice(at + 1);
+    }
+    hostPort = hostPort.replace(/\/+$/, "");
+    const parts = hostPort.split(":");
+    let host;
+    let port;
+    if (parts.length === 2) {
+      [host, port] = parts;
+    } else if (parts.length >= 4 && at < 0) {
+      host = parts[0];
+      port = parts[1];
+      auth = `${parts[2]}:${parts.slice(3).join(":")}`;
+    } else {
+      return null;
+    }
+    port = Number(port);
+    if (!host || /\s/.test(host) || !Number.isInteger(port) || port < 1 || port > 65535) return null;
+    const px = { host, port, auth, key: `${host}:${port}`, source, coolUntil: 0, fails: 0, agent: null };
+    px.agent = new ProxyTunnelAgent(px);
+    return px;
+  }
+
+  /** Đọc proxies.txt + biến môi trường (1 lần). */
+  static load() {
+    if (ProxyPool.loaded) return;
+    ProxyPool.loaded = true;
+    const lines = [];
+    try { lines.push(...fs.readFileSync(PROXY_LIST_PATH, "utf8").split(/\r?\n/)); } catch (_) { }
+    if (process.env.ROBLOX_PROXY) lines.push(...process.env.ROBLOX_PROXY.split(/[\s,;]+/));
+    if (/^(1|true|yes|on)$/i.test(String(process.env.ROBLOX_FREE_PROXY || ""))) ProxyPool.freeOn = true;
+    const seen = new Set();
+    for (let raw of lines) {
+      raw = String(raw).split(/\s+#/)[0].trim();
+      if (!raw || raw.startsWith("#")) continue;
+      if (/^free$/i.test(raw)) { ProxyPool.freeOn = true; continue; }
+      const px = ProxyPool.parse(raw, "file");
+      if (!px || seen.has(px.key)) continue;
+      seen.add(px.key);
+      ProxyPool.list.push(px);
+    }
+  }
+
+  /** Bảng proxy miễn phí: HTML free-proxy-list.net -> ["ip:port", ...] (chỉ proxy hỗ trợ HTTPS, bỏ cổng 80), xáo trộn. */
+  static parseFreeHtml(html) {
+    const out = [];
+    const rowRe = /<tr>([\s\S]*?)<\/tr>/g;
+    let row;
+    while ((row = rowRe.exec(String(html || ""))) !== null) {
+      const cells = [];
+      const tdRe = /<td[^>]*>([\s\S]*?)<\/td>/g;
+      let td;
+      while ((td = tdRe.exec(row[1])) !== null) cells.push(td[1].replace(/<[^>]*>/g, "").trim());
+      // Cột: IP | Port | Code | Country | Anonymity | Google | Https | Last checked
+      if (cells.length >= 7 && cells[6].toLowerCase() === "yes" &&
+        /^\d{1,3}(\.\d{1,3}){3}$/.test(cells[0]) && /^\d+$/.test(cells[1]) && cells[1] !== "80") {
+        out.push(`${cells[0]}:${cells[1]}`);
+      }
+    }
+    const unique = [...new Set(out)];
+    for (let i = unique.length - 1; i > 0; i--) {
+      const j = Math.floor(Math.random() * (i + 1));
+      [unique[i], unique[j]] = [unique[j], unique[i]];
+    }
+    return unique;
+  }
+
+  /** Thử thật 1 proxy: đi qua nó tới Roblox, phải nhận JSON (không phải trang chặn 403 / lỗi proxy). */
+  static async probe(px) {
+    try {
+      const res = await axios.get(PROXY_PROBE_URL, {
+        headers: { "User-Agent": USER_AGENT, Accept: "application/json" },
+        timeout: PROXY_PROBE_TIMEOUT_MS,
+        httpsAgent: px.agent,
+        proxy: false,
+        validateStatus: () => true
+      });
+      const s = res.status;
+      return s < 500 && ![403, 407, 429].includes(s) && Boolean(res.data) && typeof res.data === "object";
+    } catch (_) {
+      return false;
+    }
+  }
+
+  /** Lấy danh sách proxy miễn phí, thử thật từng cái, giữ lại các cái dùng được. Không bao giờ ném lỗi. */
+  static async refreshFree(onStatus = () => { }) {
+    let candidates = [];
+    try {
+      onStatus("Đang lấy danh sách proxy miễn phí...");
+      const res = await axios.get(PROXY_FREE_URL, {
+        headers: {
+          "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/125.0.0.0 Safari/537.36",
+          Accept: "text/html"
+        },
+        timeout: 12000,
+        proxy: false
+      });
+      candidates = ProxyPool.parseFreeHtml(res.data).slice(0, PROXY_FREE_CANDIDATES);
+    } catch (_) { }
+    if (!candidates.length) return 0;
+
+    const picked = [];
+    let next = 0;
+    let tested = 0;
+    const worker = async () => {
+      while (picked.length < PROXY_FREE_KEEP && next < candidates.length) {
+        const px = ProxyPool.parse(candidates[next++], "free");
+        const ok = px ? await ProxyPool.probe(px) : false;
+        tested++;
+        if (ok && picked.length < PROXY_FREE_KEEP) picked.push(px);
+        onStatus(`Đang thử proxy miễn phí ${tested}/${candidates.length} (dùng được ${picked.length})...`);
+      }
+    };
+    await Promise.all(Array.from({ length: PROXY_PROBE_CONCURRENCY }, worker));
+    ProxyPool.list = ProxyPool.list.filter((p) => p.source !== "free").concat(picked);
+    return picked.length;
+  }
+
+  /** Gọi trước khi gửi request: nạp cấu hình, và (nếu bật `free`) làm mới proxy miễn phí khi sắp hết. */
+  static async ensure(onStatus = () => { }) {
+    ProxyPool.load();
+    if (!ProxyPool.freeOn) return;
+    const now = Date.now();
+    const alive = ProxyPool.list.filter((p) => p.source === "free" && p.coolUntil <= now).length;
+    if (alive >= PROXY_FREE_MIN_ALIVE || now - ProxyPool.freeAt < PROXY_FREE_REFRESH_MS) return;
+    if (!ProxyPool.freeInflight) {
+      ProxyPool.freeAt = now;
+      ProxyPool.freeInflight = ProxyPool.refreshFree(onStatus)
+        .catch(() => { })
+        .finally(() => { ProxyPool.freeInflight = null; ProxyPool.freeAt = Date.now(); });
+    }
+    await ProxyPool.freeInflight;
+  }
+
+  /** Proxy kế tiếp đang rảnh (xoay vòng), hoặc null = dùng IP máy. */
+  static pick() {
+    const now = Date.now();
+    const ok = ProxyPool.list.filter((p) => p.coolUntil <= now);
+    if (!ok.length) return null;
+    return ok[ProxyPool.cursor++ % ok.length];
+  }
+
+  static rest(px, ms) {
+    px.coolUntil = Date.now() + ms;
+    px.fails++;
+  }
+
+  /** Lỗi do proxy (không phải do Roblox): mất kết nối, hết giờ, CONNECT bị từ chối, bị chặn 403/407/5xx. */
+  static isProxyFailure(e) {
+    const status = e && e.response && e.response.status;
+    if (!status) return true;
+    return status === 403 || status === 407 || status >= 500;
+  }
+
+  static restBad(px) {
+    ProxyPool.rest(px, px.source === "free" ? PROXY_COOLDOWN_FREE_BAD_MS : PROXY_COOLDOWN_FILE_BAD_MS);
+  }
+
+  /** Tóm tắt để báo người dùng; null nếu không dùng proxy. */
+  static summary() {
+    ProxyPool.load();
+    if (!ProxyPool.list.length && !ProxyPool.freeOn) return null;
+    const now = Date.now();
+    return {
+      total: ProxyPool.list.length,
+      usable: ProxyPool.list.filter((p) => p.coolUntil <= now).length,
+      free: ProxyPool.freeOn
+    };
+  }
+}
+// ---- proxy:end ----
 
 class Utils {
   /** Ghi JSON theo kiểu atomic để tránh hỏng config khi app bị dừng giữa lúc ghi. */
@@ -359,20 +629,22 @@ class Utils {
   // Roblox; bắn request song song hoặc thử lại dồn dập chỉ làm 429 nặng thêm.
   static _gates = new Map();
 
-  static _gate(url) {
+  // Mỗi (host, proxy) có cổng riêng: proxy A bị 429 không làm proxy B / IP máy phải chờ theo.
+  static _gate(url, px = null) {
     let host = "";
     try { host = new URL(url).host; } catch (_) { }
-    let g = Utils._gates.get(host);
+    const key = px ? `${host}|${px.key}` : host;
+    let g = Utils._gates.get(key);
     if (!g) {
       g = { tail: Promise.resolve(), nextAt: 0 };
-      Utils._gates.set(host, g);
+      Utils._gates.set(key, g);
     }
     return g;
   }
 
   /** Chờ tới lượt gửi request tới host của url (xếp hàng + giãn cách). */
-  static _throttle(url) {
-    const g = Utils._gate(url);
+  static _throttle(url, px = null) {
+    const g = Utils._gate(url, px);
     const turn = g.tail.then(async () => {
       const wait = g.nextAt - Date.now();
       if (wait > 0) await sleep(wait);
@@ -383,14 +655,18 @@ class Utils {
   }
 
   /** Host vừa báo 429: mọi request kế tiếp tới host đó phải chờ thêm `ms`. */
-  static _backoff(url, ms) {
-    const g = Utils._gate(url);
+  static _backoff(url, ms, px = null) {
+    const g = Utils._gate(url, px);
     g.nextAt = Math.max(g.nextAt, Date.now() + ms);
   }
 
   /** Còn bao lâu nữa host của url mới nhận request (0 nếu rảnh). Dùng để việc không gấp (giám sát) khỏi xếp hàng sau đợt 429. */
   static _waitMs(url) {
-    return Math.max(0, Utils._gate(url).nextAt - Date.now());
+    const now = Date.now();
+    ProxyPool.load();
+    const usable = ProxyPool.list.filter((p) => p.coolUntil <= now);
+    if (usable.length) return Math.max(0, Math.min(...usable.map((p) => Utils._gate(url, p).nextAt - now)));
+    return Math.max(0, Utils._gate(url).nextAt - now);
   }
 
   /**
@@ -399,19 +675,28 @@ class Utils {
    * các lỗi khác ném ra ngay.
    */
   static async _get(url, params = {}, { timeout = HTTP_TIMEOUT, retries = 0 } = {}) {
+    await ProxyPool.ensure();
+    let switched = 0; // số lần đã đổi proxy cho request này
     for (let attempt = 0; ; attempt++) {
-      await Utils._throttle(url);
+      const px = switched < PROXY_MAX_SWITCH ? ProxyPool.pick() : null; // null = IP máy
+      await Utils._throttle(url, px);
       try {
         return await axios.get(url, {
           params,
           headers: { "User-Agent": USER_AGENT, Accept: "application/json" },
-          timeout
+          timeout,
+          ...(px ? { httpsAgent: px.agent, proxy: false } : {})
         });
       } catch (e) {
         const status = e && e.response && e.response.status;
+        if (px) {
+          // Proxy dính 429 / hỏng: cho nghỉ rồi thử NGAY proxy khác (không tính vào `retries`, không bắt cả hàng đợi chờ).
+          if (status === 429) { ProxyPool.rest(px, PROXY_COOLDOWN_429_MS); switched++; attempt--; continue; }
+          if (ProxyPool.isProxyFailure(e)) { ProxyPool.restBad(px); switched++; attempt--; continue; }
+        }
         if (status !== 429) throw e;
         const retryAfter = Number(e.response.headers && e.response.headers["retry-after"]);
-        Utils._backoff(url, clamp(retryAfter > 0 ? retryAfter * 1000 : 2000 * 2 ** attempt, 1000, 15000));
+        Utils._backoff(url, clamp(retryAfter > 0 ? retryAfter * 1000 : 2000 * 2 ** attempt, 1000, 15000), px);
         if (attempt >= retries) throw e;
       }
     }
@@ -561,7 +846,7 @@ class Utils {
       const res = await Utils._get(
         `https://games.roblox.com/v1/games/${w.placeId}/servers/Public`,
         { sortOrder: "Asc", excludeFullGames: true, limit: WORLD_PROBE_LIMIT },
-        { timeout: 10000, retries: 2 }
+        { timeout: 10000, retries: 1 }
       );
       const list = ((res.data && res.data.data) || []).filter((sv) =>
         sv && sv.id && Number(sv.playing) < Number(sv.maxPlayers || Infinity)
@@ -574,6 +859,7 @@ class Utils {
     } catch (e) {
       w.status = "error";
       w.error = Utils._httpError(e);
+      w.rateLimited = Boolean(e && e.response && e.response.status === 429);
     }
   }
 
@@ -623,7 +909,7 @@ class Utils {
       if (cursor) params.cursor = cursor;
       let res;
       try {
-        res = await Utils._get(`https://develop.roblox.com/v1/universes/${universeId}/places`, params, { retries: 2 });
+        res = await Utils._get(`https://develop.roblox.com/v1/universes/${universeId}/places`, params, { retries: 3 });
       } catch (e) {
         if (page === 0) throw new Error(`Không lấy được danh sách world (${Utils._httpError(e)})`);
         break; // các trang sau lỗi: dùng phần đã có, cursor còn lại -> truncated
@@ -648,16 +934,23 @@ class Utils {
     // Dò server: ưu tiên world gốc và world đã chọn, rồi lần lượt các world còn lại (tối đa WORLD_PROBE_MAX).
     const order = [...new Set([rootPlaceId, chosen, ...worlds.map((w) => w.placeId)].filter(Boolean))]
       .map((id) => byId.get(id)).filter(Boolean).slice(0, WORLD_PROBE_MAX);
+    let rateLimited = false;
     if (probe && order.length) {
       let next = 0;
       let done = 0;
+      let stop = false;
+      const startedAt = Date.now();
       onProgress({ done, total: order.length });
       const worker = async () => {
-        while (next < order.length) {
+        while (!stop && next < order.length) {
+          // Hết ngân sách thời gian: các world còn lại giữ trạng thái "chưa dò".
+          if (Date.now() - startedAt > WORLD_PROBE_BUDGET_MS) { stop = true; break; }
           const w = order[next++];
           await Utils._probeWorld(w);
+          // Dính 429 thì dừng hẳn: dò tiếp chỉ kéo dài thời gian bị Roblox chặn.
+          if (w.rateLimited) { rateLimited = true; stop = true; }
           onProgress({ done: ++done, total: order.length });
-          await sleep(200);
+          if (!stop) await sleep(WORLD_PROBE_GAP_MS);
         }
       };
       await Promise.all(Array.from({ length: Math.min(WORLD_PROBE_CONCURRENCY, order.length) }, worker));
@@ -669,7 +962,7 @@ class Utils {
       a.name.localeCompare(b.name) ||
       (BigInt(a.placeId) < BigInt(b.placeId) ? -1 : 1)
     );
-    return { universeId, gameName, rootPlaceId, worlds, truncated, probed: probe ? order.length : 0 };
+    return { universeId, gameName, rootPlaceId, worlds, truncated, rateLimited, probed: probe ? order.filter((w) => w.status !== "skipped").length : 0 };
   }
 
   /**
@@ -1578,6 +1871,8 @@ class GameSelector {
     const spin = UIRenderer.spinner("Đang quét các world của game...");
     let scan;
     try {
+      await ProxyPool.ensure((text) => spin.update(text)); // bật `free` trong proxies.txt: lấy + thử proxy ở bước này
+      spin.update("Đang quét các world của game...");
       scan = await Utils.scanWorlds(placeId, {
         onProgress: ({ done, total }) => spin.update(`Đang dò server từng world ${done}/${total}...`)
       });
@@ -1588,8 +1883,25 @@ class GameSelector {
     }
     spin.stop();
 
+    const proxyInfo = ProxyPool.summary();
+    if (proxyInfo) {
+      console.log(UIRenderer.message(
+        "info",
+        `Dò server qua proxy: ${proxyInfo.usable}/${proxyInfo.total} đang dùng được${proxyInfo.free ? " (kèm proxy miễn phí)" : ""}. ` +
+        "Chỉ request công khai đi qua proxy, cookie và mở game vẫn dùng IP máy."
+      ));
+    }
+
     const worlds = scan.worlds;
     const multi = worlds.length > 1;
+    if (scan.rateLimited) {
+      const left = worlds.filter((w) => w.status === "skipped").length;
+      console.log(UIRenderer.message(
+        "warning",
+        `Roblox đang giới hạn tốc độ (429) nên đã dừng dò server${left ? `, ${left} world chưa dò` : ""}. ` +
+        "Vẫn chọn world được bình thường; muốn có số liệu đầy đủ thì đợi khoảng 1-2 phút rồi cấu hình lại."
+      ));
+    }
     const gameName = scan.gameName || (game.name && game.name !== "Tùy chỉnh" ? game.name : `Game ${placeId}`);
     const make = (w) => ({
       ...game,
