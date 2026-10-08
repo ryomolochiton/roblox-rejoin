@@ -205,6 +205,8 @@ const SERVER_SCAN_PAGES = 10;          // tra số người: quét tối đa N t
 const SERVER_MISS_RETRY_MS = 300000;   // đã quét mà không thấy server này thì 5 phút sau mới quét lại
 const LAUNCH_STAGGER_MS = 2000;        // giãn cách khi mở nhiều instance cùng lúc cho đỡ nặng máy
 const COOKIE_REFRESH_MS = 3 * 60 * 1000;
+const AUTO_REJOIN_MIN_MINUTES = 1;      // chu kỳ auto rejoin nhỏ nhất (0 = tắt)
+const AUTO_REJOIN_MAX_MINUTES = 1440;   // tối đa 24 giờ
 const UNIVERSE_RETRY_MS = 20000;       // tra universe của place bị lỗi thì 20s sau mới tra lại (thành công thì nhớ vĩnh viễn)
 const UNIVERSE_HOLD_CHECKS = 3;        // chưa tra được universe: tối đa N lần kiểm tra liên tiếp KHÔNG kết luận "Sai map" (tránh đá user khỏi world phụ)
 const RECENT_GAMES_LIMIT = 5;           // số game "tài khoản hay chơi" hiển thị khi chọn game (trước đây là 10)
@@ -3564,7 +3566,10 @@ class UIRenderer {
       const dot = this._dot(instance.status, frame);
 
       const players = this._playersLabel(instance);
-      const meta = `↻${instance.rejoinCount || 0}${players ? ` · ${players}` : ""} · ${this.formatCountdown(instance.countdownSeconds)}`;
+      const auto = Number(instance.config && instance.config.autoRejoinMinutes) > 0
+        ? ` · auto ${this.formatCountdown(instance.autoRejoinCountdownSeconds)}`
+        : "";
+      const meta = `↻${instance.rejoinCount || 0}${players ? ` · ${players}` : ""} · quét ${this.formatCountdown(instance.countdownSeconds)}${auto}`;
       const left = Math.max(6, inner - this._len(meta) - 1);
       const pkgW = clamp(Math.floor(left * 0.45), 4, 14);
       const userW = left - 2 - pkgW - 1;
@@ -3633,7 +3638,10 @@ class UIRenderer {
           const label = this._playersLabel(instance);
           return label === "?" ? this.color("warn", "?") : label ? this.color("accent", label) : this.color("dim", "-");
         })(),
-        this.color("violet", this.formatCountdown(instance.countdownSeconds))
+        this.color("violet", this.formatCountdown(instance.countdownSeconds)),
+        Number(instance.config && instance.config.autoRejoinMinutes) > 0
+          ? this.color("good", this.formatCountdown(instance.autoRejoinCountdownSeconds))
+          : this.color("dim", "Tắt")
       ];
     });
 
@@ -3641,9 +3649,9 @@ class UIRenderer {
       summary +
       "\n" +
       this._table(
-        ["PACKAGE", "USER", "TRẠNG THÁI", "THÔNG TIN", "CẬP NHẬT", "NGƯỜI", "QUÉT SAU"],
+        ["PACKAGE", "USER", "TRẠNG THÁI", "THÔNG TIN", "CẬP NHẬT", "NGƯỜI", "QUÉT SAU", "AUTO SAU"],
         rows,
-        [0.16, 0.11, 0.17, 0.23, 0.12, 0.10, 0.11],
+        [0.14, 0.10, 0.16, 0.21, 0.11, 0.08, 0.10, 0.10],
         width
       )
     );
@@ -3668,6 +3676,7 @@ class UIRenderer {
               ["Game", c.gameName || "Chưa đặt", "violet"],
               ["Place ID", c.placeId || "-", "dim"],
               ["Nhịp quét", c.delaySec ? `${c.delaySec} giây` : "Chưa đặt"],
+              ["Auto rejoin", Number(c.autoRejoinMinutes) > 0 ? `Mỗi ${c.autoRejoinMinutes} phút` : "TẮT", Number(c.autoRejoinMinutes) > 0 ? "good" : "dim"],
               ["Server VIP", c.linkCode ? "ĐÃ CẤU HÌNH" : "KHÔNG", c.linkCode ? "good" : "dim"],
               ["Kiểu join", JOIN_LABELS[joinModeOf(c)], JOIN_TONES[joinModeOf(c)]]
             ],
@@ -3685,14 +3694,15 @@ class UIRenderer {
         Utils.maskSensitiveInfo(c.username || "Unknown"),
         `${c.gameName || "Chưa đặt"}  (${c.placeId || "-"})`,
         c.delaySec ? `${c.delaySec}s` : "-",
+        Number(c.autoRejoinMinutes) > 0 ? `${c.autoRejoinMinutes}m` : "Tắt",
         this.color(JOIN_TONES[joinModeOf(c)], JOIN_SHORT[joinModeOf(c)])
       ];
     });
 
     return this._table(
-      ["#", "PACKAGE", "TÀI KHOẢN", "GAME / PLACE ID", "NHỊP QUÉT", "JOIN"],
+      ["#", "PACKAGE", "TÀI KHOẢN", "GAME / PLACE ID", "NHỊP QUÉT", "AUTO", "JOIN"],
       rows,
-      [0.05, 0.23, 0.17, 0.35, 0.10, 0.10],
+      [0.04, 0.20, 0.14, 0.32, 0.09, 0.09, 0.12],
       width
     );
   }
@@ -4076,6 +4086,17 @@ class MultiRejoinTool {
         console.log(UIRenderer.message("error", "Giá trị phải nằm trong khoảng 15-120 giây."));
       }
 
+      let autoRejoinMinutes;
+      while (true) {
+        const raw = (await Utils.ask(rl, UIRenderer.prompt(`Auto rejoin mỗi x phút [${AUTO_REJOIN_MIN_MINUTES}-${AUTO_REJOIN_MAX_MINUTES}, 0 = tắt]`))).trim();
+        const value = Number(raw || 0);
+        if (Number.isInteger(value) && (value === 0 || (value >= AUTO_REJOIN_MIN_MINUTES && value <= AUTO_REJOIN_MAX_MINUTES))) {
+          autoRejoinMinutes = value;
+          break;
+        }
+        console.log(UIRenderer.message("error", `Nhập 0 để tắt hoặc số phút từ ${AUTO_REJOIN_MIN_MINUTES}-${AUTO_REJOIN_MAX_MINUTES}.`));
+      }
+
       configs[packageName] = {
         username: user.username,
         userId,
@@ -4084,6 +4105,7 @@ class MultiRejoinTool {
         linkCode: game.linkCode,
         joinMode: game.joinMode,
         delaySec,
+        autoRejoinMinutes,
         packageName
       };
       configuredCount++;
@@ -4093,6 +4115,7 @@ class MultiRejoinTool {
         ["Game", game.name, "1;36"],
         ["Kiểu join", JOIN_LABELS[joinModeOf(game)], game.linkCode ? "1;32" : game.joinMode === "normal" ? "2;37" : "1;35"],
         ["Nhịp quét", `${delaySec} giây`],
+        ["Auto rejoin", autoRejoinMinutes > 0 ? `Mỗi ${autoRejoinMinutes} phút` : "TẮT", autoRejoinMinutes > 0 ? "1;32" : "2;37"],
         ["Kết quả", "ĐÃ CẤU HÌNH", "1;32"]
       ], "HOÀN TẤT TÀI KHOẢN"));
     }
@@ -4465,6 +4488,11 @@ class MultiRejoinTool {
         countdown: "00s",
         lastCheck: 0,
         presenceType: "Unknown",
+        // Auto rejoin theo chu kỳ bắt đầu tính từ lúc bật giám sát. 0/null = tắt.
+        lastAutoRejoinAt: Date.now(),
+        autoRejoinCountdownSeconds: Number(config.autoRejoinMinutes) > 0
+          ? Number(config.autoRejoinMinutes) * 60
+          : null,
         // Chỉ để bảng giám sát hiển thị số lần rejoin
         rejoinCount: 0
       });
@@ -4618,6 +4646,16 @@ class MultiRejoinTool {
     for (const instance of this.instances) {
       const delayMs = Math.max(15, Number(instance.config.delaySec) || 30) * 1000;
       instance.countdownSeconds = Math.ceil(Math.max(0, delayMs - (now - instance.lastCheck)) / 1000);
+
+      const autoMinutes = Number(instance.config.autoRejoinMinutes) || 0;
+      if (autoMinutes > 0) {
+        const autoMs = autoMinutes * 60 * 1000;
+        instance.autoRejoinCountdownSeconds = Math.ceil(
+          Math.max(0, autoMs - (now - (instance.lastAutoRejoinAt || this.startTime || now))) / 1000
+        );
+      } else {
+        instance.autoRejoinCountdownSeconds = null;
+      }
     }
   }
 
@@ -4628,8 +4666,11 @@ class MultiRejoinTool {
     for (const instance of this.instances) {
       const delayMs = Math.max(15, Number(instance.config.delaySec) || 30) * 1000;
       const since = now - instance.lastCheck;
+      const autoMinutes = Number(instance.config.autoRejoinMinutes) || 0;
+      const autoDue = autoMinutes > 0 &&
+        now - (instance.lastAutoRejoinAt || this.startTime || now) >= autoMinutes * 60 * 1000;
       instance.countdownSeconds = Math.ceil(Math.max(0, delayMs - since) / 1000);
-      if (since >= delayMs && !instance.checking) due.push(instance);
+      if ((since >= delayMs || autoDue) && !instance.checking) due.push(instance);
     }
     if (!due.length) return;
 
@@ -4657,6 +4698,14 @@ class MultiRejoinTool {
       const label = Utils.packageLabel(instance.packageName);
       const analysis = statusHandler.evaluate(check, config.placeId, Date.now(), universeId);
       const previous = String(instance.status || "").trim();
+      const autoMinutes = Number(config.autoRejoinMinutes) || 0;
+      const autoDue = autoMinutes > 0 &&
+        Date.now() - (instance.lastAutoRejoinAt || this.startTime || Date.now()) >= autoMinutes * 60 * 1000;
+      if (autoDue) {
+        analysis.shouldLaunch = true;
+        analysis.status = "Đang vào game";
+        analysis.info = `Auto rejoin định kỳ mỗi ${autoMinutes} phút`;
+      }
 
       instance.lastCheck = Date.now();
       instance.status = analysis.status;
@@ -4675,12 +4724,22 @@ class MultiRejoinTool {
 
       if (analysis.shouldLaunch) {
         if (launched++ > 0) await sleep(LAUNCH_STAGGER_MS);
+        // Reset chu kỳ ngay khi bắt đầu thử auto rejoin để lỗi `am start` không gây retry mỗi giây.
+        if (autoDue) {
+          instance.lastAutoRejoinAt = Date.now();
+          instance.autoRejoinCountdownSeconds = autoMinutes * 60;
+        }
         const result = await GameLauncher.handleGameLaunch(
           true, config.placeId, config.linkCode, config.packageName, true, joinModeOf(config)
         );
         if (result.ok) {
           statusHandler.updateJoinStatus(true);
           instance.rejoinCount = (instance.rejoinCount || 0) + 1;
+          // Mọi lần mở game thành công đều bắt đầu lại chu kỳ auto rejoin.
+          if (autoMinutes > 0) {
+            instance.lastAutoRejoinAt = Date.now();
+            instance.autoRejoinCountdownSeconds = autoMinutes * 60;
+          }
           instance.server = result.lowpop
             ? { jobId: result.lowpop.jobId, playing: result.lowpop.playing, maxPlayers: result.lowpop.maxPlayers }
             : null;
@@ -5155,20 +5214,22 @@ class ConfigEditor {
             ["Tài khoản", Utils.maskSensitiveInfo(config.username)],
             ["User ID", Utils.maskSensitiveInfo(config.userId)],
             ["Game", `${config.gameName || "Unknown"} (${config.placeId || "Unknown"})`],
-            ["Nhịp quét", `${config.delaySec || "Unknown"} giây`],
-            ["Server VIP", config.linkCode ? "ĐÃ CẤU HÌNH" : "KHÔNG", config.linkCode ? "1;32" : "2;37"],
+             ["Nhịp quét", `${config.delaySec || "Unknown"} giây`],
+             ["Auto rejoin", Number(config.autoRejoinMinutes) > 0 ? `Mỗi ${config.autoRejoinMinutes} phút` : "TẮT", Number(config.autoRejoinMinutes) > 0 ? "1;32" : "2;37"],
+             ["Server VIP", config.linkCode ? "ĐÃ CẤU HÌNH" : "KHÔNG", config.linkCode ? "1;32" : "2;37"],
             ["Kiểu join", JOIN_LABELS[joinModeOf(config)], config.linkCode ? "1;32" : joinModeOf(config) === "normal" ? "2;37" : "1;35"]
           ], "CHI TIẾT CẤU HÌNH"));
           console.log(UIRenderer.options([
             { key: "1", label: "Thay đổi game", description: "Chọn game hoặc Place ID mới, rồi chọn kiểu join" },
             { key: "2", label: "Đổi kiểu join", description: "Join thường hoặc join theo ID (server ít người nhất)" },
-            { key: "3", label: "Thay đổi nhịp quét", description: "Khoảng 15-120 giây" },
-            { key: "4", label: "Thay đổi server VIP", description: "Cập nhật link private server", color: "1;35" },
-            { key: "5", label: "Xóa cấu hình", description: "Loại tài khoản này khỏi danh sách", color: "1;31" },
-            { key: "6", label: "Giữ nguyên", description: "Bỏ qua cấu hình này", color: "1;33" }
-          ]));
+             { key: "3", label: "Thay đổi nhịp quét", description: "Khoảng 15-120 giây" },
+             { key: "4", label: "Đổi chu kỳ auto rejoin", description: `Mỗi x phút (${AUTO_REJOIN_MIN_MINUTES}-${AUTO_REJOIN_MAX_MINUTES}), hoặc tắt`, color: "1;32" },
+             { key: "5", label: "Thay đổi server VIP", description: "Cập nhật link private server", color: "1;35" },
+             { key: "6", label: "Xóa cấu hình", description: "Loại tài khoản này khỏi danh sách", color: "1;31" },
+             { key: "7", label: "Giữ nguyên", description: "Bỏ qua cấu hình này", color: "1;33" }
+           ]));
 
-          const editChoice = await Utils.ask(rl, UIRenderer.prompt("Lựa chọn [1-6]"));
+           const editChoice = await Utils.ask(rl, UIRenderer.prompt("Lựa chọn [1-7]"));
 
           try {
             switch (editChoice.trim()) {
@@ -5233,7 +5294,27 @@ class ConfigEditor {
                 break;
               }
 
-              case "4":
+              case "4": {
+                let minutes;
+                while (true) {
+                  const input = (await Utils.ask(rl, UIRenderer.prompt(`Auto rejoin [${AUTO_REJOIN_MIN_MINUTES}-${AUTO_REJOIN_MAX_MINUTES} phút, 0 = tắt]`))).trim();
+                  const value = Number(input || 0);
+                  if (Number.isInteger(value) && (value === 0 || (value >= AUTO_REJOIN_MIN_MINUTES && value <= AUTO_REJOIN_MAX_MINUTES))) {
+                    minutes = value;
+                    break;
+                  }
+                  console.log(UIRenderer.message("error", `Nhập 0 để tắt hoặc số phút từ ${AUTO_REJOIN_MIN_MINUTES}-${AUTO_REJOIN_MAX_MINUTES}.`));
+                }
+                config.autoRejoinMinutes = minutes;
+                console.log(UIRenderer.infoCard([
+                  ["Package", packageDisplay],
+                  ["Auto rejoin", minutes > 0 ? `Mỗi ${minutes} phút` : "TẮT", minutes > 0 ? "1;32" : "2;37"],
+                  ["Kết quả", "ĐÃ CẬP NHẬT", "1;32"]
+                ], "CẬP NHẬT AUTO REJOIN"));
+                break;
+              }
+
+              case "5":
                 console.log(UIRenderer.infoCard([
                   ["Đã chuyển", "roblox.com/games/ID/Tên?privateServerLinkCode=..."],
                   ["Chưa chuyển", "roblox.com/share?code=...&type=Server"],
@@ -5275,7 +5356,7 @@ class ConfigEditor {
                 }
                 break;
 
-              case "5": {
+              case "6": {
                 console.log(UIRenderer.message("warning", `Bạn sắp xóa cấu hình của ${packageDisplay}.`));
                 const confirmDelete = (await Utils.ask(rl, UIRenderer.prompt("Xác nhận xóa? [y/N]"))).trim().toLowerCase();
                 if (confirmDelete === "y" || confirmDelete === "yes") {
@@ -5290,7 +5371,7 @@ class ConfigEditor {
                 break;
               }
 
-              case "6":
+              case "7":
                 console.log(UIRenderer.message("info", `Giữ nguyên cấu hình cho ${packageDisplay}.`));
                 break;
 
