@@ -171,7 +171,13 @@ const LIVE_REFRESH_TICKS = 1;
 // ---- Tham số vận hành ----
 const HTTP_TIMEOUT = 15000;            // timeout cho MỌI request mạng (trước đây không có -> treo cả tool khi mạng chập chờn)
 const LAUNCH_GRACE_MS = 75 * 1000;     // sau khi gửi lệnh mở game, chờ chừng này rồi mới đánh giá lại (tránh mở lại giữa lúc game đang load)
-const LOWPOP_PICK_POOL = 10;           // join server ít người: chọn ngẫu nhiên trong N server ít người nhất (như Roblox Server Suite: 10) để nhiều tài khoản khỏi dồn vào 1 server
+const LOWPOP_LIST_TTL_MS = 8000;       // join server ít người: danh sách server còn chỗ của 1 world dùng chung 8s (nhiều tài khoản cùng rejoin chỉ tốn 1 request)
+const LOWPOP_RESERVE_MS = 120000;      // server vừa được 1 tài khoản chọn thì tính thêm "1 người" trong 2 phút -> các tài khoản khác tự rải sang server ít người kế tiếp
+const WORLD_PLACE_PAGES = 3;           // quét world: liệt kê tối đa N trang x 100 place của 1 game
+const WORLD_PROBE_MAX = 30;            // quét world: chỉ dò server public của tối đa N place (game có hàng trăm place thì không dò hết)
+const WORLD_PROBE_CONCURRENCY = 2;     // quét world: số place dò song song (thấp để không dính giới hạn tốc độ 429)
+const WORLD_PROBE_LIMIT = 25;          // quét world: lấy N server ít người nhất của mỗi place để thống kê (10/25/50/100)
+const WORLD_PAGE_SIZE = 8;             // danh sách chọn world: số world mỗi trang
 const SERVER_INFO_REFRESH_MS = 45000;  // làm mới số người trên server mỗi instance tối đa 45s/lần
 const SERVER_INFO_TTL_MS = 30000;      // danh sách server của 1 game được dùng chung 30s (nhiều tài khoản cùng game chỉ tốn 1 request)
 const SERVER_SCAN_PAGES = 10;          // tra số người: quét tối đa N trang x 100 server (từ ít người lên) để tìm server đang ở
@@ -345,6 +351,27 @@ class Utils {
   static _serverCache = new Map();
   static _serverInflight = new Map();
 
+  /**
+   * GET công khai (không cookie) tới API Roblox. Gặp 429 thì chờ (theo Retry-After nếu có, tối đa 8s) rồi thử lại
+   * tối đa `retries` lần; các lỗi khác ném ra ngay.
+   */
+  static async _get(url, params = {}, { timeout = HTTP_TIMEOUT, retries = 0 } = {}) {
+    for (let attempt = 0; ; attempt++) {
+      try {
+        return await axios.get(url, {
+          params,
+          headers: { "User-Agent": USER_AGENT, Accept: "application/json" },
+          timeout
+        });
+      } catch (e) {
+        const status = e && e.response && e.response.status;
+        if (status !== 429 || attempt >= retries) throw e;
+        const retryAfter = Number(e.response.headers && e.response.headers["retry-after"]);
+        await sleep(clamp(retryAfter > 0 ? retryAfter * 1000 : 1500 * 2 ** attempt, 1000, 8000));
+      }
+    }
+  }
+
   /** Rút gọn lỗi HTTP / mạng thành 1 dòng đọc được. */
   static _httpError(e) {
     const status = e && e.response && e.response.status;
@@ -362,7 +389,7 @@ class Utils {
    * Lỗi ở trang đầu thì ném ra; lỗi ở các trang sau thì trả phần đã quét được (cache.partialError ghi lại lý do).
    * Không dùng cookie.
    */
-  static async fetchPublicServers(placeId, { excludeFull = false, timeout = HTTP_TIMEOUT, maxPages = 1, pageDelayMs = 300 } = {}) {
+  static async fetchPublicServers(placeId, { excludeFull = false, timeout = HTTP_TIMEOUT, maxPages = 1, pageDelayMs = 300, retries = 0 } = {}) {
     const all = [];
     let cursor = null;
     let partialError = null;
@@ -372,11 +399,7 @@ class Utils {
       if (cursor) params.cursor = cursor;
       let res;
       try {
-        res = await axios.get(`https://games.roblox.com/v1/games/${placeId}/servers/Public`, {
-          params,
-          headers: { "User-Agent": USER_AGENT, Accept: "application/json" },
-          timeout
-        });
+        res = await Utils._get(`https://games.roblox.com/v1/games/${placeId}/servers/Public`, params, { timeout, retries });
       } catch (e) {
         if (page === 0) throw e;
         partialError = Utils._httpError(e);
@@ -391,27 +414,217 @@ class Utils {
     return all;
   }
 
-  /**
-   * Chọn server ÍT NGƯỜI bằng bộ lọc của Roblox (Asc + không full). Như Roblox Server Suite: lấy 100 server ít người nhất
-   * rồi chọn ngẫu nhiên 1 trong 10 server ít người nhất. Ưu tiên server còn >= 1 người (server 0 người sắp bị đóng).
-   * Trả về { ok, jobId, playing, maxPlayers } hoặc { ok:false, error }.
-   */
-  static async findLowPopServer(placeId) {
-    if (!/^\d+$/.test(String(placeId || ""))) return { ok: false, error: "Place ID không hợp lệ" };
-    try {
-      // Roblox đã lọc full phía server; lọc thêm phía client phòng server vừa đầy giữa chừng.
-      const list = (await Utils.fetchPublicServers(placeId, { excludeFull: true }))
-        .filter((sv) => Number(sv.playing) < Number(sv.maxPlayers || Infinity))
-        .sort((a, b) => Number(a.playing) - Number(b.playing));
-      if (!list.length) return { ok: false, error: "Không có server public nào còn chỗ" };
+  // ---- Join server ÍT NGƯỜI NHẤT của 1 world ----
 
-      const occupied = list.filter((sv) => Number(sv.playing) > 0);
-      const pool = (occupied.length ? occupied : list).slice(0, LOWPOP_PICK_POOL);
-      const pick = pool[Math.floor(Math.random() * pool.length)];
-      return { ok: true, jobId: String(pick.id), playing: Number(pick.playing) || 0, maxPlayers: Number(pick.maxPlayers) || 0 };
-    } catch (e) {
-      return { ok: false, error: Utils._httpError(e) };
+  // Server vừa được tool chọn để join: jobId -> [thời điểm...]. Mỗi lần chọn tính thêm "1 người ảo" trong
+  // LOWPOP_RESERVE_MS, nhờ vậy nhiều tài khoản rejoin cùng lúc tự rải ra các server ít người kế tiếp thay vì dồn vào 1 server.
+  static _reservations = new Map();
+
+  static reserveServer(jobId, now = Date.now()) {
+    const live = (Utils._reservations.get(jobId) || []).filter((t) => now - t < LOWPOP_RESERVE_MS);
+    live.push(now);
+    Utils._reservations.set(jobId, live);
+  }
+
+  static _reservedCount(jobId, now = Date.now()) {
+    const list = Utils._reservations.get(jobId);
+    if (!list) return 0;
+    const live = list.filter((t) => now - t < LOWPOP_RESERVE_MS);
+    if (live.length) Utils._reservations.set(jobId, live);
+    else Utils._reservations.delete(jobId);
+    return live.length;
+  }
+
+  /**
+   * Từ danh sách server public (đã lọc không full) chọn server ÍT NGƯỜI NHẤT. Hàm thuần (chỉ đọc bảng reservation).
+   *  - Bỏ server đã đầy / Job ID không hợp lệ.
+   *  - Ưu tiên server còn >= 1 người (server 0 người thường sắp bị đóng); chỉ khi không có mới lấy server 0 người.
+   *  - Điểm = số người hiện tại + số lần tool vừa chọn server đó; thấp nhất thắng, bằng điểm thì chọn ngẫu nhiên.
+   * Trả về { jobId, playing, maxPlayers } hoặc null.
+   */
+  static pickLowPopServer(list, now = Date.now(), rnd = Math.random) {
+    const open = (Array.isArray(list) ? list : []).filter((sv) =>
+      sv && sv.id && /^[0-9a-fA-F-]{8,64}$/.test(String(sv.id)) &&
+      Number(sv.playing) < Number(sv.maxPlayers || Infinity)
+    );
+    if (!open.length) return null;
+
+    const occupied = open.filter((sv) => Number(sv.playing) > 0);
+    const pool = occupied.length ? occupied : open;
+    const score = (sv) => (Number(sv.playing) || 0) + Utils._reservedCount(String(sv.id), now);
+    const hasRoom = pool.filter((sv) => score(sv) < Number(sv.maxPlayers || Infinity));
+    const base = hasRoom.length ? hasRoom : pool;
+
+    const best = Math.min(...base.map(score));
+    const ties = base.filter((sv) => score(sv) === best);
+    const pick = ties[Math.floor(rnd() * ties.length)];
+    return { jobId: String(pick.id), playing: Number(pick.playing) || 0, maxPlayers: Number(pick.maxPlayers) || 0 };
+  }
+
+  /** Danh sách server public còn chỗ của 1 world (Asc = ít người trước). Dùng chung 8s giữa các tài khoản cùng world. */
+  static async _lowPopList(placeId, fresh = false) {
+    const key = `${placeId}:1`;
+    const hit = Utils._serverCache.get(key);
+    if (!fresh && hit && !hit.partialError && Date.now() - hit.at < LOWPOP_LIST_TTL_MS) return hit.list;
+    let pending = Utils._serverInflight.get(key);
+    if (!pending) {
+      pending = Utils.fetchPublicServers(placeId, { excludeFull: true, timeout: 10000, retries: 2 })
+        .finally(() => Utils._serverInflight.delete(key));
+      Utils._serverInflight.set(key, pending);
     }
+    return pending;
+  }
+
+  /**
+   * Tìm server ÍT NGƯỜI NHẤT của world (Place ID) đã chọn: lấy 100 server ít người nhất còn chỗ (Roblox đã sắp xếp
+   * Asc + bỏ server đầy) rồi chọn bằng pickLowPopServer. Server được chọn sẽ được "giữ chỗ" để tài khoản khác tránh.
+   * Trả về { ok, jobId, playing, maxPlayers, scanned } hoặc { ok:false, error, transient } — transient = lỗi tạm
+   * thời (429/mạng) nên đáng thử lại; "không có server còn chỗ" thì không.
+   */
+  static async findLowPopServer(placeId, { fresh = false } = {}) {
+    if (!/^\d+$/.test(String(placeId || ""))) return { ok: false, error: "Place ID không hợp lệ", transient: false };
+    try {
+      const list = await Utils._lowPopList(placeId, fresh);
+      const pick = Utils.pickLowPopServer(list);
+      if (!pick) return { ok: false, error: "Không có server public nào còn chỗ", transient: false };
+      Utils.reserveServer(pick.jobId);
+      return { ok: true, ...pick, scanned: list.length };
+    } catch (e) {
+      return { ok: false, error: Utils._httpError(e), transient: true };
+    }
+  }
+
+  // ---- Quét các world (place) của 1 game ----
+
+  /**
+   * Làm sạch tên place để vẽ bảng: bỏ emoji (độ rộng ô của emoji làm lệch viền hộp), bỏ cặp ngoặc rỗng còn sót
+   * ("[🧲] Blox Fruits" -> "Blox Fruits"), gộp khoảng trắng. Tên rỗng sau khi lọc thì giữ tên gốc.
+   */
+  static cleanName(name) {
+    const raw = String(name ?? "").trim();
+    const cleaned = raw
+      .replace(/[\p{Extended_Pictographic}‍️⃣]/gu, "")
+      .replace(/\[\s*\]|\(\s*\)|\{\s*\}/g, "")
+      .replace(/\s+/g, " ")
+      .trim();
+    return cleaned || raw;
+  }
+
+  /** Dò server public còn chỗ của 1 world: ghi thống kê vào chính đối tượng w. Không ném lỗi. */
+  static async _probeWorld(w) {
+    try {
+      const res = await Utils._get(
+        `https://games.roblox.com/v1/games/${w.placeId}/servers/Public`,
+        { sortOrder: "Asc", excludeFullGames: true, limit: WORLD_PROBE_LIMIT },
+        { timeout: 10000, retries: 2 }
+      );
+      const list = ((res.data && res.data.data) || []).filter((sv) =>
+        sv && sv.id && Number(sv.playing) < Number(sv.maxPlayers || Infinity)
+      );
+      w.servers = list.length;
+      w.more = Boolean(res.data && res.data.nextPageCursor);
+      w.minPlaying = list.length ? Math.min(...list.map((sv) => Number(sv.playing) || 0)) : null;
+      w.maxPlayers = list.length ? (Number(list[0].maxPlayers) || null) : null;
+      w.status = list.length ? "ok" : "empty";
+    } catch (e) {
+      w.status = "error";
+      w.error = Utils._httpError(e);
+    }
+  }
+
+  /**
+   * Quét các world của game từ 1 Place ID bất kỳ thuộc game đó:
+   *   Place ID -> universe -> danh sách place (develop API công khai) + tên game / world gốc -> dò server public từng place.
+   * Game 1 world trả về worlds.length === 1. Place trùng tên / ID đổi theo update đều được liệt kê kèm Place ID để phân biệt.
+   * Không dùng cookie. Ném Error (nội dung đọc được) nếu không tra được game hoặc danh sách world.
+   * Trả về { universeId, gameName, rootPlaceId, worlds, truncated, probed }.
+   *   worlds[i] = { placeId, name, isRoot, status: "ok"|"empty"|"error"|"skipped", servers, more, minPlaying, maxPlayers, error }
+   *   Thứ tự: world gốc, rồi world có server, chưa dò, không có server; trong mỗi nhóm theo tên.
+   */
+  static async scanWorlds(placeId, { onProgress = () => { }, probe = true } = {}) {
+    const chosen = String(placeId || "");
+    if (!/^\d+$/.test(chosen)) throw new Error("Place ID không hợp lệ");
+
+    const universeId = await Utils.resolveUniverseId(chosen, { force: true });
+    if (!universeId) throw new Error("Không tra được game (universe) của Place ID này");
+
+    // Tên game + world gốc (không bắt buộc: lỗi thì bỏ qua).
+    let gameName = null;
+    let rootPlaceId = null;
+    try {
+      const r = await Utils._get("https://games.roblox.com/v1/games", { universeIds: universeId }, { retries: 1 });
+      const g = r.data && r.data.data && r.data.data[0];
+      if (g) {
+        gameName = g.name ? String(g.name).trim() : null;
+        rootPlaceId = g.rootPlaceId ? String(g.rootPlaceId) : null;
+      }
+    } catch (_) { }
+
+    const worlds = [];
+    const seen = new Set();
+    const add = (id, name) => {
+      const key = String(id);
+      if (!/^\d+$/.test(key) || seen.has(key)) return;
+      seen.add(key);
+      worlds.push({
+        placeId: key, name: Utils.cleanName(name) || `Place ${key}`, isRoot: false,
+        status: "skipped", servers: null, more: false, minPlaying: null, maxPlayers: null, error: null
+      });
+    };
+
+    let cursor = null;
+    for (let page = 0; page < WORLD_PLACE_PAGES; page++) {
+      const params = { sortOrder: "Asc", limit: 100 };
+      if (cursor) params.cursor = cursor;
+      let res;
+      try {
+        res = await Utils._get(`https://develop.roblox.com/v1/universes/${universeId}/places`, params, { retries: 2 });
+      } catch (e) {
+        if (page === 0) throw new Error(`Không lấy được danh sách world (${Utils._httpError(e)})`);
+        break; // các trang sau lỗi: dùng phần đã có, cursor còn lại -> truncated
+      }
+      for (const p of (res.data && res.data.data) || []) if (p) add(p.id, p.name);
+      cursor = res.data && res.data.nextPageCursor;
+      if (!cursor) break;
+      await sleep(300);
+    }
+    const truncated = Boolean(cursor);
+
+    // Place đã chọn và world gốc luôn có mặt dù API trả thiếu.
+    if (rootPlaceId) add(rootPlaceId, gameName);
+    add(chosen, gameName);
+
+    const byId = new Map(worlds.map((w) => [w.placeId, w]));
+    for (const w of worlds) {
+      w.isRoot = w.placeId === rootPlaceId;
+      Utils._universeCache.set(w.placeId, universeId); // cùng universe: khỏi tra lại khi giám sát
+    }
+
+    // Dò server: ưu tiên world gốc và world đã chọn, rồi lần lượt các world còn lại (tối đa WORLD_PROBE_MAX).
+    const order = [...new Set([rootPlaceId, chosen, ...worlds.map((w) => w.placeId)].filter(Boolean))]
+      .map((id) => byId.get(id)).filter(Boolean).slice(0, WORLD_PROBE_MAX);
+    if (probe && order.length) {
+      let next = 0;
+      let done = 0;
+      onProgress({ done, total: order.length });
+      const worker = async () => {
+        while (next < order.length) {
+          const w = order[next++];
+          await Utils._probeWorld(w);
+          onProgress({ done: ++done, total: order.length });
+          await sleep(200);
+        }
+      };
+      await Promise.all(Array.from({ length: Math.min(WORLD_PROBE_CONCURRENCY, order.length) }, worker));
+    }
+
+    const rank = (w) => (w.isRoot ? 0 : w.status === "ok" ? 1 : w.status === "skipped" ? 2 : 3);
+    worlds.sort((a, b) =>
+      rank(a) - rank(b) ||
+      a.name.localeCompare(b.name) ||
+      (BigInt(a.placeId) < BigInt(b.placeId) ? -1 : 1)
+    );
+    return { universeId, gameName, rootPlaceId, worlds, truncated, probed: probe ? order.length : 0 };
   }
 
   /**
@@ -456,22 +669,20 @@ class Utils {
    * nhưng luôn cùng 1 universe, nên so universe mới không phụ thuộc world đang đứng hay ID có đổi hay không.
    * API công khai, không dùng cookie. Không bao giờ ném lỗi: trả về chuỗi universeId hoặc null (lỗi / chưa biết).
    */
-  static async resolveUniverseId(placeId) {
+  static async resolveUniverseId(placeId, { force = false } = {}) {
     const key = String(placeId || "");
     if (!/^\d+$/.test(key)) return null;
     if (Utils._universeCache.has(key)) return Utils._universeCache.get(key);
 
+    // force: bỏ qua thời gian chờ sau lỗi (dùng khi người dùng vừa chủ động chọn game / quét world).
     const failedAt = Utils._universeFail.get(key);
-    if (failedAt && Date.now() - failedAt < UNIVERSE_RETRY_MS) return null;
+    if (!force && failedAt && Date.now() - failedAt < UNIVERSE_RETRY_MS) return null;
 
     let pending = Utils._universeInflight.get(key);
     if (!pending) {
       pending = (async () => {
         try {
-          const res = await axios.get(`https://apis.roblox.com/universes/v1/places/${key}/universe`, {
-            headers: { "User-Agent": USER_AGENT, Accept: "application/json" },
-            timeout: 8000
-          });
+          const res = await Utils._get(`https://apis.roblox.com/universes/v1/places/${key}/universe`, {}, { timeout: 8000, retries: force ? 1 : 0 });
           const id = res.data && res.data.universeId;
           if (id === undefined || id === null || id === "") throw new Error("không có universeId");
           const value = String(id);
@@ -1136,18 +1347,22 @@ class GameLauncher {
   static async handleGameLaunch(shouldLaunch, placeId, linkCode, packageName, rejoinOnly = false) {
     if (!shouldLaunch) return { ok: false, skipped: true };
 
-    // Luôn join server public ÍT NGƯỜI nhất: mỗi lần rejoin tìm lại (danh sách server đổi liên tục).
-    // Server VIP đã có mã riêng nên bỏ qua. Tìm lỗi thì tự quay về join thường, không làm tool đứng.
-    if (!linkCode) {
-      const found = await Utils.findLowPopServer(placeId);
-      if (found.ok) {
-        const result = await Utils.launch(placeId, null, packageName, found.jobId);
-        return { ...result, lowpop: { jobId: found.jobId, playing: found.playing, maxPlayers: found.maxPlayers } };
-      }
-      const result = await Utils.launch(placeId, null, packageName);
-      return { ...result, lowpopError: found.error };
+    // Server VIP đã có mã riêng nên không tìm server.
+    if (linkCode) return Utils.launch(placeId, linkCode, packageName);
+
+    // Join server public ÍT NGƯỜI NHẤT của đúng world (placeId) đã chọn: mỗi lần rejoin tìm lại vì danh sách server đổi liên tục.
+    // Lỗi tạm thời (429 / mạng) thì chờ chút thử lại 1 lần với danh sách mới; vẫn lỗi thì join thường, không làm tool đứng.
+    let found = await Utils.findLowPopServer(placeId);
+    if (!found.ok && found.transient) {
+      await sleep(1500);
+      found = await Utils.findLowPopServer(placeId, { fresh: true });
     }
-    return Utils.launch(placeId, linkCode, packageName);
+    if (found.ok) {
+      const result = await Utils.launch(placeId, null, packageName, found.jobId);
+      return { ...result, lowpop: { jobId: found.jobId, playing: found.playing, maxPlayers: found.maxPlayers, scanned: found.scanned } };
+    }
+    const result = await Utils.launch(placeId, null, packageName);
+    return { ...result, lowpopError: found.error };
   }
 }
 
@@ -1235,7 +1450,165 @@ class RobloxUser {
 }
 
 class GameSelector {
+  /**
+   * Chọn game rồi chọn world. Trả về { placeId, name, linkCode, universeId?, worldName? } với placeId là WORLD đã chọn
+   * (tool sẽ tìm server ít người nhất của đúng place này). Server VIP bỏ qua bước chọn world.
+   */
   async chooseGame(rl, cookie = null) {
+    const game = await this._pickGame(rl, cookie);
+    return this.chooseWorld(rl, game);
+  }
+
+  /** Tên hiển thị của world: game nhiều world thì kèm tên world (tránh lặp nếu tên world đã chứa tên game). */
+  static worldDisplayName(gameName, world, multi) {
+    if (!multi) return gameName;
+    const g = String(gameName || "").trim();
+    const w = String(world.name || "").trim();
+    if (!w) return g;
+    if (!g || w.toLowerCase().includes(g.toLowerCase())) return w;
+    return `${g} • ${w}`;
+  }
+
+  /** 1 dòng mô tả world trong danh sách chọn. Hàm thuần. */
+  static describeWorld(w, { current = false } = {}) {
+    const tags = [];
+    if (w.isRoot) tags.push("GỐC");
+    if (current) tags.push("ĐANG CHỌN");
+    let info;
+    if (w.status === "ok") {
+      info = `${w.servers}${w.more ? "+" : ""} server còn chỗ • ít nhất ${w.minPlaying}${w.maxPlayers ? `/${w.maxPlayers}` : ""} người`;
+    } else if (w.status === "empty") {
+      info = "không thấy server public còn chỗ";
+    } else if (w.status === "error") {
+      info = `không dò được (${w.error || "lỗi"})`;
+    } else {
+      info = "chưa dò server";
+    }
+    return `${tags.length ? `[${tags.join(" • ")}] ` : ""}Place ID ${w.placeId} • ${info}`;
+  }
+
+  /**
+   * Hiểu câu trả lời ở màn chọn world. Hàm thuần.
+   *  - số 1..N: chọn world theo số thứ tự; số dài (>= 6 chữ số): coi là Place ID và tìm trong danh sách.
+   *  - Enter: giữ world đang chọn (defaultIndex); N / P: sang trang sau / trước.
+   * Trả về { action: "pick", index } | { action: "page", page } | { action: "invalid", reason }.
+   */
+  static parseWorldChoice(input, worlds, page = 0, pageSize = WORLD_PAGE_SIZE, defaultIndex = -1) {
+    const text = String(input ?? "").trim().toLowerCase();
+    const pages = Math.max(1, Math.ceil(worlds.length / pageSize));
+
+    if (!text) {
+      return defaultIndex >= 0
+        ? { action: "pick", index: defaultIndex }
+        : { action: "invalid", reason: "Hãy nhập số thứ tự world." };
+    }
+    if (text === "n" || text === ">") {
+      return page + 1 < pages ? { action: "page", page: page + 1 } : { action: "invalid", reason: "Đây là trang cuối." };
+    }
+    if (text === "p" || text === "<") {
+      return page > 0 ? { action: "page", page: page - 1 } : { action: "invalid", reason: "Đây là trang đầu." };
+    }
+    if (/^\d+$/.test(text)) {
+      if (text.length >= 6) {
+        const index = worlds.findIndex((w) => w.placeId === text);
+        return index >= 0
+          ? { action: "pick", index }
+          : { action: "invalid", reason: "Place ID này không nằm trong danh sách world của game." };
+      }
+      const n = parseInt(text, 10);
+      if (n >= 1 && n <= worlds.length) return { action: "pick", index: n - 1 };
+      return { action: "invalid", reason: `Nhập số từ 1 đến ${worlds.length}.` };
+    }
+    return { action: "invalid", reason: "Lựa chọn không hợp lệ." };
+  }
+
+  /**
+   * Quét các world của game vừa chọn và cho người dùng chọn world để join (tìm server ít người nhất trong world đó).
+   * Game 1 world: tự dùng world đó. Quét lỗi: giữ nguyên Place ID đã chọn (không chặn việc cấu hình).
+   */
+  async chooseWorld(rl, game) {
+    if (!game || game.linkCode) return game;
+    const placeId = String(game.placeId);
+
+    const spin = UIRenderer.spinner("Đang quét các world của game...");
+    let scan;
+    try {
+      scan = await Utils.scanWorlds(placeId, {
+        onProgress: ({ done, total }) => spin.update(`Đang dò server từng world ${done}/${total}...`)
+      });
+    } catch (e) {
+      spin.stop();
+      console.log(UIRenderer.message("warning", `Không quét được world: ${e.message}. Giữ Place ID ${placeId} và vẫn join server ít người của place này.`));
+      return game;
+    }
+    spin.stop();
+
+    const worlds = scan.worlds;
+    const multi = worlds.length > 1;
+    const gameName = scan.gameName || (game.name && game.name !== "Tùy chỉnh" ? game.name : `Game ${placeId}`);
+    const make = (w) => ({
+      ...game,
+      placeId: w.placeId,
+      name: GameSelector.worldDisplayName(gameName, w, multi),
+      universeId: scan.universeId,
+      worldName: w.name
+    });
+
+    if (!multi) {
+      console.log(UIRenderer.message(
+        "success",
+        `${gameName} chỉ có 1 world (Place ID ${worlds[0].placeId}) — sẽ join server ít người nhất của world này.`
+      ));
+      return make(worlds[0]);
+    }
+
+    const current = worlds.findIndex((w) => w.placeId === placeId);
+    const pages = Math.ceil(worlds.length / WORLD_PAGE_SIZE);
+    let page = current >= 0 ? Math.floor(current / WORLD_PAGE_SIZE) : 0;
+
+    console.log(UIRenderer.renderSection(
+      "Chọn world",
+      `${gameName} có ${worlds.length} world${scan.truncated ? " (danh sách quá dài, chỉ quét được một phần)" : ""}. ` +
+      "Chọn world để tool tìm server ÍT NGƯỜI NHẤT trong world đó."
+    ));
+
+    while (true) {
+      const start = page * WORLD_PAGE_SIZE;
+      const items = worlds.slice(start, start + WORLD_PAGE_SIZE).map((w, i) => ({
+        key: String(start + i + 1),
+        label: w.name,
+        description: GameSelector.describeWorld(w, { current: start + i === current }),
+        color: w.isRoot ? "1;36" : w.status === "ok" ? "1;32" : "1;33"
+      }));
+      const hints = ["Nhập số để chọn world"];
+      if (current >= 0) hints.push("Enter = giữ world đang chọn");
+      if (pages > 1) hints.push(`N/P đổi trang (${page + 1}/${pages})`);
+      console.log(UIRenderer.options(items, { footer: hints.join(" • ") }));
+
+      const ans = await Utils.ask(rl, UIRenderer.prompt(`Chọn world [1-${worlds.length}]`));
+      const r = GameSelector.parseWorldChoice(ans, worlds, page, WORLD_PAGE_SIZE, current);
+      if (r.action === "page") {
+        page = r.page;
+        continue;
+      }
+      if (r.action === "invalid") {
+        console.log(UIRenderer.message("error", r.reason));
+        continue;
+      }
+
+      const w = worlds[r.index];
+      console.log(UIRenderer.message("success", `Đã chọn world: ${w.name} (Place ID ${w.placeId})`));
+      if (w.status === "empty" || w.status === "error") {
+        console.log(UIRenderer.message(
+          "warning",
+          "Hiện chưa thấy server public còn chỗ ở world này. Tool vẫn thử lại mỗi lần rejoin; nếu không tìm được sẽ join thường."
+        ));
+      }
+      return make(w);
+    }
+  }
+
+  async _pickGame(rl, cookie = null) {
     // Có cookie -> thử lấy danh sách game tài khoản hay chơi.
     // Lỗi / không có dữ liệu -> nhập Place ID hoặc link server thủ công.
     if (cookie) {
@@ -4161,14 +4534,15 @@ class ConfigEditor {
             ["Kiểu join", config.linkCode ? "SERVER VIP" : "SERVER ÍT NGƯỜI", config.linkCode ? "1;32" : "1;35"]
           ], "CHI TIẾT CẤU HÌNH"));
           console.log(UIRenderer.options([
-            { key: "1", label: "Thay đổi game", description: "Chọn game hoặc Place ID mới" },
-            { key: "2", label: "Thay đổi nhịp quét", description: "Khoảng 15-120 giây" },
-            { key: "3", label: "Thay đổi server VIP", description: "Cập nhật link private server", color: "1;35" },
-            { key: "4", label: "Xóa cấu hình", description: "Loại tài khoản này khỏi danh sách", color: "1;31" },
-            { key: "5", label: "Giữ nguyên", description: "Bỏ qua cấu hình này", color: "1;33" }
+            { key: "1", label: "Thay đổi game", description: "Chọn game hoặc Place ID mới, rồi chọn world" },
+            { key: "2", label: "Đổi world", description: "Quét lại các world của game hiện tại và chọn world khác" },
+            { key: "3", label: "Thay đổi nhịp quét", description: "Khoảng 15-120 giây" },
+            { key: "4", label: "Thay đổi server VIP", description: "Cập nhật link private server", color: "1;35" },
+            { key: "5", label: "Xóa cấu hình", description: "Loại tài khoản này khỏi danh sách", color: "1;31" },
+            { key: "6", label: "Giữ nguyên", description: "Bỏ qua cấu hình này", color: "1;33" }
           ]));
 
-          const editChoice = await Utils.ask(rl, UIRenderer.prompt("Lựa chọn [1-5]"));
+          const editChoice = await Utils.ask(rl, UIRenderer.prompt("Lựa chọn [1-6]"));
 
           try {
             switch (editChoice.trim()) {
@@ -4189,6 +4563,29 @@ class ConfigEditor {
               }
 
               case "2": {
+                if (config.linkCode) {
+                  console.log(UIRenderer.message("warning", "Đang dùng server VIP nên không có world để chọn. Dùng mục 1 (Thay đổi game) để chuyển về server ít người."));
+                  break;
+                }
+                // Quét lại các world của game hiện tại (không cần chọn lại game) rồi chọn world mới.
+                const selector = new GameSelector();
+                const game = await selector.chooseWorld(rl, {
+                  placeId: config.placeId,
+                  name: config.gameName || "Tùy chỉnh",
+                  linkCode: null
+                });
+                config.placeId = game.placeId;
+                config.gameName = game.name;
+                console.log(UIRenderer.infoCard([
+                  ["Game", game.name, "1;32"],
+                  ["Place ID", game.placeId],
+                  ["Kiểu join", "SERVER ÍT NGƯỜI"],
+                  ["Kết quả", "ĐÃ CẬP NHẬT", "1;32"]
+                ], "CẬP NHẬT WORLD"));
+                break;
+              }
+
+              case "3": {
                 let newDelay;
                 while (true) {
                   try {
@@ -4212,7 +4609,7 @@ class ConfigEditor {
                 break;
               }
 
-              case "3":
+              case "4":
                 console.log(UIRenderer.infoCard([
                   ["Đã chuyển", "roblox.com/games/ID/Tên?privateServerLinkCode=..."],
                   ["Chưa chuyển", "roblox.com/share?code=...&type=Server"],
@@ -4254,7 +4651,7 @@ class ConfigEditor {
                 }
                 break;
 
-              case "4": {
+              case "5": {
                 console.log(UIRenderer.message("warning", `Bạn sắp xóa cấu hình của ${packageDisplay}.`));
                 const confirmDelete = (await Utils.ask(rl, UIRenderer.prompt("Xác nhận xóa? [y/N]"))).trim().toLowerCase();
                 if (confirmDelete === "y" || confirmDelete === "yes") {
@@ -4269,7 +4666,7 @@ class ConfigEditor {
                 break;
               }
 
-              case "5":
+              case "6":
                 console.log(UIRenderer.message("info", `Giữ nguyên cấu hình cho ${packageDisplay}.`));
                 break;
 
