@@ -879,19 +879,13 @@ class Utils {
       return null;
     }
 
-    // Vị trí file cookie khác nhau tuỳ phiên bản WebView/Chromium (Network/ có từ Chromium 96+) và bản mod.
-    const base = `/data/data/${packageName}`;
-    const srcDbs = [
-      `${base}/app_webview/Default/Network/Cookies`,
-      `${base}/app_webview/Default/Cookies`,
-      `${base}/app_webview/Network/Cookies`,
-      `${base}/app_webview/Cookies`,
-      `${base}/app_webview/Profile 1/Network/Cookies`,
-      `${base}/app_webview/Profile 1/Cookies`,
-    ];
+    const srcDb = `/data/data/${packageName}/app_webview/Default/Cookies`;
     const stamp = `${process.pid}_${Date.now()}`;
-    const privateDir = (n) => path.join(TMP_DIR, `ck_${stamp}_${n}.db`);
-    const publicDir = (n) => `/sdcard/cookies_temp_${stamp}_${n}.db`;
+    // Ưu tiên thư mục riêng tư (0700). /sdcard chỉ là phương án cuối vì mọi app đều đọc được ở đó.
+    const candidates = [
+      path.join(TMP_DIR, `ck_${stamp}.db`),
+      `/sdcard/cookies_temp_${stamp}.db`
+    ];
 
     const copyFile = (from, to) => {
       try {
@@ -907,56 +901,48 @@ class Utils {
       }
     };
 
-    const label = Utils.packageLabel(packageName);
     const created = [];
-    let foundDb = false;
-    let cookieValue = "";
+    let dbCopy = null;
     try {
-      for (let i = 0; i < srcDbs.length && !cookieValue; i++) {
-        const srcDb = srcDbs[i];
-        let dbCopy = null;
-        for (const target of [privateDir(i), publicDir(i)]) {
-          if (copyFile(srcDb, target)) {
-            dbCopy = target;
-            created.push(target);
-            break;
-          }
-        }
-        if (!dbCopy) continue;
-        foundDb = true;
-        try { fs.chmodSync(dbCopy, 0o600); } catch (_) { }
-
-        // Sao chép kèm journal/wal (nếu có) để không bỏ sót dữ liệu chưa ghi hẳn vào file chính.
-        for (const suffix of ["-journal", "-wal"]) {
-          if (copyFile(`${srcDb}${suffix}`, `${dbCopy}${suffix}`)) created.push(`${dbCopy}${suffix}`);
-        }
-
-        // So khớp tên không phân biệt hoa/thường + ưu tiên host roblox.com; lấy cookie mới nhất.
-        const sql =
-          "SELECT value FROM cookies WHERE name LIKE '%ROBLOSECURITY%' AND value != '' " +
-          "ORDER BY (host_key LIKE '%roblox.com%') DESC, creation_utc DESC LIMIT 1";
-        try {
-          cookieValue = execFileSync("sqlite3", [dbCopy, sql], {
-            encoding: "utf8", stdio: ["ignore", "pipe", "pipe"]
-          }).trim();
-        } catch (err) {
-          console.error(`[-] [${label}] Lỗi khi query sqlite3 (${path.basename(path.dirname(srcDb))}): ${String(err.message).split("\n")[0]}`);
+      for (const target of candidates) {
+        if (copyFile(srcDb, target)) {
+          dbCopy = target;
+          created.push(target);
+          break;
         }
       }
-
-      if (!foundDb) {
-        console.error(`[-] [${label}] Không sao chép được database cookie (cần quyền root, hoặc package chưa từng mở).`);
+      if (!dbCopy) {
+        console.error(`[-] [${Utils.packageLabel(packageName)}] Không sao chép được database cookie (cần quyền root).`);
         return null;
       }
+      try { fs.chmodSync(dbCopy, 0o600); } catch (_) { }
+
+      // Sao chép kèm journal/wal (nếu có) để không bỏ sót dữ liệu chưa ghi hẳn vào file chính.
+      for (const suffix of ["-journal", "-wal"]) {
+        if (copyFile(`${srcDb}${suffix}`, `${dbCopy}${suffix}`)) created.push(`${dbCopy}${suffix}`);
+      }
+
+      let cookieValue;
+      try {
+        cookieValue = execFileSync(
+          "sqlite3",
+          [dbCopy, "SELECT value FROM cookies WHERE name = '.ROBLOSECURITY' LIMIT 1"],
+          { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] }
+        ).trim();
+      } catch (err) {
+        console.error(`[-] [${Utils.packageLabel(packageName)}] Lỗi khi query sqlite3: ${String(err.message).split("\n")[0]}`);
+        return null;
+      }
+
       if (!cookieValue) {
-        console.error(`[-] [${label}] Không tìm được cookie ROBLOSECURITY (đã đăng nhập chưa? Hãy mở app, đăng nhập rồi thoát hẳn).`);
+        console.error(`[-] [${Utils.packageLabel(packageName)}] Không tìm được cookie ROBLOSECURITY (đã đăng nhập chưa?).`);
         return null;
       }
 
       if (!cookieValue.startsWith("_")) cookieValue = "_" + cookieValue;
       return `.ROBLOSECURITY=${cookieValue}`;
     } catch (e) {
-      console.error(`[-] [${label}] Lỗi khi lấy cookie: ${e.message}`);
+      console.error(`[-] [${Utils.packageLabel(packageName)}] Lỗi khi lấy cookie: ${e.message}`);
       return null;
     } finally {
       for (const file of created) {
