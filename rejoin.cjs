@@ -200,6 +200,15 @@ const IN_GAME_STATUSES = new Set(["Online [+]", "Trong game"]);
 const ERROR_STATUSES = new Set(["Lỗi mạng", "Cookie hết hạn", "Lỗi mở game"]);
 const isInGameStatus = (status) => IN_GAME_STATUSES.has(String(status || "").trim());
 
+/**
+ * Kiểu join của 1 cấu hình: "vip" (có linkCode) | "normal" (join thường: vào thẳng Place ID, Roblox tự chọn server)
+ * | "lowpop" (join theo ID: tìm server ÍT NGƯỜI NHẤT của Place ID). Cấu hình cũ chưa có joinMode giữ hành vi cũ = "lowpop".
+ */
+const joinModeOf = (c) => (c && c.linkCode ? "vip" : c && c.joinMode === "normal" ? "normal" : "lowpop");
+const JOIN_LABELS = { vip: "SERVER VIP", normal: "JOIN THƯỜNG", lowpop: "SERVER ÍT NGƯỜI" };
+const JOIN_SHORT = { vip: "VIP", normal: "THƯỜNG", lowpop: "ÍT NGƯỜI" };
+const JOIN_TONES = { vip: "good", normal: "dim", lowpop: "accent" };
+
 /** Bọc chuỗi an toàn cho shell (dùng khi bắt buộc đi qua `su -c "..."`). */
 const shQuote = (value) => `'${String(value).replace(/'/g, `'\\''`)}'`;
 
@@ -1037,6 +1046,20 @@ class Utils {
     return pending;
   }
 
+  /** Tên game (universe) của 1 Place ID: 2 request nhẹ, không quét world. Không bao giờ ném lỗi; không tra được thì trả null. */
+  static async fetchGameName(placeId) {
+    try {
+      const universeId = await Utils.resolveUniverseId(placeId, { force: true });
+      if (!universeId) return null;
+      const r = await Utils._get("https://games.roblox.com/v1/games", { universeIds: universeId }, { retries: 1 });
+      const g = r.data && r.data.data && r.data.data[0];
+      const name = g && g.name ? Utils.cleanName(g.name) : "";
+      return name || null;
+    } catch (_) {
+      return null;
+    }
+  }
+
   static ask(rl, msg) {
     return new Promise((r) => rl.question(msg, r));
   }
@@ -1682,11 +1705,14 @@ class Utils {
 
 class GameLauncher {
   /** Trả về kết quả của Utils.launch ({ ok, error? }) để vòng giám sát ghi nhật ký đúng. */
-  static async handleGameLaunch(shouldLaunch, placeId, linkCode, packageName, rejoinOnly = false) {
+  static async handleGameLaunch(shouldLaunch, placeId, linkCode, packageName, rejoinOnly = false, joinMode = "lowpop") {
     if (!shouldLaunch) return { ok: false, skipped: true };
 
     // Server VIP đã có mã riêng nên không tìm server.
     if (linkCode) return Utils.launch(placeId, linkCode, packageName);
+
+    // Join thường: vào thẳng Place ID để Roblox tự chọn server, không gọi API tìm server (nhẹ, không dính 429).
+    if (joinMode === "normal") return Utils.launch(placeId, null, packageName);
 
     // Join server public ÍT NGƯỜI NHẤT của đúng world (placeId) đã chọn: mỗi lần rejoin tìm lại vì danh sách server đổi liên tục.
     // Lỗi tạm thời (429 / mạng) thì chờ chút thử lại 1 lần với danh sách mới; vẫn lỗi thì join thường, không làm tool đứng.
@@ -1789,12 +1815,54 @@ class RobloxUser {
 
 class GameSelector {
   /**
-   * Chọn game rồi chọn world. Trả về { placeId, name, linkCode, universeId?, worldName? } với placeId là WORLD đã chọn
-   * (tool sẽ tìm server ít người nhất của đúng place này). Server VIP bỏ qua bước chọn world.
+   * Chọn game rồi hỏi kiểu join. Trả về { placeId, name, linkCode, joinMode }:
+   *   joinMode = "normal" (join thường) | "lowpop" (join theo ID: server ít người nhất của Place ID) | null (server VIP).
+   * Muốn biết Place ID của từng world thì dùng mục 8 ở menu chính (Dò world) rồi nhập Place ID đó ở bước chọn game.
    */
   async chooseGame(rl, cookie = null) {
-    const game = await this._pickGame(rl, cookie);
-    return this.chooseWorld(rl, game);
+    let game = await this._pickGame(rl, cookie);
+    // Nhập thẳng Place ID thì chưa có tên game: tra tên cho dễ nhìn trong cấu hình (lỗi thì giữ tên tạm).
+    if (game && !game.linkCode && game.name === "Tùy chỉnh") {
+      const spin = UIRenderer.spinner("Đang lấy tên game...");
+      let name = null;
+      try { name = await Utils.fetchGameName(game.placeId); } finally { spin.stop(); }
+      if (name) game = { ...game, name };
+    }
+    return this.chooseJoinMode(rl, game);
+  }
+
+  /** Hỏi kiểu join cho game vừa chọn. Server VIP có mã riêng nên bỏ qua câu hỏi. */
+  async chooseJoinMode(rl, game, current = null) {
+    if (!game || game.linkCode) return { ...game, joinMode: null };
+    return { ...game, joinMode: await GameSelector.askJoinMode(rl, current) };
+  }
+
+  /**
+   * Hiểu câu trả lời ở câu hỏi kiểu join. Hàm thuần.
+   * "1" -> "normal", "2" -> "lowpop", Enter -> fallback; còn lại -> null (không hợp lệ).
+   */
+  static parseJoinChoice(input, fallback = "lowpop") {
+    const text = String(input ?? "").trim();
+    if (!text) return fallback;
+    if (text === "1") return "normal";
+    if (text === "2") return "lowpop";
+    return null;
+  }
+
+  /** Hiện câu hỏi "Join thường / Join theo ID" và đọc lựa chọn. Enter = giữ lựa chọn hiện tại (mặc định: join theo ID). */
+  static async askJoinMode(rl, current = null) {
+    const fallback = current === "normal" ? "normal" : "lowpop";
+    console.log(UIRenderer.renderSection("Kiểu join", "Chọn cách vào game mỗi lần rejoin"));
+    console.log(UIRenderer.options([
+      { key: "1", label: "Join thường", description: "Vào thẳng Place ID, Roblox tự chọn server" },
+      { key: "2", label: "Join theo ID", description: "Tìm server ÍT NGƯỜI NHẤT của Place ID này rồi vào", color: "1;35" }
+    ], { footer: `Enter = ${fallback === "normal" ? "1 (join thường)" : "2 (join theo ID)"}` }));
+    while (true) {
+      const ans = await Utils.ask(rl, UIRenderer.prompt("Kiểu join [1-2]"));
+      const mode = GameSelector.parseJoinChoice(ans, fallback);
+      if (mode) return mode;
+      console.log(UIRenderer.message("error", "Nhập 1 (join thường) hoặc 2 (join theo ID)."));
+    }
   }
 
   /** Tên hiển thị của world: game nhiều world thì kèm tên world (tránh lặp nếu tên world đã chứa tên game). */
@@ -1861,11 +1929,14 @@ class GameSelector {
   }
 
   /**
-   * Quét các world của game vừa chọn và cho người dùng chọn world để join (tìm server ít người nhất trong world đó).
+   * Quét các world của game và cho người dùng chọn world (tìm server ít người nhất trong world đó).
    * Game 1 world: tự dùng world đó. Quét lỗi: giữ nguyên Place ID đã chọn (không chặn việc cấu hình).
+   *
+   * lookup = true (mục 8 "Dò world"): chỉ liệt kê để LẤY Place ID — không đổi cấu hình nào; gõ số để xem Place ID
+   * của world đó, Enter để thoát. Trả về { needAck } (true = có thông báo cần người dùng đọc trước khi quay lại menu).
    */
-  async chooseWorld(rl, game) {
-    if (!game || game.linkCode) return game;
+  async chooseWorld(rl, game, { lookup = false } = {}) {
+    if (!game || game.linkCode) return lookup ? { needAck: false } : game;
     const placeId = String(game.placeId);
 
     const spin = UIRenderer.spinner("Đang quét các world của game...");
@@ -1878,6 +1949,10 @@ class GameSelector {
       });
     } catch (e) {
       spin.stop();
+      if (lookup) {
+        console.log(UIRenderer.message("warning", `Không quét được world: ${e.message}.`));
+        return { needAck: true };
+      }
       console.log(UIRenderer.message("warning", `Không quét được world: ${e.message}. Giữ Place ID ${placeId} và vẫn join server ít người của place này.`));
       return game;
     }
@@ -1914,9 +1989,11 @@ class GameSelector {
     if (!multi) {
       console.log(UIRenderer.message(
         "success",
-        `${gameName} chỉ có 1 world (Place ID ${worlds[0].placeId}) — sẽ join server ít người nhất của world này.`
+        lookup
+          ? `${gameName} chỉ có 1 world — Place ID ${worlds[0].placeId}.`
+          : `${gameName} chỉ có 1 world (Place ID ${worlds[0].placeId}) — sẽ join server ít người nhất của world này.`
       ));
-      return make(worlds[0]);
+      return lookup ? { needAck: true } : make(worlds[0]);
     }
 
     const current = worlds.findIndex((w) => w.placeId === placeId);
@@ -1924,9 +2001,11 @@ class GameSelector {
     let page = current >= 0 ? Math.floor(current / WORLD_PAGE_SIZE) : 0;
 
     console.log(UIRenderer.renderSection(
-      "Chọn world",
+      lookup ? "Danh sách world" : "Chọn world",
       `${gameName} có ${worlds.length} world${scan.truncated ? " (danh sách quá dài, chỉ quét được một phần)" : ""}. ` +
-      "Chọn world để tool tìm server ÍT NGƯỜI NHẤT trong world đó."
+      (lookup
+        ? "Nhập số để xem Place ID của world, rồi dùng Place ID đó ở bước chọn game (mục 2 / mục 3)."
+        : "Chọn world để tool tìm server ÍT NGƯỜI NHẤT trong world đó.")
     ));
 
     while (true) {
@@ -1934,16 +2013,18 @@ class GameSelector {
       const items = worlds.slice(start, start + WORLD_PAGE_SIZE).map((w, i) => ({
         key: String(start + i + 1),
         label: w.name,
-        description: GameSelector.describeWorld(w, { current: start + i === current }),
+        description: GameSelector.describeWorld(w, { current: !lookup && start + i === current }),
         color: w.isRoot ? "1;36" : w.status === "ok" ? "1;32" : "1;33"
       }));
-      const hints = ["Nhập số để chọn world"];
-      if (current >= 0) hints.push("Enter = giữ world đang chọn");
+      const hints = [lookup ? "Nhập số để xem Place ID" : "Nhập số để chọn world"];
+      if (lookup) hints.push("Enter = thoát");
+      else if (current >= 0) hints.push("Enter = giữ world đang chọn");
       if (pages > 1) hints.push(`N/P đổi trang (${page + 1}/${pages})`);
       console.log(UIRenderer.options(items, { footer: hints.join(" • ") }));
 
-      const ans = await Utils.ask(rl, UIRenderer.prompt(`Chọn world [1-${worlds.length}]`));
-      const r = GameSelector.parseWorldChoice(ans, worlds, page, WORLD_PAGE_SIZE, current);
+      const ans = await Utils.ask(rl, UIRenderer.prompt(lookup ? `Xem Place ID world [1-${worlds.length}]` : `Chọn world [1-${worlds.length}]`));
+      if (lookup && (!ans.trim() || /^(0|q)$/i.test(ans.trim()))) return { needAck: false };
+      const r = GameSelector.parseWorldChoice(ans, worlds, page, WORLD_PAGE_SIZE, lookup ? -1 : current);
       if (r.action === "page") {
         page = r.page;
         continue;
@@ -1954,6 +2035,14 @@ class GameSelector {
       }
 
       const w = worlds[r.index];
+      if (lookup) {
+        console.log(UIRenderer.infoCard([
+          ["World", w.name, "1;36"],
+          ["Place ID", w.placeId, "1;32"],
+          ["Server", GameSelector.describeWorld(w).replace(/^.*?Place ID \d+ • /, "")]
+        ], "PLACE ID"));
+        continue;
+      }
       console.log(UIRenderer.message("success", `Đã chọn world: ${w.name} (Place ID ${w.placeId})`));
       if (w.status === "empty" || w.status === "error") {
         console.log(UIRenderer.message(
@@ -2560,7 +2649,7 @@ class UIRenderer {
     );
   }
 
-  /** Hoạt ảnh chỉ chạy trên terminal thật. Tắt bằng REJOIN_NO_ANIM=1 hoặc trong menu 8. Giao diện. */
+  /** Hoạt ảnh chỉ chạy trên terminal thật. Tắt bằng REJOIN_NO_ANIM=1 hoặc trong menu 9. Giao diện. */
   static _motionOn() {
     return (
       this.animOn !== false &&
@@ -3081,7 +3170,7 @@ class UIRenderer {
     );
   }
 
-  /** MENU CHÍNH: LUÔN 2 CỘT NGANG (trái 1-4, phải 5-0). */
+  /** MENU CHÍNH: LUÔN 2 CỘT NGANG (trái 1-5, phải 6-9). */
   static renderMainMenu({ configCount, prefix, webhook, autoexec, wakeOff = false }) {
     const width = this._width();
     const contentWidth = width - 4;
@@ -3094,14 +3183,16 @@ class UIRenderer {
       ["1", "Chạy Rejoin", "Theo dõi và tự vào lại game", "good"],
       ["2", "Thiết lập", "Quét và thêm tài khoản", "accent"],
       ["3", "Cấu hình", "Game, delay, private server", "blue"],
-      ["4", "Prefix", "Tên package Roblox", "violet"]
+      ["4", "Prefix", "Tên package Roblox", "violet"],
+      ["5", "Activity", "Mặc định hoặc tùy chỉnh", "violet"]
     ];
 
     const rightItems = [
-      ["5", "Activity", "Mặc định hoặc tùy chỉnh", "violet"],
       ["6", "Webhook", "Báo cáo trạng thái Discord", "accent"],
       ["7", "Autoexec", "Quản lý script executor", "warn"],
-      ["8", "Giao diện", "Phông chữ, màu, hoạt ảnh", "blue"]
+      ["8", "Dò world", "Lấy Place ID các world của game", "good"],
+      ["9", "Giao diện", "Phông chữ, màu, hoạt ảnh", "blue"],
+      null
     ];
 
     const cfgTone = configCount > 0 ? "good" : "warn";
@@ -3146,9 +3237,10 @@ class UIRenderer {
       B(`╭${ruleL}┬${ruleR}╮`)
     ];
 
+    const blank = (w) => [" ".repeat(w), " ".repeat(w)];
     for (let i = 0; i < leftItems.length; i++) {
-      const l = cell(leftItems[i], leftWidth);
-      const r = cell(rightItems[i], rightWidth);
+      const l = leftItems[i] ? cell(leftItems[i], leftWidth) : blank(leftWidth);
+      const r = rightItems[i] ? cell(rightItems[i], rightWidth) : blank(rightWidth);
       lines.push(`${B("│")}${l[0]}${B("│")}${r[0]}${B("│")}`);
       if (showDesc) {
         lines.push(`${B("│")}${l[1]}${B("│")}${r[1]}${B("│")}`);
@@ -3458,7 +3550,7 @@ class UIRenderer {
               ["Place ID", c.placeId || "-", "dim"],
               ["Nhịp quét", c.delaySec ? `${c.delaySec} giây` : "Chưa đặt"],
               ["Server VIP", c.linkCode ? "ĐÃ CẤU HÌNH" : "KHÔNG", c.linkCode ? "good" : "dim"],
-              ["Kiểu join", c.linkCode ? "SERVER VIP" : "SERVER ÍT NGƯỜI", c.linkCode ? "good" : "accent"]
+              ["Kiểu join", JOIN_LABELS[joinModeOf(c)], JOIN_TONES[joinModeOf(c)]]
             ],
             `CẤU HÌNH ${String(index + 1).padStart(2, "0")}`
           );
@@ -3474,7 +3566,7 @@ class UIRenderer {
         Utils.maskSensitiveInfo(c.username || "Unknown"),
         `${c.gameName || "Chưa đặt"}  (${c.placeId || "-"})`,
         c.delaySec ? `${c.delaySec}s` : "-",
-        c.linkCode ? this.color("good", "VIP") : this.color("accent", "ÍT NGƯỜI")
+        this.color(JOIN_TONES[joinModeOf(c)], JOIN_SHORT[joinModeOf(c)])
       ];
     });
 
@@ -3665,7 +3757,8 @@ class MultiRejoinTool {
       "5": () => this.configureActivity(rl),
       "6": () => this.setupWebhook(rl),
       "7": () => this.setupAutoexec(rl),
-      "8": () => this.configureUi(rl),
+      "8": () => this.scanWorldIds(rl),
+      "9": () => this.configureUi(rl),
     };
 
     try {
@@ -3685,7 +3778,7 @@ class MultiRejoinTool {
           wakeOff: Utils.wakeLockState === "failed",
         }));
 
-        const choice = (await Utils.ask(rl, UIRenderer.prompt("Chọn chức năng [0-8]"))).trim();
+        const choice = (await Utils.ask(rl, UIRenderer.prompt("Chọn chức năng [0-9]"))).trim();
         if (choice === "0" || choice.toLowerCase() === "q") break;
         const action = actions[choice];
         if (!action) {
@@ -3714,6 +3807,42 @@ class MultiRejoinTool {
       rl.close();
       if (!this.isRunning) Utils.disableWakeLock();
     }
+  }
+
+  /**
+   * Mục 8: Dò world. Nhập 1 Place ID (hoặc link game) -> quét và liệt kê các world của game kèm Place ID,
+   * để dùng ở bước chọn game (mục 2 / mục 3) khi muốn join đúng world. Không thay đổi cấu hình nào.
+   */
+  async scanWorldIds(rl) {
+    UIRenderer.screen("Dò world", "Liệt kê world của game để lấy Place ID");
+    const known = [...new Map(
+      Object.values(Utils.loadMultiConfigs())
+        .filter((c) => c && c.placeId && !c.linkCode)
+        .map((c) => [String(c.placeId), c.gameName || "Chưa đặt"])
+    ).entries()].slice(0, 3);
+    console.log(UIRenderer.infoCard([
+      ["Place ID", "Chỉ nhập số, ví dụ 8737899170"],
+      ["Link game", "roblox.com/games/ID/Tên"],
+      ...(known.length ? [["Đã cấu hình", known.map(([id, name]) => `${name} (${id})`).join(" • ")]] : []),
+      ["Thoát", "Để trống rồi Enter"]
+    ], "DÒ WORLD"));
+
+    let target = null;
+    while (!target) {
+      const input = (await Utils.ask(rl, UIRenderer.prompt("Place ID hoặc link game"))).trim();
+      if (!input) return true;
+      const parsed = GameSelector.parseTarget(input);
+      if (parsed && (parsed.kind === "place" || parsed.kind === "private")) target = parsed;
+      else console.log(UIRenderer.message("error", "Không nhận ra Place ID. Nhập số Place ID hoặc dán link roblox.com/games/ID/..."));
+    }
+
+    const selector = new GameSelector();
+    const result = await selector.chooseWorld(
+      rl,
+      { placeId: target.placeId, name: target.name || "Tùy chỉnh", linkCode: null },
+      { lookup: true }
+    );
+    return result && result.needAck ? false : true;
   }
 
   async setupPackages(rl) {
@@ -3834,6 +3963,7 @@ class MultiRejoinTool {
         placeId: game.placeId,
         gameName: game.name,
         linkCode: game.linkCode,
+        joinMode: game.joinMode,
         delaySec,
         packageName
       };
@@ -3842,7 +3972,7 @@ class MultiRejoinTool {
       console.log(UIRenderer.infoCard([
         ["Package", packageInfo.displayName],
         ["Game", game.name, "1;36"],
-        ["Kiểu join", game.linkCode ? "SERVER VIP" : "SERVER ÍT NGƯỜI", game.linkCode ? "1;32" : "1;35"],
+        ["Kiểu join", JOIN_LABELS[joinModeOf(game)], game.linkCode ? "1;32" : game.joinMode === "normal" ? "2;37" : "1;35"],
         ["Nhịp quét", `${delaySec} giây`],
         ["Kết quả", "ĐÃ CẤU HÌNH", "1;32"]
       ], "HOÀN TẤT TÀI KHOẢN"));
@@ -4419,7 +4549,7 @@ class MultiRejoinTool {
       if (analysis.shouldLaunch) {
         if (launched++ > 0) await sleep(LAUNCH_STAGGER_MS);
         const result = await GameLauncher.handleGameLaunch(
-          true, config.placeId, config.linkCode, config.packageName, true
+          true, config.placeId, config.linkCode, config.packageName, true, joinModeOf(config)
         );
         if (result.ok) {
           statusHandler.updateJoinStatus(true);
@@ -4435,7 +4565,9 @@ class MultiRejoinTool {
           instance.serverMiss = null;
           const mode = config.linkCode
             ? " (server VIP)"
-            : result.lowpop
+            : joinModeOf(config) === "normal"
+              ? " (join thường)"
+              : result.lowpop
               ? ` (server ít người ${result.lowpop.playing}/${result.lowpop.maxPlayers})`
               : "";
           this.logEvent("success", `${label}: đã gửi lệnh mở game${mode} — lần ${instance.rejoinCount}`);
@@ -4888,11 +5020,11 @@ class ConfigEditor {
             ["Game", `${config.gameName || "Unknown"} (${config.placeId || "Unknown"})`],
             ["Nhịp quét", `${config.delaySec || "Unknown"} giây`],
             ["Server VIP", config.linkCode ? "ĐÃ CẤU HÌNH" : "KHÔNG", config.linkCode ? "1;32" : "2;37"],
-            ["Kiểu join", config.linkCode ? "SERVER VIP" : "SERVER ÍT NGƯỜI", config.linkCode ? "1;32" : "1;35"]
+            ["Kiểu join", JOIN_LABELS[joinModeOf(config)], config.linkCode ? "1;32" : joinModeOf(config) === "normal" ? "2;37" : "1;35"]
           ], "CHI TIẾT CẤU HÌNH"));
           console.log(UIRenderer.options([
-            { key: "1", label: "Thay đổi game", description: "Chọn game hoặc Place ID mới, rồi chọn world" },
-            { key: "2", label: "Đổi world", description: "Quét lại các world của game hiện tại và chọn world khác" },
+            { key: "1", label: "Thay đổi game", description: "Chọn game hoặc Place ID mới, rồi chọn kiểu join" },
+            { key: "2", label: "Đổi kiểu join", description: "Join thường hoặc join theo ID (server ít người nhất)" },
             { key: "3", label: "Thay đổi nhịp quét", description: "Khoảng 15-120 giây" },
             { key: "4", label: "Thay đổi server VIP", description: "Cập nhật link private server", color: "1;35" },
             { key: "5", label: "Xóa cấu hình", description: "Loại tài khoản này khỏi danh sách", color: "1;31" },
@@ -4909,11 +5041,12 @@ class ConfigEditor {
                 config.placeId = game.placeId;
                 config.gameName = game.name;
                 config.linkCode = game.linkCode;
+                config.joinMode = game.joinMode;
                 console.log(UIRenderer.infoCard([
                   ["Game", game.name, "1;32"],
                   ["Place ID", game.placeId],
                   ["Server VIP", game.linkCode ? "ĐÃ CẤU HÌNH" : "KHÔNG"],
-                  ["Kiểu join", game.linkCode ? "SERVER VIP" : "SERVER ÍT NGƯỜI"],
+                  ["Kiểu join", JOIN_LABELS[joinModeOf(game)]],
                   ["Kết quả", "ĐÃ CẬP NHẬT", "1;32"]
                 ], "CẬP NHẬT GAME"));
                 break;
@@ -4921,24 +5054,16 @@ class ConfigEditor {
 
               case "2": {
                 if (config.linkCode) {
-                  console.log(UIRenderer.message("warning", "Đang dùng server VIP nên không có world để chọn. Dùng mục 1 (Thay đổi game) để chuyển về server ít người."));
+                  console.log(UIRenderer.message("warning", "Đang dùng server VIP nên không có kiểu join để chọn. Dùng mục 1 (Thay đổi game) để chuyển về server public."));
                   break;
                 }
-                // Quét lại các world của game hiện tại (không cần chọn lại game) rồi chọn world mới.
-                const selector = new GameSelector();
-                const game = await selector.chooseWorld(rl, {
-                  placeId: config.placeId,
-                  name: config.gameName || "Tùy chỉnh",
-                  linkCode: null
-                });
-                config.placeId = game.placeId;
-                config.gameName = game.name;
+                config.joinMode = await GameSelector.askJoinMode(rl, joinModeOf(config));
                 console.log(UIRenderer.infoCard([
-                  ["Game", game.name, "1;32"],
-                  ["Place ID", game.placeId],
-                  ["Kiểu join", "SERVER ÍT NGƯỜI"],
+                  ["Game", config.gameName || "Unknown", "1;32"],
+                  ["Place ID", config.placeId],
+                  ["Kiểu join", JOIN_LABELS[joinModeOf(config)]],
                   ["Kết quả", "ĐÃ CẬP NHẬT", "1;32"]
-                ], "CẬP NHẬT WORLD"));
+                ], "CẬP NHẬT KIỂU JOIN"));
                 break;
               }
 
