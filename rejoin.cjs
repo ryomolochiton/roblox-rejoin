@@ -171,6 +171,7 @@ const LIVE_REFRESH_TICKS = 1;
 // ---- Tham số vận hành ----
 const HTTP_TIMEOUT = 15000;            // timeout cho MỌI request mạng (trước đây không có -> treo cả tool khi mạng chập chờn)
 const LAUNCH_GRACE_MS = 75 * 1000;     // sau khi gửi lệnh mở game, chờ chừng này rồi mới đánh giá lại (tránh mở lại giữa lúc game đang load)
+const LOWPOP_PICK_POOL = 3;            // join server ít người: chọn ngẫu nhiên trong N server ít người nhất (nhiều tài khoản khỏi dồn vào 1 server)
 const LAUNCH_STAGGER_MS = 2000;        // giãn cách khi mở nhiều instance cùng lúc cho đỡ nặng máy
 const COOKIE_REFRESH_MS = 3 * 60 * 1000;
 const RECENT_GAMES_LIMIT = 5;           // số game "tài khoản hay chơi" hiển thị khi chọn game (trước đây là 10)
@@ -280,7 +281,7 @@ class Utils {
    * thử `am` rồi `/system/bin/am`, và đọc cả nội dung "Error:" mà am vẫn trả exit code 0.
    * Trả về { ok, error? } — không in log, để màn giám sát tự ghi vào NHẬT KÝ.
    */
-  static async launch(placeId, linkCode = null, packageName) {
+  static async launch(placeId, linkCode = null, packageName, jobId = null) {
     if (!/^[A-Za-z0-9_.]+$/.test(String(packageName || ""))) {
       return { ok: false, error: "Tên package không hợp lệ" };
     }
@@ -290,10 +291,16 @@ class Utils {
     if (linkCode && !/^[\w-]+$/.test(String(linkCode))) {
       return { ok: false, error: "Mã server VIP không hợp lệ" };
     }
+    if (jobId && !/^[0-9a-fA-F-]{8,64}$/.test(String(jobId))) {
+      return { ok: false, error: "Job ID server không hợp lệ" };
+    }
 
+    // Ưu tiên: server VIP (linkCode) > server cụ thể (jobId, dùng cho join server ít người) > vào thường.
     const url = linkCode
       ? `roblox://placeID=${placeId}&linkCode=${linkCode}`
-      : `roblox://placeID=${placeId}`;
+      : jobId
+        ? `roblox://placeID=${placeId}&gameInstanceId=${jobId}`
+        : `roblox://placeID=${placeId}`;
 
     // Activity: dùng giá trị tùy chỉnh nếu hợp lệ, ngược lại luôn dùng mặc định cố định.
     let activity = Utils.loadActivityConfig();
@@ -326,6 +333,35 @@ class Utils {
       }
     }
     return { ok: false, error: lastError };
+  }
+
+  /**
+   * Tìm server public ÍT NGƯỜI nhất của một game (không dùng cookie -> không lộ cookie).
+   * Roblox: sortOrder=Asc trả server ít người trước; bỏ server đầy; ưu tiên server còn >= 1 người
+   * (server 0 người sắp bị đóng). Trả về { ok, jobId, playing, maxPlayers } hoặc { ok:false, error }.
+   */
+  static async findLowPopServer(placeId) {
+    if (!/^\d+$/.test(String(placeId || ""))) return { ok: false, error: "Place ID không hợp lệ" };
+    try {
+      const res = await axios.get(`https://games.roblox.com/v1/games/${placeId}/servers/Public`, {
+        params: { sortOrder: "Asc", excludeFullGames: true, limit: 100 },
+        headers: { "User-Agent": USER_AGENT, Accept: "application/json" },
+        timeout: HTTP_TIMEOUT
+      });
+      const list = ((res.data && res.data.data) || [])
+        .filter((sv) => sv && sv.id && Number(sv.playing) < Number(sv.maxPlayers || Infinity))
+        .sort((a, b) => Number(a.playing) - Number(b.playing));
+      if (!list.length) return { ok: false, error: "Không có server public nào còn chỗ" };
+
+      const occupied = list.filter((sv) => Number(sv.playing) > 0);
+      const pool = (occupied.length ? occupied : list).slice(0, LOWPOP_PICK_POOL);
+      const pick = pool[Math.floor(Math.random() * pool.length)];
+      return { ok: true, jobId: String(pick.id), playing: Number(pick.playing) || 0, maxPlayers: Number(pick.maxPlayers) || 0 };
+    } catch (e) {
+      const status = e.response && e.response.status;
+      if (status === 429) return { ok: false, error: "Roblox giới hạn tốc độ (429)" };
+      return { ok: false, error: status ? `HTTP ${status}` : (e.message || "lỗi mạng") };
+    }
   }
 
   static ask(rl, msg) {
@@ -975,6 +1011,18 @@ class GameLauncher {
   /** Trả về kết quả của Utils.launch ({ ok, error? }) để vòng giám sát ghi nhật ký đúng. */
   static async handleGameLaunch(shouldLaunch, placeId, linkCode, packageName, rejoinOnly = false) {
     if (!shouldLaunch) return { ok: false, skipped: true };
+
+    // Luôn join server public ÍT NGƯỜI nhất: mỗi lần rejoin tìm lại (danh sách server đổi liên tục).
+    // Server VIP đã có mã riêng nên bỏ qua. Tìm lỗi thì tự quay về join thường, không làm tool đứng.
+    if (!linkCode) {
+      const found = await Utils.findLowPopServer(placeId);
+      if (found.ok) {
+        const result = await Utils.launch(placeId, null, packageName, found.jobId);
+        return { ...result, lowpop: { playing: found.playing, maxPlayers: found.maxPlayers } };
+      }
+      const result = await Utils.launch(placeId, null, packageName);
+      return { ...result, lowpopError: found.error };
+    }
     return Utils.launch(placeId, linkCode, packageName);
   }
 }
@@ -2494,7 +2542,8 @@ class UIRenderer {
               ["Game", c.gameName || "Chưa đặt", "violet"],
               ["Place ID", c.placeId || "-", "dim"],
               ["Nhịp quét", c.delaySec ? `${c.delaySec} giây` : "Chưa đặt"],
-              ["Server VIP", c.linkCode ? "ĐÃ CẤU HÌNH" : "KHÔNG", c.linkCode ? "good" : "dim"]
+              ["Server VIP", c.linkCode ? "ĐÃ CẤU HÌNH" : "KHÔNG", c.linkCode ? "good" : "dim"],
+              ["Kiểu join", c.linkCode ? "SERVER VIP" : "SERVER ÍT NGƯỜI", c.linkCode ? "good" : "accent"]
             ],
             `CẤU HÌNH ${String(index + 1).padStart(2, "0")}`
           );
@@ -2510,12 +2559,12 @@ class UIRenderer {
         Utils.maskSensitiveInfo(c.username || "Unknown"),
         `${c.gameName || "Chưa đặt"}  (${c.placeId || "-"})`,
         c.delaySec ? `${c.delaySec}s` : "-",
-        this.color(c.linkCode ? "good" : "dim", c.linkCode ? "CÓ" : "KHÔNG")
+        c.linkCode ? this.color("good", "VIP") : this.color("accent", "ÍT NGƯỜI")
       ];
     });
 
     return this._table(
-      ["#", "PACKAGE", "TÀI KHOẢN", "GAME / PLACE ID", "NHỊP QUÉT", "VIP"],
+      ["#", "PACKAGE", "TÀI KHOẢN", "GAME / PLACE ID", "NHỊP QUÉT", "JOIN"],
       rows,
       [0.05, 0.23, 0.17, 0.35, 0.10, 0.10],
       width
@@ -2878,6 +2927,7 @@ class MultiRejoinTool {
       console.log(UIRenderer.infoCard([
         ["Package", packageInfo.displayName],
         ["Game", game.name, "1;36"],
+        ["Kiểu join", game.linkCode ? "SERVER VIP" : "SERVER ÍT NGƯỜI", game.linkCode ? "1;32" : "1;35"],
         ["Nhịp quét", `${delaySec} giây`],
         ["Kết quả", "ĐÃ CẤU HÌNH", "1;32"]
       ], "HOÀN TẤT TÀI KHOẢN"));
@@ -3397,7 +3447,15 @@ class MultiRejoinTool {
         if (result.ok) {
           statusHandler.updateJoinStatus(true);
           instance.rejoinCount = (instance.rejoinCount || 0) + 1;
-          this.logEvent("success", `${label}: đã gửi lệnh mở game${config.linkCode ? " (server VIP)" : ""} — lần ${instance.rejoinCount}`);
+          const mode = config.linkCode
+            ? " (server VIP)"
+            : result.lowpop
+              ? ` (server ít người ${result.lowpop.playing}/${result.lowpop.maxPlayers})`
+              : "";
+          this.logEvent("success", `${label}: đã gửi lệnh mở game${mode} — lần ${instance.rejoinCount}`);
+          if (result.lowpopError) {
+            this.logEvent("warning", `${label}: không tìm được server ít người (${result.lowpopError}) — đã join thường`);
+          }
         } else {
           instance.status = "Lỗi mở game";
           instance.info = result.error || "am start thất bại";
@@ -3843,7 +3901,8 @@ class ConfigEditor {
             ["User ID", Utils.maskSensitiveInfo(config.userId)],
             ["Game", `${config.gameName || "Unknown"} (${config.placeId || "Unknown"})`],
             ["Nhịp quét", `${config.delaySec || "Unknown"} giây`],
-            ["Server VIP", config.linkCode ? "ĐÃ CẤU HÌNH" : "KHÔNG", config.linkCode ? "1;32" : "2;37"]
+            ["Server VIP", config.linkCode ? "ĐÃ CẤU HÌNH" : "KHÔNG", config.linkCode ? "1;32" : "2;37"],
+            ["Kiểu join", config.linkCode ? "SERVER VIP" : "SERVER ÍT NGƯỜI", config.linkCode ? "1;32" : "1;35"]
           ], "CHI TIẾT CẤU HÌNH"));
           console.log(UIRenderer.options([
             { key: "1", label: "Thay đổi game", description: "Chọn game hoặc Place ID mới" },
@@ -3867,6 +3926,7 @@ class ConfigEditor {
                   ["Game", game.name, "1;32"],
                   ["Place ID", game.placeId],
                   ["Server VIP", game.linkCode ? "ĐÃ CẤU HÌNH" : "KHÔNG"],
+                  ["Kiểu join", game.linkCode ? "SERVER VIP" : "SERVER ÍT NGƯỜI"],
                   ["Kết quả", "ĐÃ CẬP NHẬT", "1;32"]
                 ], "CẬP NHẬT GAME"));
                 break;
