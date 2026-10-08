@@ -39,11 +39,25 @@ if (process.env.PATH && !process.env.PATH.includes(TERMUX_BIN)) {
   process.env.PATH = `${TERMUX_BIN}:${process.env.PATH}`;
 }
 
+/** Tìm lệnh trong PATH ngay trong tiến trình (trước đây spawn `sh -c "command -v ..."`: mỗi lần spawn trên Android tốn hàng chục ms). */
+function hasCommand(name) {
+  const fsx = require("fs");
+  const pathx = require("path");
+  for (const dir of String(process.env.PATH || "").split(pathx.delimiter)) {
+    if (!dir) continue;
+    try {
+      const file = pathx.join(dir, name);
+      if (!fsx.statSync(file).isFile()) continue;
+      fsx.accessSync(file, fsx.constants.X_OK);
+      return true;
+    } catch { }
+  }
+  return false;
+}
+
 function ensureSystemDependencies() {
-  try {
-    execSync("command -v sqlite3", { stdio: "ignore" });
-  } catch {
-    const isRoot = execSync("id -u", { encoding: 'utf8' }).trim() === "0";
+  if (!hasCommand("sqlite3")) {
+    const isRoot = typeof process.getuid === "function" && process.getuid() === 0;
 
     if (isRoot) {
       console.warn("[-] Chưa tìm thấy sqlite3 và đang chạy dưới quyền Root.");
@@ -239,12 +253,14 @@ try {
   console.warn(`[!] Không load được figlet, dùng tiêu đề dự phòng: ${e.message}`);
 }
 
-let screenshot = null;
-try {
-  screenshot = require("screenshot-desktop");
-} catch (e) {
-  screenshot = null;
-}
+// screenshot-desktop chỉ là phương án dự phòng cuối của takeScreenshot: nạp khi thật sự cần (khỏi tốn 1 lượt dò module lúc khởi động).
+let screenshot;
+const loadScreenshot = () => {
+  if (screenshot === undefined) {
+    try { screenshot = require("screenshot-desktop"); } catch (_) { screenshot = null; }
+  }
+  return screenshot;
+};
 
 // ---- proxy:begin ----
 /**
@@ -520,15 +536,23 @@ class Utils {
     fs.renameSync(tempPath, filePath);
   }
 
-  static ensureRoot() {
-    let uid = "";
+  /** UID hiện tại, đọc thẳng từ tiến trình (không spawn `id -u`). NaN nếu không xác định được. */
+  static currentUid() {
+    if (typeof process.getuid === "function") return process.getuid();
     try {
-      uid = execSync("id -u", { encoding: "utf8" }).trim();
-    } catch (e) {
-      console.error("Không kiểm tra được quyền hiện tại:", e.message);
+      return Number(execSync("id -u", { encoding: "utf8" }).trim());
+    } catch (_) {
+      return NaN;
+    }
+  }
+
+  static ensureRoot() {
+    const uid = Utils.currentUid();
+    if (Number.isNaN(uid)) {
+      console.error("Không kiểm tra được quyền hiện tại.");
       process.exit(1);
     }
-    if (uid === "0") return;
+    if (uid === 0) return;
 
     console.log("Cần quyền root, chuyển qua su...");
     // Truyền CONFIG_DIR sang tiến trình root để cả 2 phía luôn dùng chung 1 thư mục config
@@ -632,6 +656,16 @@ class Utils {
   // Cache danh sách server public theo "placeId:kiểu lọc" (dùng chung cho nhiều tài khoản cùng game).
   static _serverCache = new Map();
   static _serverInflight = new Map();
+
+  /** Danh sách server có thể tới ~1000 phần tử / place và trước đây không bao giờ bị xoá -> bỏ bản cũ để tool chạy nhiều giờ không phình RAM. */
+  static _pruneCaches(now = Date.now()) {
+    for (const [key, hit] of Utils._serverCache) {
+      if (now - hit.at > 10 * 60 * 1000) Utils._serverCache.delete(key);
+    }
+    for (const [jobId, list] of Utils._reservations) {
+      if (!list.length || now - list[list.length - 1] >= LOWPOP_RESERVE_MS) Utils._reservations.delete(jobId);
+    }
+  }
 
   // Mỗi host Roblox có 1 "cổng": request tới cùng host đi TUẦN TỰ, cách nhau tối thiểu API_MIN_GAP_MS, và khi 1 request
   // dính 429 thì CẢ HÀNG ĐỢI của host đó cùng chờ. Cloud phone / nhiều tài khoản chung IP rất dễ chạm giới hạn tốc độ của
@@ -750,6 +784,7 @@ class Utils {
       if (page < maxPages - 1) await sleep(pageDelayMs);
     }
     Utils._serverCache.set(`${placeId}:${excludeFull ? 1 : 0}`, { at: Date.now(), list: all, partialError });
+    Utils._pruneCaches();
     return all;
   }
 
@@ -1234,19 +1269,20 @@ class Utils {
 
     // Lỗi cũ: execSync mặc định chỉ nhận 1MB stdout, mà ảnh PNG cả màn hình điện thoại thường 1.5–5MB
     // -> ENOBUFS -> tính năng chụp ảnh gần như luôn rơi xuống file thông tin hệ thống. Nâng lên 64MB.
-    const opts = { stdio: ["ignore", "pipe", "pipe"], maxBuffer: 64 * 1024 * 1024, timeout: 20000 };
+    // Chạy bất đồng bộ: execFileSync trước đây chặn cả vòng giám sát + giao diện (tới 20s) mỗi lần gửi webhook.
+    const opts = { encoding: "buffer", maxBuffer: 64 * 1024 * 1024, timeout: 20000 };
     const attempts = [
-      () => execFileSync("screencap", ["-p"], opts),
-      () => execFileSync("su", ["-c", "screencap -p"], opts),
+      async () => (await execFileAsync("screencap", ["-p"], opts)).stdout,
+      async () => (await execFileAsync("su", ["-c", "screencap -p"], opts)).stdout,
     ];
 
     let lastError = null;
     for (const run of attempts) {
       try {
-        const img = run();
+        const img = await run();
         if (!isPng(img)) throw new Error("dữ liệu ảnh không hợp lệ");
         const filepath = path.join(TMP_DIR, `screenshot_${stamp}.png`);
-        fs.writeFileSync(filepath, img, { mode: 0o600 });
+        await fs.promises.writeFile(filepath, img, { mode: 0o600 });
         console.log(`[*] Đã chụp ảnh màn hình (${Math.round(img.length / 1024)} KB)`);
         return filepath;
       } catch (e) {
@@ -1256,8 +1292,9 @@ class Utils {
     console.error(`[-] Lỗi khi chụp ảnh với screencap: ${lastError ? lastError.message : "không rõ"}`);
 
     try {
-      if (!screenshot) throw new Error("screenshot-desktop không khả dụng");
-      const img = await screenshot();
+      const shot = loadScreenshot();
+      if (!shot) throw new Error("screenshot-desktop không khả dụng");
+      const img = await shot();
       const filepath = path.join(TMP_DIR, `screenshot_${stamp}.png`);
       fs.writeFileSync(filepath, img, { mode: 0o600 });
       return filepath;
@@ -1402,28 +1439,38 @@ class Utils {
       const prefix = this.loadPackagePrefixConfig();
       let result = "";
 
-      // Danh sách các phương pháp gọi pm bền bỉ nhất trên Android/Termux
+      // Danh sách các phương pháp gọi pm bền bỉ nhất trên Android/Termux (%F = chuỗi lọc theo prefix)
       const methods = [
-        "unset LD_PRELOAD LD_LIBRARY_PATH; pm list packages",
-        "unset LD_PRELOAD LD_LIBRARY_PATH; cmd package list packages",
-        "unset LD_PRELOAD LD_LIBRARY_PATH; /system/bin/pm list packages",
-        "pm list packages",
-        "cmd package list packages",
-        "su -c 'unset LD_PRELOAD LD_LIBRARY_PATH; pm list packages'"
+        "unset LD_PRELOAD LD_LIBRARY_PATH; pm list packages%F",
+        "unset LD_PRELOAD LD_LIBRARY_PATH; cmd package list packages%F",
+        "unset LD_PRELOAD LD_LIBRARY_PATH; /system/bin/pm list packages%F",
+        "pm list packages%F",
+        "cmd package list packages%F",
+        "su -c 'unset LD_PRELOAD LD_LIBRARY_PATH; pm list packages%F'"
       ];
 
-      for (const method of methods) {
-        try {
-          result = execSync(method, {
-            encoding: 'utf8',
-            stdio: ['ignore', 'pipe', 'pipe'],
-            shell: true
-          });
-          if (result && result.includes('package:')) break;
-        } catch (e) {
-          continue;
+      // `pm list packages <lọc>` chỉ trả các package chứa chuỗi lọc (vài dòng thay vì hàng trăm). Có timeout để
+      // lệnh treo (vd. `su` chờ cấp quyền) không làm đứng cả tool. prefix đã được isValidPrefix kiểm tra nên an toàn khi nhúng vào shell.
+      const runPm = (filter) => {
+        const suffix = filter ? ` ${filter}` : "";
+        for (const method of methods) {
+          try {
+            const out = execSync(method.replace("%F", suffix), {
+              encoding: 'utf8',
+              stdio: ['ignore', 'pipe', 'pipe'],
+              shell: true,
+              timeout: 20000,
+              maxBuffer: 8 * 1024 * 1024
+            });
+            if (out && out.includes('package:')) return out;
+          } catch (e) {
+            continue;
+          }
         }
-      }
+        return "";
+      };
+      // Lọc trước (nhanh); không ra gì thì quét đầy đủ để còn cảnh báo "có thể đang dùng bản mod" bên dưới.
+      result = runPm(prefix) || runPm("");
 
       if (!result) {
         console.error(`[-] Mọi nỗ lực quét packages bằng pm/cmd đều thất bại.`);
@@ -1558,8 +1605,18 @@ class Utils {
     }
   }
 
-  static getRobloxCookie(packageName) {
-    console.log(`[*] [${Utils.packageLabel(packageName)}] Đang lấy cookie ROBLOSECURITY...`);
+  static _cookieSeq = 0;
+
+  /**
+   * Đọc cookie .ROBLOSECURITY của 1 package (bất đồng bộ).
+   * Trước đây chạy toàn bằng execFileSync: mỗi lần tốn 4-6 tiến trình con (cp, rồi `su -c cp` cho cả file -journal / -wal
+   * thường không tồn tại, rồi sqlite3) và CHẶN cả vòng giám sát + giao diện trong lúc chờ. Giờ: đang là root (luôn đúng
+   * sau ensureRoot) thì chép thẳng bằng fs; chỉ chép -journal / -wal khi file có thật; cp / su -c cp chỉ còn là phương án
+   * dự phòng; sqlite3 chạy bất đồng bộ và có timeout.
+   */
+  static async getRobloxCookie(packageName) {
+    const label = Utils.packageLabel(packageName);
+    console.log(`[*] [${label}] Đang lấy cookie ROBLOSECURITY...`);
 
     if (!/^[A-Za-z0-9_.]+$/.test(String(packageName || ""))) {
       console.error(`[-] Tên package không hợp lệ: ${packageName}`);
@@ -1567,20 +1624,25 @@ class Utils {
     }
 
     const srcDb = `/data/data/${packageName}/app_webview/Default/Cookies`;
-    const stamp = `${process.pid}_${Date.now()}`;
+    const stamp = `${process.pid}_${Date.now()}_${Utils._cookieSeq++}`;
     // Ưu tiên thư mục riêng tư (0700). /sdcard chỉ là phương án cuối vì mọi app đều đọc được ở đó.
     const candidates = [
       path.join(TMP_DIR, `ck_${stamp}.db`),
       `/sdcard/cookies_temp_${stamp}.db`
     ];
+    const isRoot = Utils.currentUid() === 0;
+    const exists = (p) => { try { fs.accessSync(p); return true; } catch { return false; } };
 
-    const copyFile = (from, to) => {
+    const copyFile = async (from, to) => {
+      if (isRoot) {
+        try { await fs.promises.copyFile(from, to); return true; } catch (_) { /* rơi xuống cp / su bên dưới */ }
+      }
       try {
-        execFileSync("cp", [from, to], { stdio: "pipe" });
+        await execFileAsync("cp", [from, to], { timeout: 15000 });
         return true;
       } catch {
         try {
-          execFileSync("su", ["-c", `cp ${shQuote(from)} ${shQuote(to)}`], { stdio: "pipe" });
+          await execFileAsync("su", ["-c", `cp ${shQuote(from)} ${shQuote(to)}`], { timeout: 15000 });
           return true;
         } catch {
           return false;
@@ -1592,51 +1654,60 @@ class Utils {
     let dbCopy = null;
     try {
       for (const target of candidates) {
-        if (copyFile(srcDb, target)) {
+        if (await copyFile(srcDb, target)) {
           dbCopy = target;
           created.push(target);
           break;
         }
       }
       if (!dbCopy) {
-        console.error(`[-] [${Utils.packageLabel(packageName)}] Không sao chép được database cookie (cần quyền root).`);
+        console.error(`[-] [${label}] Không sao chép được database cookie (cần quyền root).`);
         return null;
       }
       try { fs.chmodSync(dbCopy, 0o600); } catch (_) { }
 
       // Sao chép kèm journal/wal (nếu có) để không bỏ sót dữ liệu chưa ghi hẳn vào file chính.
-      for (const suffix of ["-journal", "-wal"]) {
-        if (copyFile(`${srcDb}${suffix}`, `${dbCopy}${suffix}`)) created.push(`${dbCopy}${suffix}`);
-      }
+      const extras = await Promise.all(["-journal", "-wal"].map(async (suffix) => {
+        const from = `${srcDb}${suffix}`;
+        if (isRoot && !exists(from)) return null; // không có file thì khỏi tốn tiến trình con thử chép
+        const to = `${dbCopy}${suffix}`;
+        return (await copyFile(from, to)) ? to : null;
+      }));
+      for (const file of extras) if (file) created.push(file);
 
       let cookieValue;
       try {
-        cookieValue = execFileSync(
+        const query = execFileAsync(
           "sqlite3",
           [dbCopy, "SELECT value FROM cookies WHERE name = '.ROBLOSECURITY' LIMIT 1"],
-          { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] }
-        ).trim();
+          { encoding: "utf8", timeout: 15000, maxBuffer: 1024 * 1024 }
+        );
+        if (query.child && query.child.stdin) query.child.stdin.end();
+        cookieValue = String((await query).stdout || "").trim();
       } catch (err) {
-        console.error(`[-] [${Utils.packageLabel(packageName)}] Lỗi khi query sqlite3: ${String(err.message).split("\n")[0]}`);
+        console.error(`[-] [${label}] Lỗi khi query sqlite3: ${String(err.message).split("\n")[0]}`);
         return null;
       }
 
       if (!cookieValue) {
-        console.error(`[-] [${Utils.packageLabel(packageName)}] Không tìm được cookie ROBLOSECURITY (đã đăng nhập chưa?).`);
+        console.error(`[-] [${label}] Không tìm được cookie ROBLOSECURITY (đã đăng nhập chưa?).`);
         return null;
       }
 
       if (!cookieValue.startsWith("_")) cookieValue = "_" + cookieValue;
       return `.ROBLOSECURITY=${cookieValue}`;
     } catch (e) {
-      console.error(`[-] [${Utils.packageLabel(packageName)}] Lỗi khi lấy cookie: ${e.message}`);
+      console.error(`[-] [${label}] Lỗi khi lấy cookie: ${e.message}`);
       return null;
     } finally {
       for (const file of created) {
         try {
           fs.unlinkSync(file);
-        } catch {
-          try { execFileSync("rm", ["-f", file], { stdio: "ignore" }); } catch (_) { }
+        } catch (e) {
+          // ENOENT = file đã mất (sqlite3 tự xoá -wal khi đóng) -> khỏi spawn `rm`.
+          if (!e || e.code !== "ENOENT") {
+            try { await execFileAsync("rm", ["-f", file]); } catch (_) { }
+          }
         }
       }
     }
@@ -1650,11 +1721,7 @@ class Utils {
   }
 
   static async openEditor(rl, initialContent = "") {
-    let hasNano = false;
-    try {
-      execSync("command -v nano", { stdio: "ignore" });
-      hasNano = true;
-    } catch (_) { }
+    const hasNano = hasCommand("nano");
 
     if (hasNano) {
       const tempFile = path.join(TMP_DIR, `script_${Date.now()}.txt`);
@@ -2232,7 +2299,7 @@ class GameSelector {
       throw new Error("Link có mã server nhưng thiếu Place ID. Hãy dán đủ link .../games/ID/...?privateServerLinkCode=...");
     }
     if (target.kind === "share") {
-      const value = typeof cookie === "function" ? cookie() : cookie;
+      const value = typeof cookie === "function" ? await cookie() : cookie;
       const info = await GameSelector.resolveShareLink(target.shareCode, value);
       return { placeId: info.placeId, name: "Private Server", linkCode: info.linkCode };
     }
@@ -2903,7 +2970,8 @@ class UIRenderer {
   }
 
   static stripAnsi(text) {
-    return String(text ?? "").replace(/\x1b\[[0-?]*[ -/]*[@-~]/g, "");
+    const s = String(text ?? "");
+    return s.indexOf("\x1b") === -1 ? s : s.replace(/\x1b\[[0-?]*[ -/]*[@-~]/g, "");
   }
 
   static _chars(text) {
@@ -2911,7 +2979,20 @@ class UIRenderer {
   }
 
   static _len(text) {
-    return this._chars(text).length;
+    const s = this.stripAnsi(text);
+    // Chuỗi ASCII in được (đa số dòng vẽ khung): độ dài = s.length, khỏi normalize + cấp phát mảng.
+    if (/^[\x20-\x7e]*$/.test(s)) return s.length;
+    // Có dấu / Unicode: đếm code point bằng vòng lặp charCodeAt (không tạo mảng, không dùng iterator như for...of).
+    const u = s.normalize("NFC");
+    let n = u.length;
+    for (let i = 0; i < u.length - 1; i++) {
+      const c = u.charCodeAt(i);
+      if (c >= 0xd800 && c <= 0xdbff) {
+        const d = u.charCodeAt(i + 1);
+        if (d >= 0xdc00 && d <= 0xdfff) { n--; i++; }
+      }
+    }
+    return n;
   }
 
   static _width(max = 94) {
@@ -3952,7 +4033,7 @@ class MultiRejoinTool {
         ["Package", packageName]
       ], "PACKAGE ĐANG XỬ LÝ"));
 
-      const cookie = Utils.getRobloxCookie(packageName);
+      const cookie = await Utils.getRobloxCookie(packageName);
       if (!cookie) {
         console.log(UIRenderer.message("error", `Không lấy được cookie cho ${packageName}; đã bỏ qua.`));
         skippedPackages.push(packageInfo.displayName);
@@ -4364,7 +4445,7 @@ class MultiRejoinTool {
 
     for (const packageName of selectedPackages) {
       const config = configs[packageName];
-      const cookie = Utils.getRobloxCookie(packageName);
+      const cookie = await Utils.getRobloxCookie(packageName);
 
       if (!cookie) {
         console.log(UIRenderer.message("error", `Không lấy được cookie cho ${packageName}, bỏ qua...`));
@@ -4466,7 +4547,7 @@ class MultiRejoinTool {
       const now = Date.now();
       if (now - (instance.cookieRefreshAt || 0) >= COOKIE_REFRESH_MS) {
         instance.cookieRefreshAt = now;
-        const fresh = Utils.getRobloxCookie(instance.packageName);
+        const fresh = await Utils.getRobloxCookie(instance.packageName);
         if (fresh && fresh !== instance.user.cookie) {
           instance.user.cookie = fresh;
           instance.user.csrf = null;
@@ -4530,6 +4611,14 @@ class MultiRejoinTool {
         this._noteServer(instance, `Không tra được số người: ${(info && info.message) || "lỗi không rõ"}`);
       }
     } catch (_) { }
+  }
+
+  /** Cập nhật số giây đếm ngược của từng instance (gọi mỗi giây, kể cả khi 1 nhịp kiểm tra đang chạy dở). */
+  _refreshCountdowns(now = Date.now()) {
+    for (const instance of this.instances) {
+      const delayMs = Math.max(15, Number(instance.config.delaySec) || 30) * 1000;
+      instance.countdownSeconds = Math.ceil(Math.max(0, delayMs - (now - instance.lastCheck)) / 1000);
+    }
   }
 
   /** Một nhịp giám sát: kiểm tra song song các instance đến hạn, rồi mở lại game tuần tự (giãn cách). */
@@ -4670,6 +4759,15 @@ class MultiRejoinTool {
     const restoreConsole = this._captureLogs();
     const unbindKeys = this._bindLiveKeys(rl);
     let renderCounter = 0;
+    // Nhịp kiểm tra chạy NỀN (mỗi lần tối đa 1 nhịp): trước đây vòng lặp `await this._tick()` nên 1 request chậm
+    // (tới HTTP_TIMEOUT) hoặc đợt mở game giãn cách LAUNCH_STAGGER_MS làm đứng cả khung hình và đồng hồ.
+    let tickRun = null;
+    const kickTick = () => {
+      if (tickRun) return;
+      tickRun = this._tick()
+        .catch((e) => this.logEvent("error", `Lỗi vòng giám sát: ${e.message}`))
+        .finally(() => { tickRun = null; });
+    };
 
     try {
       this.logEvent("info", `Bắt đầu giám sát ${this.instances.length} instance`);
@@ -4683,7 +4781,8 @@ class MultiRejoinTool {
             nextAutoexecCheck = tickStart + 15 * 60 * 1000;
           }
 
-          await this._tick();
+          this._refreshCountdowns();
+          kickTick();
 
           // Lên lịch theo thời gian thật (trước đây đếm số vòng lặp nên bị lệch khi mỗi vòng chạy lâu hơn 1 giây),
           // và gửi nền để không chặn việc giám sát trong lúc chụp ảnh / tải lên.
@@ -5075,7 +5174,7 @@ class ConfigEditor {
             switch (editChoice.trim()) {
               case "1": {
                 const selector = new GameSelector();
-                const game = await selector.chooseGame(rl, Utils.getRobloxCookie(packageName));
+                const game = await selector.chooseGame(rl, await Utils.getRobloxCookie(packageName));
                 config.placeId = game.placeId;
                 config.gameName = game.name;
                 config.linkCode = game.linkCode;
