@@ -1124,6 +1124,17 @@ class WorldScanner {
     return String(data.universeId);
   }
 
+  static _universeCache = new Map();
+
+  /** universeId của 1 place, có cache (1 game có thể có nhiều world/place cùng universe). */
+  static async universeOfCached(placeId) {
+    const key = String(placeId);
+    if (WorldScanner._universeCache.has(key)) return WorldScanner._universeCache.get(key);
+    const id = await WorldScanner.universeOf(key);
+    WorldScanner._universeCache.set(key, id);
+    return id;
+  }
+
   static async gameInfo(universeId) {
     try {
       const data = await httpGetJson("https://games.roblox.com/v1/games", { params: { universeIds: universeId } });
@@ -1586,7 +1597,7 @@ class StatusHandler {
   }
 
   /** Phân tích dữ liệu presence thuần (không xét lỗi mạng / thời gian chờ). */
-  analyzePresence(presence, targetRootPlaceId) {
+  analyzePresence(presence, targetRootPlaceId, targetUniverseId = null) {
     if (!presence || presence.userPresenceType === undefined) {
       return {
         status: "Không rõ",
@@ -1635,7 +1646,12 @@ class StatusHandler {
       };
     }
 
-    if (String(actual) !== String(targetRootPlaceId)) {
+    // 1 game có nhiều world: đúng map nếu placeId/rootPlaceId khớp, HOẶC cùng universe với place mục tiêu.
+    const target = String(targetRootPlaceId);
+    const sameUniverse = targetUniverseId && presence.universeId &&
+      String(presence.universeId) === String(targetUniverseId);
+    const samePlace = [presence.placeId, presence.rootPlaceId].some((v) => v !== undefined && v !== null && String(v) === target);
+    if (!samePlace && !sameUniverse) {
       return {
         status: "Sai map",
         info: `User đang trong game nhưng sai rootPlaceId (${actual}). Đã rejoin đúng map! `,
@@ -1657,7 +1673,7 @@ class StatusHandler {
    *  - Lỗi mạng / lỗi xác thực: KHÔNG mở lại game (trước đây mọi lỗi mạng đều bị coi là offline -> đóng/mở lại game vô cớ).
    *  - Vừa mở game xong: chờ LAUNCH_GRACE_MS để game kịp load, tránh mở lại đè lên lần đang vào.
    */
-  evaluate(check, targetPlaceId, now = Date.now()) {
+  evaluate(check, targetPlaceId, now = Date.now(), targetUniverseId = null) {
     if (check && check.error) {
       this.failStreak++;
       const auth = check.status === 401;
@@ -1673,7 +1689,7 @@ class StatusHandler {
     }
     this.failStreak = 0;
 
-    const analysis = this.analyzePresence(check ? check.presence : null, targetPlaceId);
+    const analysis = this.analyzePresence(check ? check.presence : null, targetPlaceId, targetUniverseId);
     if (analysis.shouldLaunch && this.hasLaunched && now - this.joinedAt < LAUNCH_GRACE_MS) {
       const left = Math.ceil((LAUNCH_GRACE_MS - (now - this.joinedAt)) / 1000);
       return {
@@ -3723,7 +3739,15 @@ class MultiRejoinTool {
     for (const { instance, check } of results) {
       const { config, statusHandler } = instance;
       const label = Utils.packageLabel(instance.packageName);
-      const analysis = statusHandler.evaluate(check, config.placeId);
+      let targetUniverseId = instance.targetUniverseId || null;
+      const pr = check && check.presence;
+      if (!targetUniverseId && pr && pr.userPresenceType === 2 && config.placeId) {
+        try {
+          targetUniverseId = await WorldScanner.universeOfCached(config.placeId);
+          instance.targetUniverseId = targetUniverseId;
+        } catch (_) { /* không tra được universe -> so theo placeId như cũ */ }
+      }
+      const analysis = statusHandler.evaluate(check, config.placeId, Date.now(), targetUniverseId);
       const previous = String(instance.status || "").trim();
 
       instance.lastCheck = Date.now();
