@@ -85,9 +85,16 @@ const path = require("path");
 const os = require("os");
 const Table = require("cli-table3");
 const util = require("util");
-const http = require("http");
 const https = require("https");
-const tls = require("tls");
+
+/**
+ * Dùng CHUNG 1 HTTPS agent có keep-alive cho mọi request tới API Roblox.
+ * Mặc định axios mở kết nối mới (TCP + bắt tay TLS) cho TỪNG request; tool poll liên tục nhiều giờ,
+ * mỗi instance 1 nhịp/15-120s nên số lần bắt tay rất lớn -> tốn CPU pin của điện thoại và dễ chậm dần.
+ * maxSockets giới hạn số kết nối mở cùng lúc (Roblox có nhiều host, mỗi host giữ vài socket).
+ */
+const HTTP_AGENT = new https.Agent({ keepAlive: true, maxSockets: 16, maxFreeSockets: 8, timeout: 60000 });
+axios.defaults.httpsAgent = HTTP_AGENT;
 
 /**
  * Thư mục lưu cấu hình NGOÀI repo.
@@ -196,7 +203,6 @@ const WORLD_PROBE_CONCURRENCY = 1;     // quét world: dò TUẦN TỰ từng pl
 const WORLD_PROBE_GAP_MS = 1200;       // quét world: nghỉ giữa 2 lần dò place (endpoint servers/Public bị Roblox giới hạn rất gắt)
 const WORLD_PROBE_BUDGET_MS = 30000;   // quét world: dò tuần tự, quá chừng này thì dừng (world còn lại hiện "chưa dò", bấm R để dò tiếp)
 const API_MIN_GAP_MS = 700;            // mọi request tới cùng 1 host Roblox đi tuần tự và cách nhau tối thiểu chừng này (chống 429 khi nhiều máy/tài khoản chung IP)
-const LOWPOP_STALE_MS = 180000;        // bị 429 mà không lấy được danh sách server mới thì dùng lại danh sách cũ (tối đa chừng này) thay vì join thường
 const WORLD_PROBE_LIMIT = 25;          // quét world: lấy N server ít người nhất của mỗi place để thống kê (10/25/50/100)
 const WORLD_PAGE_SIZE = 8;             // danh sách chọn world: số world mỗi trang
 const SERVER_INFO_REFRESH_MS = 45000;  // làm mới số người trên server mỗi instance tối đa 45s/lần
@@ -209,6 +215,7 @@ const AUTO_REJOIN_MIN_MINUTES = 1;      // chu kỳ auto rejoin nhỏ nhất (0 
 const AUTO_REJOIN_MAX_MINUTES = 1440;   // tối đa 24 giờ
 const UNIVERSE_RETRY_MS = 20000;       // tra universe của place bị lỗi thì 20s sau mới tra lại (thành công thì nhớ vĩnh viễn)
 const UNIVERSE_HOLD_CHECKS = 3;        // chưa tra được universe: tối đa N lần kiểm tra liên tiếp KHÔNG kết luận "Sai map" (tránh đá user khỏi world phụ)
+const UNIVERSE_CACHE_MAX = 2000;       // placeId -> universeId nhớ vĩnh viễn: chặn trần để quét nhiều game trong nhiều giờ không phình RAM
 const RECENT_GAMES_LIMIT = 5;           // số game "tài khoản hay chơi" hiển thị khi chọn game (trước đây là 10)
 const USER_AGENT = "Mozilla/5.0 (Linux; Android 10; Termux)";
 
@@ -263,272 +270,6 @@ const loadScreenshot = () => {
   }
   return screenshot;
 };
-
-// ---- proxy:begin ----
-/**
- * PROXY cho các request CÔNG KHAI tới API Roblox (dò server / world / universe) khi bị 429.
- * Chỉ request không cookie đi qua đây (Utils._get); cookie, đăng nhập và mở game luôn dùng IP máy.
- *
- * Nguồn proxy (HTTP / HTTPS-CONNECT, không hỗ trợ SOCKS):
- *   - file  ~/.roblox-rejoin/proxies.txt  (mỗi dòng 1 proxy; dòng `free` = bật proxy miễn phí tự lấy)
- *   - biến môi trường ROBLOX_PROXY="host:port,host:port,..."   ROBLOX_FREE_PROXY=1
- * Định dạng 1 proxy: host:port | host:port:user:pass | user:pass@host:port | http://user:pass@host:port
- *
- * Request vẫn là HTTPS đầu-cuối qua đường hầm CONNECT (kiểm tra chứng chỉ như bình thường) nên proxy
- * không đọc / sửa được nội dung. Proxy dính 429 / lỗi thì tạm nghỉ rồi đổi proxy khác; hết proxy thì dùng IP máy.
- */
-const PROXY_LIST_PATH = cfgPath("proxies.txt");
-const PROXY_FREE_URL = "https://free-proxy-list.net/en/anonymous-proxy.html";
-const PROXY_PROBE_URL = "https://games.roblox.com/v1/games?universeIds=1"; // chỉ cần Roblox trả JSON (không cần dữ liệu thật)
-const PROXY_CONNECT_TIMEOUT_MS = 8000;
-const PROXY_PROBE_TIMEOUT_MS = 8000;
-const PROXY_PROBE_CONCURRENCY = 8;
-const PROXY_FREE_CANDIDATES = 40;        // tối đa N proxy miễn phí được thử mỗi lần làm mới
-const PROXY_FREE_KEEP = 8;               // giữ tối đa N proxy dùng được
-const PROXY_FREE_MIN_ALIVE = 2;          // còn ít hơn N proxy miễn phí sống thì lấy lại danh sách
-const PROXY_FREE_REFRESH_MS = 5 * 60 * 1000; // không lấy lại danh sách thường xuyên hơn chừng này
-const PROXY_COOLDOWN_429_MS = 90 * 1000; // proxy bị Roblox giới hạn tốc độ: nghỉ chừng này
-const PROXY_COOLDOWN_FREE_BAD_MS = 10 * 60 * 1000; // proxy miễn phí lỗi: nghỉ lâu (hay chết)
-const PROXY_COOLDOWN_FILE_BAD_MS = 2 * 60 * 1000;  // proxy của người dùng lỗi: nghỉ ngắn
-const PROXY_MAX_SWITCH = 4;              // mỗi request đổi proxy tối đa N lần rồi mới dùng IP máy
-
-/** Đường hầm HTTPS qua proxy HTTP: CONNECT host:port rồi bọc TLS (có kiểm tra chứng chỉ). Không cần package ngoài. */
-class ProxyTunnelAgent extends https.Agent {
-  constructor(proxy, tlsOptions = {}) {
-    super({ keepAlive: false });
-    this.proxy = proxy;
-    this.tlsOptions = tlsOptions;
-  }
-
-  createConnection(options, callback) {
-    const targetHost = options.hostname || options.host;
-    const targetPort = options.port || 443;
-    const headers = { Host: `${targetHost}:${targetPort}` };
-    if (this.proxy.auth) headers["Proxy-Authorization"] = `Basic ${Buffer.from(this.proxy.auth).toString("base64")}`;
-
-    let finished = false;
-    const done = (err, sock) => {
-      if (finished) return;
-      finished = true;
-      callback(err, sock);
-    };
-
-    const req = http.request({
-      host: this.proxy.host,
-      port: this.proxy.port,
-      method: "CONNECT",
-      path: `${targetHost}:${targetPort}`,
-      headers,
-      timeout: PROXY_CONNECT_TIMEOUT_MS
-    });
-    req.once("connect", (res, socket) => {
-      if (res.statusCode !== 200) {
-        socket.destroy();
-        const err = new Error(`proxy CONNECT ${res.statusCode}`);
-        err.code = "EPROXY";
-        err.proxyStatus = res.statusCode;
-        return done(err);
-      }
-      const secure = tls.connect({ ...this.tlsOptions, socket, servername: options.servername || targetHost });
-      secure.setTimeout(PROXY_CONNECT_TIMEOUT_MS, () => secure.destroy(new Error("proxy TLS timeout")));
-      secure.once("secureConnect", () => { secure.setTimeout(0); done(null, secure); });
-      secure.once("error", (e) => done(e));
-    });
-    req.once("timeout", () => req.destroy(new Error("proxy connect timeout")));
-    req.once("error", (e) => done(e));
-    req.end();
-  }
-}
-
-class ProxyPool {
-  static list = [];          // { host, port, auth, key, source: "file"|"free", coolUntil, fails, agent }
-  static loaded = false;
-  static freeOn = false;
-  static freeAt = 0;
-  static freeInflight = null;
-  static cursor = 0;
-
-  /** Hiểu 1 dòng proxy. Trả về null nếu sai định dạng / SOCKS. */
-  static parse(raw, source = "file") {
-    let s = String(raw || "").trim();
-    let scheme = "";
-    s = s.replace(/^[a-z][a-z0-9+.-]*:\/\//i, (m) => { scheme = m; return ""; });
-    if (/^socks/i.test(scheme) || !s) return null;
-    let auth = null;
-    let hostPort = s;
-    const at = s.lastIndexOf("@");
-    if (at >= 0) {
-      auth = s.slice(0, at);
-      hostPort = s.slice(at + 1);
-    }
-    hostPort = hostPort.replace(/\/+$/, "");
-    const parts = hostPort.split(":");
-    let host;
-    let port;
-    if (parts.length === 2) {
-      [host, port] = parts;
-    } else if (parts.length >= 4 && at < 0) {
-      host = parts[0];
-      port = parts[1];
-      auth = `${parts[2]}:${parts.slice(3).join(":")}`;
-    } else {
-      return null;
-    }
-    port = Number(port);
-    if (!host || /\s/.test(host) || !Number.isInteger(port) || port < 1 || port > 65535) return null;
-    const px = { host, port, auth, key: `${host}:${port}`, source, coolUntil: 0, fails: 0, agent: null };
-    px.agent = new ProxyTunnelAgent(px);
-    return px;
-  }
-
-  /** Đọc proxies.txt + biến môi trường (1 lần). */
-  static load() {
-    if (ProxyPool.loaded) return;
-    ProxyPool.loaded = true;
-    const lines = [];
-    try { lines.push(...fs.readFileSync(PROXY_LIST_PATH, "utf8").split(/\r?\n/)); } catch (_) { }
-    if (process.env.ROBLOX_PROXY) lines.push(...process.env.ROBLOX_PROXY.split(/[\s,;]+/));
-    if (/^(1|true|yes|on)$/i.test(String(process.env.ROBLOX_FREE_PROXY || ""))) ProxyPool.freeOn = true;
-    const seen = new Set();
-    for (let raw of lines) {
-      raw = String(raw).split(/\s+#/)[0].trim();
-      if (!raw || raw.startsWith("#")) continue;
-      if (/^free$/i.test(raw)) { ProxyPool.freeOn = true; continue; }
-      const px = ProxyPool.parse(raw, "file");
-      if (!px || seen.has(px.key)) continue;
-      seen.add(px.key);
-      ProxyPool.list.push(px);
-    }
-  }
-
-  /** Bảng proxy miễn phí: HTML free-proxy-list.net -> ["ip:port", ...] (chỉ proxy hỗ trợ HTTPS, bỏ cổng 80), xáo trộn. */
-  static parseFreeHtml(html) {
-    const out = [];
-    const rowRe = /<tr>([\s\S]*?)<\/tr>/g;
-    let row;
-    while ((row = rowRe.exec(String(html || ""))) !== null) {
-      const cells = [];
-      const tdRe = /<td[^>]*>([\s\S]*?)<\/td>/g;
-      let td;
-      while ((td = tdRe.exec(row[1])) !== null) cells.push(td[1].replace(/<[^>]*>/g, "").trim());
-      // Cột: IP | Port | Code | Country | Anonymity | Google | Https | Last checked
-      if (cells.length >= 7 && cells[6].toLowerCase() === "yes" &&
-        /^\d{1,3}(\.\d{1,3}){3}$/.test(cells[0]) && /^\d+$/.test(cells[1]) && cells[1] !== "80") {
-        out.push(`${cells[0]}:${cells[1]}`);
-      }
-    }
-    const unique = [...new Set(out)];
-    for (let i = unique.length - 1; i > 0; i--) {
-      const j = Math.floor(Math.random() * (i + 1));
-      [unique[i], unique[j]] = [unique[j], unique[i]];
-    }
-    return unique;
-  }
-
-  /** Thử thật 1 proxy: đi qua nó tới Roblox, phải nhận JSON (không phải trang chặn 403 / lỗi proxy). */
-  static async probe(px) {
-    try {
-      const res = await axios.get(PROXY_PROBE_URL, {
-        headers: { "User-Agent": USER_AGENT, Accept: "application/json" },
-        timeout: PROXY_PROBE_TIMEOUT_MS,
-        httpsAgent: px.agent,
-        proxy: false,
-        validateStatus: () => true
-      });
-      const s = res.status;
-      return s < 500 && ![403, 407, 429].includes(s) && Boolean(res.data) && typeof res.data === "object";
-    } catch (_) {
-      return false;
-    }
-  }
-
-  /** Lấy danh sách proxy miễn phí, thử thật từng cái, giữ lại các cái dùng được. Không bao giờ ném lỗi. */
-  static async refreshFree(onStatus = () => { }) {
-    let candidates = [];
-    try {
-      onStatus("Đang lấy danh sách proxy miễn phí...");
-      const res = await axios.get(PROXY_FREE_URL, {
-        headers: {
-          "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/125.0.0.0 Safari/537.36",
-          Accept: "text/html"
-        },
-        timeout: 12000,
-        proxy: false
-      });
-      candidates = ProxyPool.parseFreeHtml(res.data).slice(0, PROXY_FREE_CANDIDATES);
-    } catch (_) { }
-    if (!candidates.length) return 0;
-
-    const picked = [];
-    let next = 0;
-    let tested = 0;
-    const worker = async () => {
-      while (picked.length < PROXY_FREE_KEEP && next < candidates.length) {
-        const px = ProxyPool.parse(candidates[next++], "free");
-        const ok = px ? await ProxyPool.probe(px) : false;
-        tested++;
-        if (ok && picked.length < PROXY_FREE_KEEP) picked.push(px);
-        onStatus(`Đang thử proxy miễn phí ${tested}/${candidates.length} (dùng được ${picked.length})...`);
-      }
-    };
-    await Promise.all(Array.from({ length: PROXY_PROBE_CONCURRENCY }, worker));
-    ProxyPool.list = ProxyPool.list.filter((p) => p.source !== "free").concat(picked);
-    return picked.length;
-  }
-
-  /** Gọi trước khi gửi request: nạp cấu hình, và (nếu bật `free`) làm mới proxy miễn phí khi sắp hết. */
-  static async ensure(onStatus = () => { }) {
-    ProxyPool.load();
-    if (!ProxyPool.freeOn) return;
-    const now = Date.now();
-    const alive = ProxyPool.list.filter((p) => p.source === "free" && p.coolUntil <= now).length;
-    if (alive >= PROXY_FREE_MIN_ALIVE || now - ProxyPool.freeAt < PROXY_FREE_REFRESH_MS) return;
-    if (!ProxyPool.freeInflight) {
-      ProxyPool.freeAt = now;
-      ProxyPool.freeInflight = ProxyPool.refreshFree(onStatus)
-        .catch(() => { })
-        .finally(() => { ProxyPool.freeInflight = null; ProxyPool.freeAt = Date.now(); });
-    }
-    await ProxyPool.freeInflight;
-  }
-
-  /** Proxy kế tiếp đang rảnh (xoay vòng), hoặc null = dùng IP máy. */
-  static pick() {
-    const now = Date.now();
-    const ok = ProxyPool.list.filter((p) => p.coolUntil <= now);
-    if (!ok.length) return null;
-    return ok[ProxyPool.cursor++ % ok.length];
-  }
-
-  static rest(px, ms) {
-    px.coolUntil = Date.now() + ms;
-    px.fails++;
-  }
-
-  /** Lỗi do proxy (không phải do Roblox): mất kết nối, hết giờ, CONNECT bị từ chối, bị chặn 403/407/5xx. */
-  static isProxyFailure(e) {
-    const status = e && e.response && e.response.status;
-    if (!status) return true;
-    return status === 403 || status === 407 || status >= 500;
-  }
-
-  static restBad(px) {
-    ProxyPool.rest(px, px.source === "free" ? PROXY_COOLDOWN_FREE_BAD_MS : PROXY_COOLDOWN_FILE_BAD_MS);
-  }
-
-  /** Tóm tắt để báo người dùng; null nếu không dùng proxy. */
-  static summary() {
-    ProxyPool.load();
-    if (!ProxyPool.list.length && !ProxyPool.freeOn) return null;
-    const now = Date.now();
-    return {
-      total: ProxyPool.list.length,
-      usable: ProxyPool.list.filter((p) => p.coolUntil <= now).length,
-      free: ProxyPool.freeOn
-    };
-  }
-}
-// ---- proxy:end ----
 
 class Utils {
   /** Ghi JSON theo kiểu atomic để tránh hỏng config khi app bị dừng giữa lúc ghi. */
@@ -659,13 +400,26 @@ class Utils {
   static _serverCache = new Map();
   static _serverInflight = new Map();
 
-  /** Danh sách server có thể tới ~1000 phần tử / place và trước đây không bao giờ bị xoá -> bỏ bản cũ để tool chạy nhiều giờ không phình RAM. */
+  /**
+   * Danh sách server có thể tới ~1000 phần tử / place và trước đây không bao giờ bị xoá -> bỏ bản cũ để tool chạy
+   * nhiều giờ không phình RAM. Cũng dọn _universeFail (lỗi tạm thời, hết hạn thì bỏ) và chặn trần _universeCache
+   * (placeId -> universeId là vĩnh viễn nên không tự hết hạn — dùng "Dò world" nhiều game khác nhau trong nhiều giờ
+   * mới cần chặn trần; LRU đơn giản bằng thứ tự chèn của Map).
+   */
   static _pruneCaches(now = Date.now()) {
     for (const [key, hit] of Utils._serverCache) {
       if (now - hit.at > 10 * 60 * 1000) Utils._serverCache.delete(key);
     }
     for (const [jobId, list] of Utils._reservations) {
       if (!list.length || now - list[list.length - 1] >= LOWPOP_RESERVE_MS) Utils._reservations.delete(jobId);
+    }
+    for (const [key, failedAt] of Utils._universeFail) {
+      if (now - failedAt > UNIVERSE_RETRY_MS) Utils._universeFail.delete(key);
+    }
+    const over = Utils._universeCache.size - UNIVERSE_CACHE_MAX;
+    if (over > 0) {
+      const it = Utils._universeCache.keys();
+      for (let i = 0; i < over; i++) Utils._universeCache.delete(it.next().value);
     }
   }
 
@@ -674,22 +428,20 @@ class Utils {
   // Roblox; bắn request song song hoặc thử lại dồn dập chỉ làm 429 nặng thêm.
   static _gates = new Map();
 
-  // Mỗi (host, proxy) có cổng riêng: proxy A bị 429 không làm proxy B / IP máy phải chờ theo.
-  static _gate(url, px = null) {
+  static _gate(url) {
     let host = "";
     try { host = new URL(url).host; } catch (_) { }
-    const key = px ? `${host}|${px.key}` : host;
-    let g = Utils._gates.get(key);
+    let g = Utils._gates.get(host);
     if (!g) {
       g = { tail: Promise.resolve(), nextAt: 0 };
-      Utils._gates.set(key, g);
+      Utils._gates.set(host, g);
     }
     return g;
   }
 
   /** Chờ tới lượt gửi request tới host của url (xếp hàng + giãn cách). */
-  static _throttle(url, px = null) {
-    const g = Utils._gate(url, px);
+  static _throttle(url) {
+    const g = Utils._gate(url);
     const turn = g.tail.then(async () => {
       const wait = g.nextAt - Date.now();
       if (wait > 0) await sleep(wait);
@@ -700,18 +452,14 @@ class Utils {
   }
 
   /** Host vừa báo 429: mọi request kế tiếp tới host đó phải chờ thêm `ms`. */
-  static _backoff(url, ms, px = null) {
-    const g = Utils._gate(url, px);
+  static _backoff(url, ms) {
+    const g = Utils._gate(url);
     g.nextAt = Math.max(g.nextAt, Date.now() + ms);
   }
 
   /** Còn bao lâu nữa host của url mới nhận request (0 nếu rảnh). Dùng để việc không gấp (giám sát) khỏi xếp hàng sau đợt 429. */
   static _waitMs(url) {
-    const now = Date.now();
-    ProxyPool.load();
-    const usable = ProxyPool.list.filter((p) => p.coolUntil <= now);
-    if (usable.length) return Math.max(0, Math.min(...usable.map((p) => Utils._gate(url, p).nextAt - now)));
-    return Math.max(0, Utils._gate(url).nextAt - now);
+    return Math.max(0, Utils._gate(url).nextAt - Date.now());
   }
 
   /**
@@ -720,28 +468,19 @@ class Utils {
    * các lỗi khác ném ra ngay.
    */
   static async _get(url, params = {}, { timeout = HTTP_TIMEOUT, retries = 0 } = {}) {
-    await ProxyPool.ensure();
-    let switched = 0; // số lần đã đổi proxy cho request này
     for (let attempt = 0; ; attempt++) {
-      const px = switched < PROXY_MAX_SWITCH ? ProxyPool.pick() : null; // null = IP máy
-      await Utils._throttle(url, px);
+      await Utils._throttle(url);
       try {
         return await axios.get(url, {
           params,
           headers: { "User-Agent": USER_AGENT, Accept: "application/json" },
-          timeout,
-          ...(px ? { httpsAgent: px.agent, proxy: false } : {})
+          timeout
         });
       } catch (e) {
         const status = e && e.response && e.response.status;
-        if (px) {
-          // Proxy dính 429 / hỏng: cho nghỉ rồi thử NGAY proxy khác (không tính vào `retries`, không bắt cả hàng đợi chờ).
-          if (status === 429) { ProxyPool.rest(px, PROXY_COOLDOWN_429_MS); switched++; attempt--; continue; }
-          if (ProxyPool.isProxyFailure(e)) { ProxyPool.restBad(px); switched++; attempt--; continue; }
-        }
         if (status !== 429) throw e;
         const retryAfter = Number(e.response.headers && e.response.headers["retry-after"]);
-        Utils._backoff(url, clamp(retryAfter > 0 ? retryAfter * 1000 : 2000 * 2 ** attempt, 1000, 15000), px);
+        Utils._backoff(url, clamp(retryAfter > 0 ? retryAfter * 1000 : 2000 * 2 ** attempt, 1000, 15000));
         if (attempt >= retries) throw e;
       }
     }
@@ -1099,6 +838,36 @@ class Utils {
 
   static ask(rl, msg) {
     return new Promise((r) => rl.question(msg, r));
+  }
+
+  /**
+   * Hỏi "Auto rejoin mỗi x phút" bằng menu Bật/Tắt (giống các câu hỏi khác trong tool) thay vì
+   * bắt gõ số 0 để tắt. Chọn "1. Bật" rồi mới hỏi tiếp số phút; "2. Tắt" trả về 0 ngay.
+   * current: giá trị hiện tại (phút) để hiển thị gợi ý / Enter giữ nguyên khi sửa cấu hình.
+   */
+  static async askAutoRejoinMinutes(rl, current = 0) {
+    const curOn = Number(current) > 0;
+    console.log(UIRenderer.renderSection("Rejoin theo x phút", "Tự mở lại game định kỳ, kể cả khi vẫn đang trong game"));
+    console.log(UIRenderer.options([
+      { key: "1", label: "Bật", description: curOn ? `Hiện đang bật: mỗi ${current} phút` : "Nhập số phút để tự rejoin định kỳ", color: "1;32" },
+      { key: "2", label: "Tắt", description: curOn ? "Hiện đang bật — chọn để tắt" : "Hiện đang tắt (giữ nguyên)", color: "2;37" }
+    ], { footer: `Enter = ${curOn ? "1 (giữ bật)" : "2 (giữ tắt)"}` }));
+
+    while (true) {
+      const ans = (await Utils.ask(rl, UIRenderer.prompt("Rejoin theo x phút [1-2]"))).trim();
+      const choice = ans || (curOn ? "1" : "2");
+      if (choice === "2") return 0;
+      if (choice === "1") break;
+      console.log(UIRenderer.message("error", "Nhập 1 (Bật) hoặc 2 (Tắt)."));
+    }
+
+    while (true) {
+      const raw = (await Utils.ask(rl, UIRenderer.prompt(`Số phút [${AUTO_REJOIN_MIN_MINUTES}-${AUTO_REJOIN_MAX_MINUTES}]${curOn ? ` (Enter = ${current})` : ""}`))).trim();
+      if (!raw && curOn) return Number(current);
+      const value = Number(raw);
+      if (Number.isInteger(value) && value >= AUTO_REJOIN_MIN_MINUTES && value <= AUTO_REJOIN_MAX_MINUTES) return value;
+      console.log(UIRenderer.message("error", `Nhập số phút từ ${AUTO_REJOIN_MIN_MINUTES}-${AUTO_REJOIN_MAX_MINUTES}.`));
+    }
   }
 
   static saveMultiConfigs(configs) {
@@ -2049,8 +1818,6 @@ class GameSelector {
     const spin = UIRenderer.spinner("Đang quét các world của game...");
     let scan;
     try {
-      await ProxyPool.ensure((text) => spin.update(text)); // bật `free` trong proxies.txt: lấy + thử proxy ở bước này
-      spin.update("Đang quét các world của game...");
       scan = await Utils.scanWorlds(placeId, {
         onProgress: ({ done, total }) => spin.update(`Đang dò server từng world ${done}/${total}...`)
       });
@@ -2065,14 +1832,6 @@ class GameSelector {
     }
     spin.stop();
 
-    const proxyInfo = ProxyPool.summary();
-    if (proxyInfo) {
-      console.log(UIRenderer.message(
-        "info",
-        `Dò server qua proxy: ${proxyInfo.usable}/${proxyInfo.total} đang dùng được${proxyInfo.free ? " (kèm proxy miễn phí)" : ""}. ` +
-        "Chỉ request công khai đi qua proxy, cookie và mở game vẫn dùng IP máy."
-      ));
-    }
 
     const worlds = scan.worlds;
     const multi = worlds.length > 1;
@@ -3384,11 +3143,15 @@ class UIRenderer {
       cpus = os.cpus() || [];
     } catch (_) { }
 
-    const idle = cpus.reduce((s, c) => s + c.times.idle, 0);
-    const total = cpus.reduce(
-      (s, c) => s + Object.values(c.times).reduce((a, b) => a + b, 0),
-      0
-    );
+    // Cộng trực tiếp từng trường thay vì Object.values(...).reduce(...): bỏ cấp phát 1 mảng/core
+    // mỗi giây trong suốt thời gian giám sát (hàm này được gọi mỗi khung hình).
+    let idle = 0;
+    let total = 0;
+    for (const c of cpus) {
+      const t = c.times;
+      idle += t.idle;
+      total += t.user + t.nice + t.sys + t.idle + t.irq;
+    }
 
     const now = Date.now();
     const prev = this._cpuSample;
@@ -4086,16 +3849,7 @@ class MultiRejoinTool {
         console.log(UIRenderer.message("error", "Giá trị phải nằm trong khoảng 15-120 giây."));
       }
 
-      let autoRejoinMinutes;
-      while (true) {
-        const raw = (await Utils.ask(rl, UIRenderer.prompt(`Auto rejoin mỗi x phút [${AUTO_REJOIN_MIN_MINUTES}-${AUTO_REJOIN_MAX_MINUTES}, 0 = tắt]`))).trim();
-        const value = Number(raw || 0);
-        if (Number.isInteger(value) && (value === 0 || (value >= AUTO_REJOIN_MIN_MINUTES && value <= AUTO_REJOIN_MAX_MINUTES))) {
-          autoRejoinMinutes = value;
-          break;
-        }
-        console.log(UIRenderer.message("error", `Nhập 0 để tắt hoặc số phút từ ${AUTO_REJOIN_MIN_MINUTES}-${AUTO_REJOIN_MAX_MINUTES}.`));
-      }
+      const autoRejoinMinutes = await Utils.askAutoRejoinMinutes(rl, 0);
 
       configs[packageName] = {
         username: user.username,
@@ -4813,6 +4567,7 @@ class MultiRejoinTool {
     const autoexecManager = new AutoexecManager();
     const autoexecConfig = autoexecManager.loadConfig();
     let nextAutoexecCheck = Date.now() + 15 * 60 * 1000;
+    let nextCachePrune = Date.now() + 5 * 60 * 1000; // dọn cache định kỳ (server/universe/reservation) để chạy nhiều giờ không phình RAM
 
     this.events = [];
     const restoreConsole = this._captureLogs();
@@ -4838,6 +4593,11 @@ class MultiRejoinTool {
           if (autoexecConfig && tickStart >= nextAutoexecCheck) {
             autoexecManager.checkAndFix(autoexecConfig);
             nextAutoexecCheck = tickStart + 15 * 60 * 1000;
+          }
+
+          if (tickStart >= nextCachePrune) {
+            Utils._pruneCaches(tickStart);
+            nextCachePrune = tickStart + 5 * 60 * 1000;
           }
 
           this._refreshCountdowns();
@@ -5295,16 +5055,7 @@ class ConfigEditor {
               }
 
               case "4": {
-                let minutes;
-                while (true) {
-                  const input = (await Utils.ask(rl, UIRenderer.prompt(`Auto rejoin [${AUTO_REJOIN_MIN_MINUTES}-${AUTO_REJOIN_MAX_MINUTES} phút, 0 = tắt]`))).trim();
-                  const value = Number(input || 0);
-                  if (Number.isInteger(value) && (value === 0 || (value >= AUTO_REJOIN_MIN_MINUTES && value <= AUTO_REJOIN_MAX_MINUTES))) {
-                    minutes = value;
-                    break;
-                  }
-                  console.log(UIRenderer.message("error", `Nhập 0 để tắt hoặc số phút từ ${AUTO_REJOIN_MIN_MINUTES}-${AUTO_REJOIN_MAX_MINUTES}.`));
-                }
+                const minutes = await Utils.askAutoRejoinMinutes(rl, config.autoRejoinMinutes || 0);
                 config.autoRejoinMinutes = minutes;
                 console.log(UIRenderer.infoCard([
                   ["Package", packageDisplay],
