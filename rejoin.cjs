@@ -171,7 +171,9 @@ const LIVE_REFRESH_TICKS = 1;
 // ---- Tham số vận hành ----
 const HTTP_TIMEOUT = 15000;            // timeout cho MỌI request mạng (trước đây không có -> treo cả tool khi mạng chập chờn)
 const LAUNCH_GRACE_MS = 75 * 1000;     // sau khi gửi lệnh mở game, chờ chừng này rồi mới đánh giá lại (tránh mở lại giữa lúc game đang load)
-const LOWPOP_PICK_POOL = 3;            // join server ít người: chọn ngẫu nhiên trong N server ít người nhất (nhiều tài khoản khỏi dồn vào 1 server)
+const LOWPOP_PICK_POOL = 10;           // join server ít người: chọn ngẫu nhiên trong N server ít người nhất (như Roblox Server Suite: 10) để nhiều tài khoản khỏi dồn vào 1 server
+const SERVER_INFO_REFRESH_MS = 45000;  // làm mới số người trên server mỗi instance tối đa 45s/lần
+const SERVER_INFO_TTL_MS = 30000;      // danh sách server của 1 game được dùng chung 30s (nhiều tài khoản cùng game chỉ tốn 1 request)
 const LAUNCH_STAGGER_MS = 2000;        // giãn cách khi mở nhiều instance cùng lúc cho đỡ nặng máy
 const COOKIE_REFRESH_MS = 3 * 60 * 1000;
 const RECENT_GAMES_LIMIT = 5;           // số game "tài khoản hay chơi" hiển thị khi chọn game (trước đây là 10)
@@ -335,21 +337,41 @@ class Utils {
     return { ok: false, error: lastError };
   }
 
+  // Cache danh sách server public theo "placeId:kiểu lọc" (dùng chung cho nhiều tài khoản cùng game).
+  static _serverCache = new Map();
+  static _serverInflight = new Map();
+
   /**
-   * Tìm server public ÍT NGƯỜI nhất của một game (không dùng cookie -> không lộ cookie).
-   * Roblox: sortOrder=Asc trả server ít người trước; bỏ server đầy; ưu tiên server còn >= 1 người
-   * (server 0 người sắp bị đóng). Trả về { ok, jobId, playing, maxPlayers } hoặc { ok:false, error }.
+   * Gọi API server public của Roblox đúng như các extension (RoPro "Smallest First" + "Not Full", Roblox Server Suite...):
+   *   sortOrder=Asc          -> xếp từ ÍT người lên nhiều người (đảo ngược danh sách mặc định của web)
+   *   excludeFullGames=true  -> bỏ server đã đầy (chỉ bật khi excludeFull)
+   *   limit=100              -> tối đa mỗi trang; trang đầu của Asc đã là 100 server ít người nhất nên không cần phân trang
+   * Không dùng cookie.
+   */
+  static async fetchPublicServers(placeId, { excludeFull = false, timeout = HTTP_TIMEOUT } = {}) {
+    const params = { sortOrder: "Asc", limit: 100 };
+    if (excludeFull) params.excludeFullGames = true;
+    const res = await axios.get(`https://games.roblox.com/v1/games/${placeId}/servers/Public`, {
+      params,
+      headers: { "User-Agent": USER_AGENT, Accept: "application/json" },
+      timeout
+    });
+    const list = ((res.data && res.data.data) || []).filter((sv) => sv && sv.id);
+    Utils._serverCache.set(`${placeId}:${excludeFull ? 1 : 0}`, { at: Date.now(), list });
+    return list;
+  }
+
+  /**
+   * Chọn server ÍT NGƯỜI bằng bộ lọc của Roblox (Asc + không full). Như Roblox Server Suite: lấy 100 server ít người nhất
+   * rồi chọn ngẫu nhiên 1 trong 10 server ít người nhất. Ưu tiên server còn >= 1 người (server 0 người sắp bị đóng).
+   * Trả về { ok, jobId, playing, maxPlayers } hoặc { ok:false, error }.
    */
   static async findLowPopServer(placeId) {
     if (!/^\d+$/.test(String(placeId || ""))) return { ok: false, error: "Place ID không hợp lệ" };
     try {
-      const res = await axios.get(`https://games.roblox.com/v1/games/${placeId}/servers/Public`, {
-        params: { sortOrder: "Asc", excludeFullGames: true, limit: 100 },
-        headers: { "User-Agent": USER_AGENT, Accept: "application/json" },
-        timeout: HTTP_TIMEOUT
-      });
-      const list = ((res.data && res.data.data) || [])
-        .filter((sv) => sv && sv.id && Number(sv.playing) < Number(sv.maxPlayers || Infinity))
+      // Roblox đã lọc full phía server; lọc thêm phía client phòng server vừa đầy giữa chừng.
+      const list = (await Utils.fetchPublicServers(placeId, { excludeFull: true }))
+        .filter((sv) => Number(sv.playing) < Number(sv.maxPlayers || Infinity))
         .sort((a, b) => Number(a.playing) - Number(b.playing));
       if (!list.length) return { ok: false, error: "Không có server public nào còn chỗ" };
 
@@ -361,6 +383,34 @@ class Utils {
       const status = e.response && e.response.status;
       if (status === 429) return { ok: false, error: "Roblox giới hạn tốc độ (429)" };
       return { ok: false, error: status ? `HTTP ${status}` : (e.message || "lỗi mạng") };
+    }
+  }
+
+  /**
+   * Số người hiện có trên 1 server public (theo Job ID). Danh sách KHÔNG lọc full để server đang đầy vẫn hiện 20/20.
+   * Dùng cache dùng chung theo placeId. Trả về { playing, maxPlayers } hoặc null nếu không tra được
+   * (lỗi mạng / server không nằm trong 100 server ít người nhất).
+   */
+  static async lookupServerPlayers(placeId, jobId) {
+    if (!jobId || !/^\d+$/.test(String(placeId || ""))) return null;
+    const key = `${placeId}:0`;
+    try {
+      let list;
+      const hit = Utils._serverCache.get(key);
+      if (hit && Date.now() - hit.at <= SERVER_INFO_TTL_MS) {
+        list = hit.list;
+      } else {
+        let pending = Utils._serverInflight.get(key);
+        if (!pending) {
+          pending = Utils.fetchPublicServers(placeId, { timeout: 8000 }).finally(() => Utils._serverInflight.delete(key));
+          Utils._serverInflight.set(key, pending);
+        }
+        list = await pending;
+      }
+      const sv = list.find((x) => String(x.id) === String(jobId));
+      return sv ? { playing: Number(sv.playing) || 0, maxPlayers: Number(sv.maxPlayers) || 0 } : null;
+    } catch (_) {
+      return null;
     }
   }
 
@@ -1018,7 +1068,7 @@ class GameLauncher {
       const found = await Utils.findLowPopServer(placeId);
       if (found.ok) {
         const result = await Utils.launch(placeId, null, packageName, found.jobId);
-        return { ...result, lowpop: { playing: found.playing, maxPlayers: found.maxPlayers } };
+        return { ...result, lowpop: { jobId: found.jobId, playing: found.playing, maxPlayers: found.maxPlayers } };
       }
       const result = await Utils.launch(placeId, null, packageName);
       return { ...result, lowpopError: found.error };
@@ -1480,7 +1530,12 @@ class StatusHandler {
       };
     }
 
-    if (String(actual) !== String(targetRootPlaceId)) {
+    // Khớp nếu rootPlaceId HOẶC placeId hiện tại trùng với place đã cấu hình. Game nhiều world: nếu cấu hình
+    // world phụ (không phải world gốc) thì rootPlaceId luôn là world gốc -> trước đây bị báo "Sai map" và rejoin liên tục.
+    const matches = [presence.rootPlaceId, presence.placeId].some(
+      (id) => id !== undefined && id !== null && id !== "" && String(id) === String(targetRootPlaceId)
+    );
+    if (!matches) {
       return {
         status: "Sai map",
         info: `User đang trong game nhưng sai rootPlaceId (${actual}). Đã rejoin đúng map! `,
@@ -2427,6 +2482,13 @@ class UIRenderer {
     ], width);
   }
 
+  /** "3/20" khi biết số người trên server hiện tại, ngược lại "". */
+  static _players(instance) {
+    const sv = instance && instance.server;
+    if (!sv || !Number.isFinite(sv.playing)) return "";
+    return sv.maxPlayers ? `${sv.playing}/${sv.maxPlayers}` : String(sv.playing);
+  }
+
   /** Mỗi instance 2 dòng: [chấm package user ... ↻n · đếm ngược] + [trạng thái — thông tin]. */
   static _instancePanel(instances, frame, width) {
     const inner = width - 4;
@@ -2442,7 +2504,8 @@ class UIRenderer {
       const pkg = Utils.packageLabel(instance.packageName);
       const dot = this._dot(instance.status, frame);
 
-      const meta = `↻${instance.rejoinCount || 0} · ${this.formatCountdown(instance.countdownSeconds)}`;
+      const players = this._players(instance);
+      const meta = `↻${instance.rejoinCount || 0}${players ? ` · ${players}` : ""} · ${this.formatCountdown(instance.countdownSeconds)}`;
       const left = Math.max(6, inner - this._len(meta) - 1);
       const pkgW = clamp(Math.floor(left * 0.45), 4, 14);
       const userW = left - 2 - pkgW - 1;
@@ -2507,6 +2570,7 @@ class UIRenderer {
         this.statusColor(instance.status, frame),
         instance.info || "-",
         this._clock(instance.lastCheck),
+        this._players(instance) ? this.color("accent", this._players(instance)) : this.color("dim", "-"),
         this.color("violet", this.formatCountdown(instance.countdownSeconds))
       ];
     });
@@ -2515,9 +2579,9 @@ class UIRenderer {
       summary +
       "\n" +
       this._table(
-        ["PACKAGE", "USER", "TRẠNG THÁI", "THÔNG TIN", "CẬP NHẬT", "QUÉT SAU"],
+        ["PACKAGE", "USER", "TRẠNG THÁI", "THÔNG TIN", "CẬP NHẬT", "NGƯỜI", "QUÉT SAU"],
         rows,
-        [0.18, 0.12, 0.19, 0.27, 0.13, 0.11],
+        [0.16, 0.11, 0.17, 0.23, 0.12, 0.10, 0.11],
         width
       )
     );
@@ -3394,6 +3458,32 @@ class MultiRejoinTool {
     return check;
   }
 
+  /**
+   * Cập nhật số người trên server mà tài khoản đang ở (hiện ở bảng trạng thái).
+   * Lấy Job ID từ presence (gameId); không có thì dùng Job ID lúc join. Không bao giờ ném lỗi.
+   */
+  async _refreshServerInfo(instance, check) {
+    try {
+      const presence = check && check.presence;
+      if (!presence || presence.userPresenceType !== 2 || instance.config.linkCode) return;
+      const jobId = presence.gameId || instance.serverJobId;
+      if (!jobId) return;
+
+      const now = Date.now();
+      if (instance.serverJobId === jobId && now - (instance.serverCheckedAt || 0) < SERVER_INFO_REFRESH_MS) return;
+      instance.serverJobId = jobId;
+      instance.serverCheckedAt = now;
+
+      // Game nhiều world: Job ID thuộc world đang đứng (presence.placeId) chứ không nhất thiết là world đã cấu hình.
+      const info = await Utils.lookupServerPlayers(presence.placeId || instance.config.placeId, jobId);
+      if (info) {
+        instance.server = { jobId, ...info };
+      } else if (instance.server && instance.server.jobId !== jobId) {
+        instance.server = null; // đã sang server khác mà chưa tra được -> bỏ số cũ cho khỏi sai
+      }
+    } catch (_) { }
+  }
+
   /** Một nhịp giám sát: kiểm tra song song các instance đến hạn, rồi mở lại game tuần tự (giãn cách). */
   async _tick() {
     const now = Date.now();
@@ -3410,7 +3500,9 @@ class MultiRejoinTool {
     const results = await Promise.all(due.map(async (instance) => {
       instance.checking = true;
       try {
-        return { instance, check: await this._checkInstance(instance) };
+        const check = await this._checkInstance(instance);
+        await this._refreshServerInfo(instance, check);
+        return { instance, check };
       } catch (e) {
         return { instance, check: { presence: null, error: e.message } };
       } finally {
@@ -3428,6 +3520,7 @@ class MultiRejoinTool {
       instance.lastCheck = Date.now();
       instance.status = analysis.status;
       instance.info = analysis.info;
+      if (analysis.shouldLaunch) instance.server = null; // sắp vào server mới: số người cũ không còn đúng
       instance.presenceType = check && check.presence && check.presence.userPresenceType !== undefined
         ? String(check.presence.userPresenceType)
         : "Unknown";
@@ -3447,6 +3540,11 @@ class MultiRejoinTool {
         if (result.ok) {
           statusHandler.updateJoinStatus(true);
           instance.rejoinCount = (instance.rejoinCount || 0) + 1;
+          instance.server = result.lowpop
+            ? { jobId: result.lowpop.jobId, playing: result.lowpop.playing, maxPlayers: result.lowpop.maxPlayers }
+            : null;
+          instance.serverJobId = result.lowpop ? result.lowpop.jobId : null;
+          instance.serverCheckedAt = Date.now();
           const mode = config.linkCode
             ? " (server VIP)"
             : result.lowpop
