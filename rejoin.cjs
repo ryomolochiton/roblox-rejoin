@@ -139,7 +139,6 @@ const ACTIVITY_CONFIG_PATH = cfgPath("activity_config.json");
 const AUTOEXEC_CONFIG_PATH = cfgPath("autoexec_config.json");
 
 const UI_CONFIG_PATH = cfgPath("ui_config.json");
-const RUN_OPTIONS_PATH = cfgPath("run_options.json");
 
 /**
  * Thư mục tạm RIÊNG TƯ (0700) nằm trong CONFIG_DIR: bản sao cookie DB, ảnh chụp màn hình,
@@ -281,7 +280,7 @@ class Utils {
    * thử `am` rồi `/system/bin/am`, và đọc cả nội dung "Error:" mà am vẫn trả exit code 0.
    * Trả về { ok, error? } — không in log, để màn giám sát tự ghi vào NHẬT KÝ.
    */
-  static async launch(placeId, linkCode = null, packageName, jobId = null) {
+  static async launch(placeId, linkCode = null, packageName) {
     if (!/^[A-Za-z0-9_.]+$/.test(String(packageName || ""))) {
       return { ok: false, error: "Tên package không hợp lệ" };
     }
@@ -292,14 +291,9 @@ class Utils {
       return { ok: false, error: "Mã server VIP không hợp lệ" };
     }
 
-    if (jobId && !/^[\w-]+$/.test(String(jobId))) {
-      return { ok: false, error: "Job ID server không hợp lệ" };
-    }
-
-    // Server VIP (linkCode) được ưu tiên; ngược lại nếu có jobId thì vào đúng server công khai đó.
-    let url = `roblox://placeID=${placeId}`;
-    if (linkCode) url += `&linkCode=${linkCode}`;
-    else if (jobId) url += `&gameInstanceId=${jobId}`;
+    const url = linkCode
+      ? `roblox://placeID=${placeId}&linkCode=${linkCode}`
+      : `roblox://placeID=${placeId}`;
 
     // Activity: dùng giá trị tùy chỉnh nếu hợp lệ, ngược lại luôn dùng mặc định cố định.
     let activity = Utils.loadActivityConfig();
@@ -452,45 +446,6 @@ class Utils {
     } catch (_) { }
     Utils._prefixCache = { value, at: Date.now() };
     return value;
-  }
-
-  /** Tùy chọn chọn ở bước "Chạy Rejoin" (nhớ lại lần chạy trước). autoRejoinMin: 0 = tắt. */
-  static loadRunOptions() {
-    const base = { autoRejoinMin: 0, lowPop: false };
-    try {
-      if (!fs.existsSync(RUN_OPTIONS_PATH)) return base;
-      const parsed = JSON.parse(fs.readFileSync(RUN_OPTIONS_PATH, "utf8"));
-      if (!parsed || typeof parsed !== "object") return base;
-      const min = Math.floor(Number(parsed.autoRejoinMin));
-      return {
-        autoRejoinMin: min >= 1 && min <= 1440 ? min : 0,
-        lowPop: Boolean(parsed.lowPop)
-      };
-    } catch {
-      return base;
-    }
-  }
-
-  static saveRunOptions(options) {
-    try {
-      Utils.writeJsonAtomic(RUN_OPTIONS_PATH, options);
-      return true;
-    } catch (e) {
-      console.error(UIRenderer.message("error", `Không thể lưu tùy chọn chạy: ${e.message}`));
-      return false;
-    }
-  }
-
-  /** Dừng hẳn app Roblox của package (dùng cho auto rejoin định kỳ để vào lại sạch). */
-  static async forceStop(packageName) {
-    if (!/^[A-Za-z0-9_.]+$/.test(String(packageName || ""))) return false;
-    for (const bin of ["am", "/system/bin/am"]) {
-      try {
-        await execFileAsync(bin, ["force-stop", packageName], { timeout: 15000 });
-        return true;
-      } catch (_) { }
-    }
-    return false;
   }
 
   static loadUiConfig() {
@@ -1018,167 +973,9 @@ class Utils {
 
 class GameLauncher {
   /** Trả về kết quả của Utils.launch ({ ok, error? }) để vòng giám sát ghi nhật ký đúng. */
-  static async handleGameLaunch(shouldLaunch, placeId, linkCode, packageName, rejoinOnly = false, jobId = null) {
+  static async handleGameLaunch(shouldLaunch, placeId, linkCode, packageName, rejoinOnly = false) {
     if (!shouldLaunch) return { ok: false, skipped: true };
-    return Utils.launch(placeId, linkCode, packageName, jobId);
-  }
-}
-
-/** GET JSON thẳng tới Roblox (KHÔNG qua proxy), tự chờ & thử lại khi bị 429. Lỗi ném ra có .status. */
-async function httpGetJson(url, { params, headers, retries = 2 } = {}) {
-  for (let attempt = 0; ; attempt++) {
-    try {
-      const res = await axios.get(url, {
-        params,
-        headers: { "User-Agent": USER_AGENT, Accept: "application/json", ...(headers || {}) },
-        timeout: HTTP_TIMEOUT,
-      });
-      return res.data;
-    } catch (e) {
-      const status = e.response && e.response.status;
-      if (status === 429 && attempt < retries) {
-        const retryAfter = Number(e.response.headers && e.response.headers["retry-after"]);
-        await sleep(clamp((retryAfter > 0 ? retryAfter : 2 * (attempt + 1)) * 1000, 1000, 10000));
-        continue;
-      }
-      const err = new Error(
-        status === 429 ? "Roblox giới hạn tốc độ (429)"
-          : status ? `HTTP ${status}`
-            : e.code === "ECONNABORTED" || e.code === "ETIMEDOUT" ? "Hết thời gian chờ"
-              : e.message
-      );
-      err.status = status;
-      throw err;
-    }
-  }
-}
-
-/**
- * JOIN SERVER ÍT NGƯỜI (kiểu extension RoPro / Server Hop): quét danh sách server công khai của Place ID,
- * xếp tăng dần theo số người, chọn server vắng nhất còn chỗ rồi vào thẳng bằng gameInstanceId.
- * Mỗi tài khoản "giữ chỗ" 1 server (claimed) để nhiều instance không đổ vào cùng một server.
- */
-class ServerFinder {
-  static claimed = new Map(); // jobId -> thời điểm giữ chỗ
-  static MAX_PAGES = 5;
-  static CLAIM_TTL_MS = 10 * 60 * 1000;
-
-  static _purge() {
-    const now = Date.now();
-    for (const [id, at] of ServerFinder.claimed) {
-      if (now - at > ServerFinder.CLAIM_TTL_MS) ServerFinder.claimed.delete(id);
-    }
-  }
-
-  /** Trả về { ok, jobId, playing, maxPlayers, scanned } hoặc { ok:false, error }. */
-  static async findLowest(placeId, { exclude = null } = {}) {
-    if (!/^\d+$/.test(String(placeId || ""))) return { ok: false, error: "Place ID không hợp lệ" };
-    ServerFinder._purge();
-
-    let cursor = null;
-    let scanned = 0;
-    try {
-      for (let page = 0; page < ServerFinder.MAX_PAGES; page++) {
-        const params = { sortOrder: "Asc", excludeFullGames: true, limit: 100 };
-        if (cursor) params.cursor = cursor;
-        const data = await httpGetJson(`https://games.roblox.com/v1/games/${placeId}/servers/Public`, { params });
-        const list = Array.isArray(data && data.data) ? data.data : [];
-        scanned += list.length;
-
-        const usable = list.filter((sv) =>
-          sv && /^[\w-]+$/.test(String(sv.id || "")) &&
-          Number(sv.playing) >= 1 && Number(sv.playing) < Number(sv.maxPlayers) &&
-          sv.id !== exclude && !ServerFinder.claimed.has(sv.id)
-        );
-        if (usable.length) {
-          const min = Math.min(...usable.map((sv) => Number(sv.playing)));
-          const pool = usable.filter((sv) => Number(sv.playing) === min);
-          const pick = pool[Math.floor(Math.random() * pool.length)];
-          ServerFinder.claimed.set(pick.id, Date.now());
-          return { ok: true, jobId: String(pick.id), playing: Number(pick.playing), maxPlayers: Number(pick.maxPlayers), scanned };
-        }
-
-        cursor = data && data.nextPageCursor;
-        if (!cursor) break;
-        await sleep(400);
-      }
-      return { ok: false, error: scanned ? "không có server phù hợp" : "game không có server công khai" };
-    } catch (e) {
-      return { ok: false, error: e.message };
-    }
-  }
-}
-
-/** QUÉT WORLD: từ 1 game (Place ID / link / tên) liệt kê mọi place (map) cùng Place ID. */
-class WorldScanner {
-  static parsePlaceId(input) {
-    const text = String(input || "").trim();
-    if (/^\d{3,}$/.test(text)) return text;
-    const m = text.match(/roblox\.com\/(?:[a-z]{2}(?:-[a-z]{2})?\/)?games\/(\d+)/i) || text.match(/[?&]placeId=(\d+)/i);
-    return m ? m[1] : null;
-  }
-
-  static async universeOf(placeId) {
-    const data = await httpGetJson(`https://apis.roblox.com/universes/v1/places/${placeId}/universe`);
-    if (!data || !data.universeId) throw new Error("Không tìm thấy game ứng với Place ID này");
-    return String(data.universeId);
-  }
-
-  static async gameInfo(universeId) {
-    try {
-      const data = await httpGetJson("https://games.roblox.com/v1/games", { params: { universeIds: universeId } });
-      const g = data && data.data && data.data[0];
-      return g ? { name: g.name, rootPlaceId: g.rootPlaceId ? String(g.rootPlaceId) : null, playing: g.playing } : null;
-    } catch (_) {
-      return null;
-    }
-  }
-
-  static async placesOf(universeId, cookie) {
-    const url = `https://develop.roblox.com/v1/universes/${universeId}/places`;
-    const out = [];
-    let cursor = null;
-    for (let page = 0; page < 10; page++) {
-      const params = { limit: 100, sortOrder: "Asc" };
-      if (cursor) params.cursor = cursor;
-      let data;
-      try {
-        data = await httpGetJson(url, { params });
-      } catch (e) {
-        // Một số game chỉ trả danh sách khi có đăng nhập -> thử lại với cookie (chỉ gửi tới roblox.com).
-        if ((e.status === 401 || e.status === 403) && cookie) data = await httpGetJson(url, { params, headers: { Cookie: cookie } });
-        else throw e;
-      }
-      for (const p of (data && data.data) || []) out.push({ id: String(p.id), name: p.name || "(không tên)" });
-      cursor = data && data.nextPageCursor;
-      if (!cursor) break;
-    }
-    return out;
-  }
-
-  /** Tìm game theo tên. Trả về [{ universeId, placeId, name, playing }]. */
-  static async search(keyword) {
-    const seen = new Set();
-    const results = [];
-    const add = (universeId, placeId, name, playing) => {
-      if (!universeId || !placeId || seen.has(String(universeId))) return;
-      seen.add(String(universeId));
-      results.push({ universeId: String(universeId), placeId: String(placeId), name: name || "(không tên)", playing });
-    };
-
-    try {
-      const data = await httpGetJson("https://apis.roblox.com/search-api/omni-search", {
-        params: { searchQuery: keyword, sessionId: require("crypto").randomUUID(), pageType: "all" },
-      });
-      for (const group of (data && data.searchResults) || []) {
-        for (const c of group.contents || []) add(c.universeId, c.rootPlaceId, c.name, c.playerCount);
-      }
-    } catch (_) { }
-    if (results.length) return results;
-
-    const data = await httpGetJson("https://games.roblox.com/v1/games/list", { params: { keyword, maxRows: 10 } });
-    for (const g of (data && data.games) || []) add(g.universeId, g.placeId, g.name, g.playerCount);
-    return results;
+    return Utils.launch(placeId, linkCode, packageName);
   }
 }
 
@@ -1290,7 +1087,7 @@ class GameSelector {
     return this.chooseCustom(rl, cookie);
   }
 
-  static customHint = "Nhập Place ID hoặc dán link server (cần ID map: dùng mục 8)";
+  static customHint = "Nhập Place ID hoặc dán link server (đã hoặc chưa chuyển hướng)";
 
   /** Menu game tài khoản hay chơi. Mục nhập Game ID / link server nằm ở số cuối. */
   async chooseFromRecent(rl, recent, cookie = null) {
@@ -1821,7 +1618,7 @@ class UIRenderer {
     );
   }
 
-  /** Hoạt ảnh chỉ chạy trên terminal thật. Tắt bằng REJOIN_NO_ANIM=1. */
+  /** Hoạt ảnh chỉ chạy trên terminal thật. Tắt bằng REJOIN_NO_ANIM=1 hoặc trong menu 8. Giao diện. */
   static _motionOn() {
     return (
       this.animOn !== false &&
@@ -2362,7 +2159,7 @@ class UIRenderer {
       ["5", "Activity", "Mặc định hoặc tùy chỉnh", "violet"],
       ["6", "Webhook", "Báo cáo trạng thái Discord", "accent"],
       ["7", "Autoexec", "Quản lý script executor", "warn"],
-      ["8", "Quét world", "Lấy Place ID các map", "blue"]
+      ["8", "Giao diện", "Phông chữ, màu, hoạt ảnh", "blue"]
     ];
 
     const cfgTone = configCount > 0 ? "good" : "warn";
@@ -2904,7 +2701,7 @@ class MultiRejoinTool {
       "5": () => this.configureActivity(rl),
       "6": () => this.setupWebhook(rl),
       "7": () => this.setupAutoexec(rl),
-      "8": () => this.scanWorlds(rl),
+      "8": () => this.configureUi(rl),
     };
 
     try {
@@ -3289,153 +3086,73 @@ class MultiRejoinTool {
     }
   }
 
-  /** MỤC 8 — QUÉT WORLD: liệt kê các map (place) của 1 game để lấy Place ID. */
-  async scanWorlds(rl) {
-    UIRenderer.screen("Quét world", "Lấy Place ID các map của một game");
-    console.log(UIRenderer.infoCard([
-      ["Nhập", "Place ID, link game hoặc tên game"],
-      ["Kết quả", "Danh sách world kèm Place ID"],
-      ["Dùng ID", "Dán ở mục 2 hoặc 3 (Game ID / Link server)"],
-      ["Thoát", "Để trống rồi Enter"]
-    ], "QUÉT WORLD"));
-
-    let cookie;
-    const getCookie = () => {
-      if (cookie !== undefined) return cookie;
-      cookie = null;
-      try {
-        const first = Object.keys(Utils.loadMultiConfigs())[0];
-        if (first) cookie = Utils.getRobloxCookie(first) || null;
-      } catch (_) { }
-      return cookie;
-    };
-
+  /** MỤC 8 — GIAO DIỆN: phông chữ banner, bảng màu, hoạt ảnh (lưu vào ui_config.json). */
+  async configureUi(rl) {
     while (true) {
-      const input = (await Utils.ask(rl, UIRenderer.prompt("Place ID / link / tên game"))).trim();
-      if (!input) return true;
-      try {
-        await this._scanWorldsFor(rl, input, getCookie);
-      } catch (e) {
-        console.log(UIRenderer.message("error", `Không quét được: ${e.message}`));
-      }
-    }
-  }
+      const cfg = Utils.loadUiConfig();
+      UIRenderer.applyUiConfig(cfg);
 
-  async _scanWorldsFor(rl, input, getCookie) {
-    let universeId;
-    let info = null;
-    const placeId = WorldScanner.parsePlaceId(input);
+      console.clear();
+      console.log(UIRenderer.renderTitle({ big: true, preview: true }));
+      console.log(UIRenderer.renderSection("Giao diện", "Phông chữ banner, bảng màu, hoạt ảnh"));
 
-    if (placeId) {
-      const spin = UIRenderer.spinner("Đang tìm game theo Place ID...");
-      try {
-        universeId = await WorldScanner.universeOf(placeId);
-        info = await WorldScanner.gameInfo(universeId);
-      } finally {
-        spin.stop();
-      }
-    } else {
-      const spin = UIRenderer.spinner("Đang tìm game theo tên...");
-      let found;
-      try {
-        found = await WorldScanner.search(input);
-      } finally {
-        spin.stop();
-      }
-      if (!found.length) throw new Error("Không tìm thấy game nào với từ khóa này");
-      const shown = found.slice(0, 8);
-      console.log(UIRenderer.options(
-        shown.map((g, i) => ({
-          key: i + 1,
-          label: g.name,
-          description: `Place ID ${g.placeId} • ${g.playing ?? "?"} đang chơi`
-        })),
-        { footer: "Nhập số để quét world, Enter để hủy" }
-      ));
-      const pick = parseInt(await Utils.ask(rl, UIRenderer.prompt("Chọn game")), 10) - 1;
-      if (!(pick >= 0 && pick < shown.length)) {
-        console.log(UIRenderer.message("info", "Đã hủy."));
-        return;
-      }
-      universeId = shown[pick].universeId;
-      info = { name: shown[pick].name, rootPlaceId: shown[pick].placeId };
-    }
+      const fonts = UIRenderer.fontChoices();
+      const fontLabel = (fonts.find((f) => f.key === cfg.font) || fonts[0]).label;
+      const theme = UIRenderer.themes[cfg.theme] || UIRenderer.themes.midnight;
+      console.log(UIRenderer.infoCard([
+        ["Phông chữ", fontLabel, "accent"],
+        ["Bảng màu", theme.label, "violet"],
+        ["Hoạt ảnh", cfg.anim === false ? "TẮT" : "BẬT", cfg.anim === false ? "dim" : "good"],
+        ["Figlet", figlet ? "CÓ — nhiều phông banner" : "KHÔNG — chỉ phông tích hợp", figlet ? "good" : "warn"]
+      ], "HIỆN TẠI"));
+      console.log(UIRenderer.options([
+        { key: "1", label: "Phông chữ banner", description: "Đổi kiểu chữ REJOIN" },
+        { key: "2", label: "Bảng màu", description: "Midnight Cyan / Aurora / Sunset", color: "1;35" },
+        { key: "3", label: "Hoạt ảnh mở đầu", description: "Bật / tắt hiệu ứng banner", color: "1;33" },
+        { key: "0", label: "Quay lại", description: "Trở về menu chính", color: "1;31" }
+      ]));
 
-    const spin = UIRenderer.spinner("Đang quét danh sách world...");
-    let places;
-    let warning = null;
-    try {
-      try {
-        places = await WorldScanner.placesOf(universeId, getCookie());
-      } catch (e) {
-        if (info && info.rootPlaceId) {
-          places = [{ id: info.rootPlaceId, name: info.name || "Map chính" }];
-          warning = `Không lấy được danh sách đầy đủ (${e.message}); chỉ hiện map chính.`;
-        } else {
-          throw e;
+      const choice = (await Utils.ask(rl, UIRenderer.prompt("Lựa chọn [0-3]"))).trim();
+      if (choice === "0" || choice.toLowerCase() === "q") return true;
+
+      if (choice === "1") {
+        console.log(UIRenderer.options(
+          fonts.map((f, i) => ({ key: String(i + 1), label: f.label, description: f.desc })),
+          { footer: "Nhập số để chọn phông, Enter để giữ nguyên" }
+        ));
+        const pick = (await Utils.ask(rl, UIRenderer.prompt(`Phông [1-${fonts.length}]`))).trim();
+        const chosen = fonts[parseInt(pick, 10) - 1];
+        if (chosen) {
+          Utils.saveUiConfig({ ...cfg, font: chosen.key });
+        } else if (pick) {
+          console.log(UIRenderer.message("warning", "Lựa chọn không hợp lệ."));
+          await sleep(900);
         }
-      }
-    } finally {
-      spin.stop();
-    }
-    if (!places.length) throw new Error("Game này không có world nào để hiển thị");
-
-    const root = info && info.rootPlaceId;
-    const LIMIT = 40;
-    console.log(UIRenderer.infoCard([
-      ["Game", (info && info.name) || "Unknown", "1;36"],
-      ["Universe", universeId],
-      ["Số world", String(places.length), "1;32"]
-    ], "KẾT QUẢ QUÉT WORLD"));
-    console.log(UIRenderer.options(
-      places.slice(0, LIMIT).map((p, i) => ({
-        key: i + 1,
-        label: p.name,
-        description: `Place ID ${p.id}${p.id === root ? " • map chính" : ""}`
-      })),
-      { footer: places.length > LIMIT ? `Còn ${places.length - LIMIT} world nữa chưa hiển thị` : "Sao chép Place ID để dùng" }
-    ));
-    if (warning) console.log(UIRenderer.message("warning", warning));
-  }
-
-  /**
-   * Tùy chọn khi chạy (hỏi ngay sau khi chọn package):
-   *  - Auto rejoin mỗi X phút (0 = tắt, rejoin như bình thường)
-   *  - Join server ít người (bỏ qua package dùng server VIP)
-   */
-  async askRunOptions(rl, selectedPackages, configs) {
-    const saved = Utils.loadRunOptions();
-    console.log(UIRenderer.infoCard([
-      ["Auto rejoin", "Vào lại game mỗi X phút (0 = tắt)"],
-      ["Sv ít người", "Quét server theo Place ID, vào server vắng nhất"]
-    ], "TÙY CHỌN CHẠY"));
-
-    let autoRejoinMin;
-    while (true) {
-      const raw = (await Utils.ask(rl, UIRenderer.prompt(`Auto rejoin mỗi X phút [0 = tắt, Enter = ${saved.autoRejoinMin}]`))).trim();
-      if (raw === "") { autoRejoinMin = saved.autoRejoinMin; break; }
-      const n = Number(raw);
-      if (Number.isInteger(n) && n >= 0 && n <= 1440) { autoRejoinMin = n; break; }
-      console.log(UIRenderer.message("error", "Nhập số phút nguyên từ 0 đến 1440 (0 = tắt)."));
-    }
-
-    const allVip = selectedPackages.every((pkg) => configs[pkg] && configs[pkg].linkCode);
-    let lowPop = false;
-    if (allVip) {
-      console.log(UIRenderer.message("info", "Tất cả package đang dùng server VIP nên bỏ qua join server ít người."));
-    } else {
-      while (true) {
-        const raw = (await Utils.ask(rl, UIRenderer.prompt(`Join server ít người? [y/n, Enter = ${saved.lowPop ? "y" : "n"}]`))).trim().toLowerCase();
-        if (raw === "") { lowPop = saved.lowPop; break; }
-        if (["y", "yes", "c", "co", "có"].includes(raw)) { lowPop = true; break; }
-        if (["n", "no", "k", "khong", "không"].includes(raw)) { lowPop = false; break; }
-        console.log(UIRenderer.message("error", "Nhập y hoặc n."));
+      } else if (choice === "2") {
+        const keys = Object.keys(UIRenderer.themes);
+        console.log(UIRenderer.options(
+          keys.map((k, i) => ({
+            key: String(i + 1),
+            label: `${UIRenderer.themes[k].label}  ${UIRenderer._swatch(k)}`,
+            description: UIRenderer.themes[k].desc
+          })),
+          { footer: "Nhập số để chọn bảng màu, Enter để giữ nguyên" }
+        ));
+        const pick = (await Utils.ask(rl, UIRenderer.prompt(`Bảng màu [1-${keys.length}]`))).trim();
+        const chosen = keys[parseInt(pick, 10) - 1];
+        if (chosen) {
+          Utils.saveUiConfig({ ...cfg, theme: chosen });
+        } else if (pick) {
+          console.log(UIRenderer.message("warning", "Lựa chọn không hợp lệ."));
+          await sleep(900);
+        }
+      } else if (choice === "3") {
+        Utils.saveUiConfig({ ...cfg, anim: cfg.anim === false });
+      } else {
+        console.log(UIRenderer.message("warning", "Lựa chọn không hợp lệ."));
+        await sleep(900);
       }
     }
-
-    const options = { autoRejoinMin, lowPop };
-    Utils.saveRunOptions(options);
-    return options;
   }
 
   async startAutoRejoin(rl) {
@@ -3503,15 +3220,11 @@ class MultiRejoinTool {
       console.log(UIRenderer.selectionCard(selectedPackages.map((pkg) => Utils.packageLabel(pkg)), "PACKAGE SẼ CHẠY"));
     }
 
-    const runOptions = await this.askRunOptions(rl, selectedPackages, configs);
-
     console.log(UIRenderer.message("info", "Đang khởi tạo hệ thống multi-instance..."));
-    await this.initializeSelectedInstances(selectedPackages, configs, rl, runOptions);
+    await this.initializeSelectedInstances(selectedPackages, configs, rl);
   }
 
-  async initializeSelectedInstances(selectedPackages, configs, rl, runOptions = { autoRejoinMin: 0, lowPop: false }) {
-    this.runOptions = runOptions;
-    const autoRejoinMs = (Number(runOptions.autoRejoinMin) || 0) * 60 * 1000;
+  async initializeSelectedInstances(selectedPackages, configs, rl) {
     // Cho phép khởi chạy lại trong cùng process mà không nhân đôi instance cũ.
     this.instances = [];
     this.startTime = Date.now();
@@ -3539,11 +3252,7 @@ class MultiRejoinTool {
         lastCheck: 0,
         presenceType: "Unknown",
         // Chỉ để bảng giám sát hiển thị số lần rejoin
-        rejoinCount: 0,
-        autoRejoinMs,
-        nextAutoRejoinAt: autoRejoinMs ? Date.now() + autoRejoinMs : 0,
-        lowPop: Boolean(runOptions.lowPop) && !config.linkCode,
-        lastJobId: null
+        rejoinCount: 0
       });
     }
 
@@ -3561,8 +3270,6 @@ class MultiRejoinTool {
     console.log(UIRenderer.infoCard([
       ["Instance", String(this.instances.length), "1;32"],
       ["Trạng thái", "SẴN SÀNG", "1;32"],
-      ["Auto rejoin", autoRejoinMs ? `Mỗi ${runOptions.autoRejoinMin} phút` : "TẮT", autoRejoinMs ? "1;32" : "2;37"],
-      ["Sv ít người", this.instances.some((i) => i.lowPop) ? "BẬT" : "TẮT", this.instances.some((i) => i.lowPop) ? "1;32" : "2;37"],
       ["Webhook", webhookConfig && webhookConfig.enabled ? "ĐANG BẬT" : "ĐANG TẮT", webhookConfig && webhookConfig.enabled ? "1;32" : "2;37"],
       ["Autoexec", autoexecConfig ? autoexecConfig.executor : "ĐANG TẮT", autoexecConfig ? "1;32" : "2;37"],
       ["Khởi động", "Sau 3 giây"]
@@ -3637,67 +3344,8 @@ class MultiRejoinTool {
     return check;
   }
 
-  /**
-   * Mở game cho 1 instance. Nếu bật "sv ít người" thì quét server trước rồi vào đúng server đó
-   * (quét lỗi thì vẫn vào server thường). forced = auto rejoin định kỳ: dừng hẳn app trước khi mở lại.
-   */
-  async _launchInstance(instance, { forced = false } = {}) {
-    const { config, statusHandler } = instance;
-    const label = Utils.packageLabel(instance.packageName);
-    let jobId = null;
-    let note = config.linkCode ? " (server VIP)" : "";
-
-    if (instance.lowPop && !config.linkCode) {
-      const found = await ServerFinder.findLowest(config.placeId, { exclude: instance.lastJobId });
-      if (found.ok) {
-        jobId = found.jobId;
-        instance.lastJobId = jobId;
-        note = ` (sv ít người ${found.playing}/${found.maxPlayers}, quét ${found.scanned})`;
-      } else {
-        this.logEvent("warning", `${label}: không tìm được server ít người (${found.error}) — vào server thường`);
-      }
-    }
-
-    if (forced) {
-      await Utils.forceStop(instance.packageName);
-      await sleep(2000);
-    }
-
-    const result = await GameLauncher.handleGameLaunch(
-      true, config.placeId, config.linkCode, config.packageName, true, jobId
-    );
-    if (result.ok) {
-      statusHandler.updateJoinStatus(true);
-      instance.rejoinCount = (instance.rejoinCount || 0) + 1;
-      if (instance.autoRejoinMs) instance.nextAutoRejoinAt = Date.now() + instance.autoRejoinMs;
-      if (forced) {
-        instance.status = "Auto rejoin";
-        instance.info = `Rejoin định kỳ mỗi ${this.runOptions.autoRejoinMin} phút`;
-      }
-      this.logEvent("success", `${label}: ${forced ? "auto rejoin" : "đã gửi lệnh mở game"}${note} — lần ${instance.rejoinCount}`);
-    } else {
-      instance.status = "Lỗi mở game";
-      instance.info = result.error || "am start thất bại";
-      // Auto rejoin lỗi: thử lại sau 1 phút thay vì chờ trọn chu kỳ.
-      if (instance.autoRejoinMs) instance.nextAutoRejoinAt = Date.now() + 60 * 1000;
-      this.logEvent("error", `${label}: mở game thất bại — ${instance.info}`);
-    }
-    return result;
-  }
-
-  /** Một nhịp giám sát: auto rejoin đến hạn, kiểm tra song song các instance đến hạn, rồi mở lại game tuần tự (giãn cách). */
+  /** Một nhịp giám sát: kiểm tra song song các instance đến hạn, rồi mở lại game tuần tự (giãn cách). */
   async _tick() {
-    let launched = 0;
-
-    // Auto rejoin định kỳ (autoRejoinMs = 0 là tắt -> rejoin như bình thường).
-    for (const instance of this.instances) {
-      if (instance.autoRejoinMs > 0 && !instance.checking && Date.now() >= instance.nextAutoRejoinAt) {
-        if (launched++ > 0) await sleep(LAUNCH_STAGGER_MS);
-        await this._launchInstance(instance, { forced: true });
-        instance.lastCheck = Date.now();
-      }
-    }
-
     const now = Date.now();
     const due = [];
     for (const instance of this.instances) {
@@ -3720,6 +3368,7 @@ class MultiRejoinTool {
       }
     }));
 
+    let launched = 0;
     for (const { instance, check } of results) {
       const { config, statusHandler } = instance;
       const label = Utils.packageLabel(instance.packageName);
@@ -3742,7 +3391,18 @@ class MultiRejoinTool {
 
       if (analysis.shouldLaunch) {
         if (launched++ > 0) await sleep(LAUNCH_STAGGER_MS);
-        await this._launchInstance(instance);
+        const result = await GameLauncher.handleGameLaunch(
+          true, config.placeId, config.linkCode, config.packageName, true
+        );
+        if (result.ok) {
+          statusHandler.updateJoinStatus(true);
+          instance.rejoinCount = (instance.rejoinCount || 0) + 1;
+          this.logEvent("success", `${label}: đã gửi lệnh mở game${config.linkCode ? " (server VIP)" : ""} — lần ${instance.rejoinCount}`);
+        } else {
+          instance.status = "Lỗi mở game";
+          instance.info = result.error || "am start thất bại";
+          this.logEvent("error", `${label}: mở game thất bại — ${instance.info}`);
+        }
       }
     }
   }
@@ -3763,21 +3423,6 @@ class MultiRejoinTool {
       parts.push(
         UIRenderer.color(webhookOn ? "good" : "muted", "●") + " " +
         UIRenderer.color("dim", UIRenderer.fit(text, Math.max(1, width - 2)).trimEnd())
-      );
-    }
-
-    const auto = this.instances.filter((i) => i.autoRejoinMs > 0);
-    if (auto.length || this.instances.some((i) => i.lowPop)) {
-      const segs = [];
-      if (auto.length) {
-        const nextAt = Math.min(...auto.map((i) => i.nextAutoRejoinAt));
-        const left = Math.max(0, Math.ceil((nextAt - Date.now()) / 1000));
-        segs.push(`Auto rejoin ${this.runOptions.autoRejoinMin}p • kế tiếp ${UIRenderer.formatCountdown(left)}`);
-      }
-      if (this.instances.some((i) => i.lowPop)) segs.push("Sv ít người bật");
-      parts.push(
-        UIRenderer.color("good", "●") + " " +
-        UIRenderer.color("dim", UIRenderer.fit(segs.join(" • "), Math.max(1, width - 2)).trimEnd())
       );
     }
 
