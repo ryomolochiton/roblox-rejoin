@@ -175,7 +175,9 @@ const LOWPOP_LIST_TTL_MS = 8000;       // join server ít người: danh sách s
 const LOWPOP_RESERVE_MS = 120000;      // server vừa được 1 tài khoản chọn thì tính thêm "1 người" trong 2 phút -> các tài khoản khác tự rải sang server ít người kế tiếp
 const WORLD_PLACE_PAGES = 3;           // quét world: liệt kê tối đa N trang x 100 place của 1 game
 const WORLD_PROBE_MAX = 30;            // quét world: chỉ dò server public của tối đa N place (game có hàng trăm place thì không dò hết)
-const WORLD_PROBE_CONCURRENCY = 2;     // quét world: số place dò song song (thấp để không dính giới hạn tốc độ 429)
+const WORLD_PROBE_BUDGET_MS = 30000;   // quét world: dò tuần tự, quá chừng này thì dừng (world còn lại hiện "chưa dò", bấm R để dò tiếp)
+const API_MIN_GAP_MS = 700;            // mọi request tới cùng 1 host Roblox đi tuần tự và cách nhau tối thiểu chừng này (chống 429 khi nhiều máy/tài khoản chung IP)
+const LOWPOP_STALE_MS = 180000;        // bị 429 mà không lấy được danh sách server mới thì dùng lại danh sách cũ (tối đa chừng này) thay vì join thường
 const WORLD_PROBE_LIMIT = 25;          // quét world: lấy N server ít người nhất của mỗi place để thống kê (10/25/50/100)
 const WORLD_PAGE_SIZE = 8;             // danh sách chọn world: số world mỗi trang
 const SERVER_INFO_REFRESH_MS = 45000;  // làm mới số người trên server mỗi instance tối đa 45s/lần
@@ -351,12 +353,53 @@ class Utils {
   static _serverCache = new Map();
   static _serverInflight = new Map();
 
+  // Mỗi host Roblox có 1 "cổng": request tới cùng host đi TUẦN TỰ, cách nhau tối thiểu API_MIN_GAP_MS, và khi 1 request
+  // dính 429 thì CẢ HÀNG ĐỢI của host đó cùng chờ. Cloud phone / nhiều tài khoản chung IP rất dễ chạm giới hạn tốc độ của
+  // Roblox; bắn request song song hoặc thử lại dồn dập chỉ làm 429 nặng thêm.
+  static _gates = new Map();
+
+  static _gate(url) {
+    let host = "";
+    try { host = new URL(url).host; } catch (_) { }
+    let g = Utils._gates.get(host);
+    if (!g) {
+      g = { tail: Promise.resolve(), nextAt: 0 };
+      Utils._gates.set(host, g);
+    }
+    return g;
+  }
+
+  /** Chờ tới lượt gửi request tới host của url (xếp hàng + giãn cách). */
+  static _throttle(url) {
+    const g = Utils._gate(url);
+    const turn = g.tail.then(async () => {
+      const wait = g.nextAt - Date.now();
+      if (wait > 0) await sleep(wait);
+      g.nextAt = Date.now() + API_MIN_GAP_MS;
+    });
+    g.tail = turn.catch(() => { });
+    return turn;
+  }
+
+  /** Host vừa báo 429: mọi request kế tiếp tới host đó phải chờ thêm `ms`. */
+  static _backoff(url, ms) {
+    const g = Utils._gate(url);
+    g.nextAt = Math.max(g.nextAt, Date.now() + ms);
+  }
+
+  /** Còn bao lâu nữa host của url mới nhận request (0 nếu rảnh). Dùng để việc không gấp (giám sát) khỏi xếp hàng sau đợt 429. */
+  static _waitMs(url) {
+    return Math.max(0, Utils._gate(url).nextAt - Date.now());
+  }
+
   /**
-   * GET công khai (không cookie) tới API Roblox. Gặp 429 thì chờ (theo Retry-After nếu có, tối đa 8s) rồi thử lại
-   * tối đa `retries` lần; các lỗi khác ném ra ngay.
+   * GET công khai (không cookie) tới API Roblox, qua cổng xếp hàng ở trên. Gặp 429 thì cả host tạm nghỉ
+   * (theo Retry-After nếu có, ngược lại 2s -> 4s -> 8s..., tối đa 15s) rồi thử lại tối đa `retries` lần;
+   * các lỗi khác ném ra ngay.
    */
   static async _get(url, params = {}, { timeout = HTTP_TIMEOUT, retries = 0 } = {}) {
     for (let attempt = 0; ; attempt++) {
+      await Utils._throttle(url);
       try {
         return await axios.get(url, {
           params,
@@ -365,9 +408,10 @@ class Utils {
         });
       } catch (e) {
         const status = e && e.response && e.response.status;
-        if (status !== 429 || attempt >= retries) throw e;
+        if (status !== 429) throw e;
         const retryAfter = Number(e.response.headers && e.response.headers["retry-after"]);
-        await sleep(clamp(retryAfter > 0 ? retryAfter * 1000 : 1500 * 2 ** attempt, 1000, 8000));
+        Utils._backoff(url, clamp(retryAfter > 0 ? retryAfter * 1000 : 2000 * 2 ** attempt, 1000, 15000));
+        if (attempt >= retries) throw e;
       }
     }
   }
