@@ -171,9 +171,6 @@ const LIVE_REFRESH_TICKS = 1;
 // ---- Tham số vận hành ----
 const HTTP_TIMEOUT = 15000;            // timeout cho MỌI request mạng (trước đây không có -> treo cả tool khi mạng chập chờn)
 const LAUNCH_GRACE_MS = 75 * 1000;     // sau khi gửi lệnh mở game, chờ chừng này rồi mới đánh giá lại (tránh mở lại giữa lúc game đang load)
-const LOWPOP_PICK_POOL = 10;           // join server ít người: chọn ngẫu nhiên trong N server ít người nhất (như Roblox Server Suite: 10) để nhiều tài khoản khỏi dồn vào 1 server
-const SERVER_INFO_REFRESH_MS = 45000;  // làm mới số người trên server mỗi instance tối đa 45s/lần
-const SERVER_INFO_TTL_MS = 30000;      // danh sách server của 1 game được dùng chung 30s (nhiều tài khoản cùng game chỉ tốn 1 request)
 const LAUNCH_STAGGER_MS = 2000;        // giãn cách khi mở nhiều instance cùng lúc cho đỡ nặng máy
 const COOKIE_REFRESH_MS = 3 * 60 * 1000;
 const RECENT_GAMES_LIMIT = 5;           // số game "tài khoản hay chơi" hiển thị khi chọn game (trước đây là 10)
@@ -283,7 +280,7 @@ class Utils {
    * thử `am` rồi `/system/bin/am`, và đọc cả nội dung "Error:" mà am vẫn trả exit code 0.
    * Trả về { ok, error? } — không in log, để màn giám sát tự ghi vào NHẬT KÝ.
    */
-  static async launch(placeId, linkCode = null, packageName, jobId = null) {
+  static async launch(placeId, linkCode = null, packageName, gameInstanceId = null) {
     if (!/^[A-Za-z0-9_.]+$/.test(String(packageName || ""))) {
       return { ok: false, error: "Tên package không hợp lệ" };
     }
@@ -293,15 +290,14 @@ class Utils {
     if (linkCode && !/^[\w-]+$/.test(String(linkCode))) {
       return { ok: false, error: "Mã server VIP không hợp lệ" };
     }
-    if (jobId && !/^[0-9a-fA-F-]{8,64}$/.test(String(jobId))) {
-      return { ok: false, error: "Job ID server không hợp lệ" };
+    if (gameInstanceId && !/^[A-Za-z0-9_-]{8,128}$/.test(String(gameInstanceId))) {
+      return { ok: false, error: "Game Instance ID không hợp lệ" };
     }
 
-    // Ưu tiên: server VIP (linkCode) > server cụ thể (jobId, dùng cho join server ít người) > vào thường.
     const url = linkCode
       ? `roblox://placeID=${placeId}&linkCode=${linkCode}`
-      : jobId
-        ? `roblox://placeID=${placeId}&gameInstanceId=${jobId}`
+      : gameInstanceId
+        ? `roblox://placeID=${placeId}&gameInstanceId=${gameInstanceId}`
         : `roblox://placeID=${placeId}`;
 
     // Activity: dùng giá trị tùy chỉnh nếu hợp lệ, ngược lại luôn dùng mặc định cố định.
@@ -335,83 +331,6 @@ class Utils {
       }
     }
     return { ok: false, error: lastError };
-  }
-
-  // Cache danh sách server public theo "placeId:kiểu lọc" (dùng chung cho nhiều tài khoản cùng game).
-  static _serverCache = new Map();
-  static _serverInflight = new Map();
-
-  /**
-   * Gọi API server public của Roblox đúng như các extension (RoPro "Smallest First" + "Not Full", Roblox Server Suite...):
-   *   sortOrder=Asc          -> xếp từ ÍT người lên nhiều người (đảo ngược danh sách mặc định của web)
-   *   excludeFullGames=true  -> bỏ server đã đầy (chỉ bật khi excludeFull)
-   *   limit=100              -> tối đa mỗi trang; trang đầu của Asc đã là 100 server ít người nhất nên không cần phân trang
-   * Không dùng cookie.
-   */
-  static async fetchPublicServers(placeId, { excludeFull = false, timeout = HTTP_TIMEOUT } = {}) {
-    const params = { sortOrder: "Asc", limit: 100 };
-    if (excludeFull) params.excludeFullGames = true;
-    const res = await axios.get(`https://games.roblox.com/v1/games/${placeId}/servers/Public`, {
-      params,
-      headers: { "User-Agent": USER_AGENT, Accept: "application/json" },
-      timeout
-    });
-    const list = ((res.data && res.data.data) || []).filter((sv) => sv && sv.id);
-    Utils._serverCache.set(`${placeId}:${excludeFull ? 1 : 0}`, { at: Date.now(), list });
-    return list;
-  }
-
-  /**
-   * Chọn server ÍT NGƯỜI bằng bộ lọc của Roblox (Asc + không full). Như Roblox Server Suite: lấy 100 server ít người nhất
-   * rồi chọn ngẫu nhiên 1 trong 10 server ít người nhất. Ưu tiên server còn >= 1 người (server 0 người sắp bị đóng).
-   * Trả về { ok, jobId, playing, maxPlayers } hoặc { ok:false, error }.
-   */
-  static async findLowPopServer(placeId) {
-    if (!/^\d+$/.test(String(placeId || ""))) return { ok: false, error: "Place ID không hợp lệ" };
-    try {
-      // Roblox đã lọc full phía server; lọc thêm phía client phòng server vừa đầy giữa chừng.
-      const list = (await Utils.fetchPublicServers(placeId, { excludeFull: true }))
-        .filter((sv) => Number(sv.playing) < Number(sv.maxPlayers || Infinity))
-        .sort((a, b) => Number(a.playing) - Number(b.playing));
-      if (!list.length) return { ok: false, error: "Không có server public nào còn chỗ" };
-
-      const occupied = list.filter((sv) => Number(sv.playing) > 0);
-      const pool = (occupied.length ? occupied : list).slice(0, LOWPOP_PICK_POOL);
-      const pick = pool[Math.floor(Math.random() * pool.length)];
-      return { ok: true, jobId: String(pick.id), playing: Number(pick.playing) || 0, maxPlayers: Number(pick.maxPlayers) || 0 };
-    } catch (e) {
-      const status = e.response && e.response.status;
-      if (status === 429) return { ok: false, error: "Roblox giới hạn tốc độ (429)" };
-      return { ok: false, error: status ? `HTTP ${status}` : (e.message || "lỗi mạng") };
-    }
-  }
-
-  /**
-   * Số người hiện có trên 1 server public (theo Job ID). Danh sách KHÔNG lọc full để server đang đầy vẫn hiện 20/20.
-   * Dùng cache dùng chung theo placeId. Trả về { playing, maxPlayers } hoặc null nếu không tra được
-   * (lỗi mạng / server không nằm trong 100 server ít người nhất).
-   */
-  static async lookupServerPlayers(placeId, jobId) {
-    if (!jobId || !/^\d+$/.test(String(placeId || ""))) return null;
-    const key = `${placeId}:0`;
-    try {
-      let list;
-      const hit = Utils._serverCache.get(key);
-      if (hit && Date.now() - hit.at <= SERVER_INFO_TTL_MS) {
-        list = hit.list;
-      } else {
-        let pending = Utils._serverInflight.get(key);
-        if (!pending) {
-          pending = Utils.fetchPublicServers(placeId, { timeout: 8000 }).finally(() => Utils._serverInflight.delete(key));
-          Utils._serverInflight.set(key, pending);
-        }
-        list = await pending;
-      }
-      const sv = list.find((x) => String(x.id) === String(jobId));
-      return sv ? { playing: Number(sv.playing) || 0, maxPlayers: Number(sv.maxPlayers) || 0 } : null;
-    } catch (_) {
-      return null;
-    }
   }
 
   static ask(rl, msg) {
@@ -1058,21 +977,105 @@ class Utils {
 }
 
 class GameLauncher {
+  /**
+   * Chọn server theo cách các extension server finder hiện đại sử dụng:
+   * gọi API public với sortOrder=Asc + limit=100, lọc server đầy rồi xếp hạng cục bộ.
+   * Số người là ưu tiên tuyệt đối; nếu bằng nhau mới ưu tiên ping thấp và FPS cao.
+   * Chỉ cần trang đầu vì API đã trả danh sách theo số người tăng dần — tránh quét nhiều
+   * cursor như extension cũ, vừa chậm vừa dễ dính rate limit.
+   */
+  static async findLeastPopulatedServer(placeId) {
+    if (!/^\d+$/.test(String(placeId || ""))) throw new Error("Place ID không hợp lệ");
+
+    const res = await axios.get(`https://games.roblox.com/v1/games/${placeId}/servers/Public`, {
+      params: {
+        sortOrder: "Asc",
+        excludeFullGames: true,
+        limit: 100
+      },
+      headers: { "User-Agent": USER_AGENT, Accept: "application/json" },
+      timeout: HTTP_TIMEOUT
+    });
+
+    const candidates = (Array.isArray(res.data && res.data.data) ? res.data.data : [])
+      .map((server) => ({
+        id: server && server.id ? String(server.id) : "",
+        playing: Number(server && server.playing),
+        maxPlayers: Number(server && server.maxPlayers),
+        ping: Number(server && server.ping),
+        fps: Number(server && server.fps)
+      }))
+      .filter((server) =>
+        server.id &&
+        Number.isFinite(server.playing) &&
+        server.playing >= 0 &&
+        (!Number.isFinite(server.maxPlayers) || server.playing < server.maxPlayers)
+      );
+
+    candidates.sort((a, b) =>
+      (a.playing - b.playing) ||
+      ((Number.isFinite(a.ping) ? a.ping : Infinity) - (Number.isFinite(b.ping) ? b.ping : Infinity)) ||
+      ((Number.isFinite(b.fps) ? b.fps : -Infinity) - (Number.isFinite(a.fps) ? a.fps : -Infinity))
+    );
+
+    return candidates[0] || null;
+  }
+
+  /**
+   * Tìm server hiện tại theo gameId (Job ID) và trả số người đang chơi.
+   * Với game nhiều world phải truyền placeId của world hiện tại, không dùng rootPlaceId.
+   */
+  static async getServerPopulation(placeId, gameId, maxPages = 5) {
+    if (!/^\d+$/.test(String(placeId || "")) || !gameId) return null;
+
+    let cursor = null;
+    for (let page = 0; page < maxPages; page++) {
+      const res = await axios.get(`https://games.roblox.com/v1/games/${placeId}/servers/Public`, {
+        params: {
+          sortOrder: "Asc",
+          excludeFullGames: false,
+          limit: 100,
+          ...(cursor ? { cursor } : {})
+        },
+        headers: { "User-Agent": USER_AGENT, Accept: "application/json" },
+        timeout: HTTP_TIMEOUT
+      });
+      const servers = Array.isArray(res.data && res.data.data) ? res.data.data : [];
+      const found = servers.find((server) => server && String(server.id) === String(gameId));
+      if (found) {
+        const playing = Number(found.playing);
+        const maxPlayers = Number(found.maxPlayers);
+        return {
+          id: String(found.id),
+          playing: Number.isFinite(playing) ? playing : null,
+          maxPlayers: Number.isFinite(maxPlayers) ? maxPlayers : null
+        };
+      }
+      cursor = res.data && res.data.nextPageCursor;
+      if (!cursor) break;
+    }
+    return null;
+  }
+
   /** Trả về kết quả của Utils.launch ({ ok, error? }) để vòng giám sát ghi nhật ký đúng. */
-  static async handleGameLaunch(shouldLaunch, placeId, linkCode, packageName, rejoinOnly = false) {
+  static async handleGameLaunch(shouldLaunch, placeId, linkCode, packageName, rejoinOnly = false, joinLeastServer = false) {
     if (!shouldLaunch) return { ok: false, skipped: true };
 
-    // Luôn join server public ÍT NGƯỜI nhất: mỗi lần rejoin tìm lại (danh sách server đổi liên tục).
-    // Server VIP đã có mã riêng nên bỏ qua. Tìm lỗi thì tự quay về join thường, không làm tool đứng.
-    if (!linkCode) {
-      const found = await Utils.findLowPopServer(placeId);
-      if (found.ok) {
-        const result = await Utils.launch(placeId, null, packageName, found.jobId);
-        return { ...result, lowpop: { jobId: found.jobId, playing: found.playing, maxPlayers: found.maxPlayers } };
+    // Server VIP luôn được ưu tiên theo link đã cấu hình, không áp dụng tìm server public.
+    if (joinLeastServer && !linkCode) {
+      try {
+        const server = await this.findLeastPopulatedServer(placeId);
+        if (server) {
+          const result = await Utils.launch(placeId, null, packageName, server.id);
+          return { ...result, leastServer: true, server };
+        }
+      } catch (e) {
+        // API server có thể lỗi/giới hạn tốc độ; vẫn mở game theo cách thường để auto rejoin không bị gián đoạn.
+        const fallback = await Utils.launch(placeId, null, packageName);
+        return { ...fallback, leastServerFallback: true, serverError: e.message };
       }
-      const result = await Utils.launch(placeId, null, packageName);
-      return { ...result, lowpopError: found.error };
     }
+
     return Utils.launch(placeId, linkCode, packageName);
   }
 }
@@ -1164,6 +1167,7 @@ class GameSelector {
   async chooseGame(rl, cookie = null) {
     // Có cookie -> thử lấy danh sách game tài khoản hay chơi.
     // Lỗi / không có dữ liệu -> nhập Place ID hoặc link server thủ công.
+    let game;
     if (cookie) {
       // Warning của fetchRecentGames được gom lại, in sau khi spinner dừng để không bị vỡ dòng.
       const notes = [];
@@ -1175,14 +1179,73 @@ class GameSelector {
         spin.stop();
       }
       notes.forEach((line) => console.log(line));
-      if (recent.length) {
-        return this.chooseFromRecent(rl, recent, cookie);
-      }
+      if (recent.length) game = await this.chooseFromRecent(rl, recent, cookie);
     }
 
-    // Không có game gần đây (hoặc không lấy được) -> vào thẳng ô nhập Place ID / link server.
-    console.log(UIRenderer.renderSection("Chọn game", "Nhập Place ID hoặc link server"));
-    return this.chooseCustom(rl, cookie);
+    if (!game) {
+      // Không có game gần đây (hoặc không lấy được) -> vào thẳng ô nhập Place ID / link server.
+      console.log(UIRenderer.renderSection("Chọn game", "Nhập Place ID hoặc link server"));
+      game = await this.chooseCustom(rl, cookie);
+    }
+
+    // Chuẩn hóa rootPlaceId để game nhiều world/sub-place không bị nhận nhầm là "Sai map".
+    try {
+      game.rootPlaceId = await GameSelector.resolveRootPlaceId(game.placeId);
+    } catch (_) {
+      // API universe lỗi thì giữ tương thích: coi place đã chọn là root.
+      game.rootPlaceId = String(game.placeId);
+    }
+
+    return this.chooseJoinMode(rl, game);
+  }
+
+  /**
+   * Đổi một place bất kỳ (kể cả world phụ) thành rootPlaceId của universe.
+   * Nếu không lấy được dữ liệu, trả lại chính placeId để luồng cấu hình vẫn tiếp tục.
+   */
+  static async resolveRootPlaceId(placeId) {
+    const id = String(placeId || "");
+    if (!/^\d+$/.test(id)) throw new Error("Place ID không hợp lệ");
+
+    try {
+      const universeRes = await axios.get(`https://apis.roblox.com/universes/v1/places/${id}/universe`, {
+        headers: { "User-Agent": USER_AGENT, Accept: "application/json" },
+        timeout: HTTP_TIMEOUT
+      });
+      const universeId = universeRes.data && universeRes.data.universeId;
+      if (!universeId) return id;
+
+      const gameRes = await axios.get("https://games.roblox.com/v1/games", {
+        params: { universeIds: String(universeId) },
+        headers: { "User-Agent": USER_AGENT, Accept: "application/json" },
+        timeout: HTTP_TIMEOUT
+      });
+      const game = Array.isArray(gameRes.data && gameRes.data.data) ? gameRes.data.data[0] : null;
+      return game && game.rootPlaceId ? String(game.rootPlaceId) : id;
+    } catch (_) {
+      return id;
+    }
+  }
+
+  /** Hỏi cách vào server ngay sau khi người dùng đã chọn game. */
+  async chooseJoinMode(rl, game) {
+    if (game.linkCode) {
+      // Private server đã chỉ định đích đến nên không thể đồng thời chọn server public ít người.
+      return { ...game, joinLeastServer: false };
+    }
+
+    console.log(UIRenderer.renderSection("Chọn server", `${game.name} • Place ID ${game.placeId}`));
+    console.log(UIRenderer.options([
+      { key: "1", label: "Server ít người nhất", description: "Ưu tiên server public còn chỗ có ít người nhất", color: "1;32" },
+      { key: "2", label: "Server thường", description: "Để Roblox tự chọn server" }
+    ], { footer: "Ưu tiên mặc định: server ít người nhất" }));
+
+    while (true) {
+      const ans = (await Utils.ask(rl, UIRenderer.prompt("Cách vào server [1-2, Enter = 1]"))).trim();
+      if (!ans || ans === "1") return { ...game, joinLeastServer: true };
+      if (ans === "2") return { ...game, joinLeastServer: false };
+      console.log(UIRenderer.message("error", "Lựa chọn không hợp lệ. Chọn 1 hoặc 2."));
+    }
   }
 
   static customHint = "Nhập Place ID hoặc dán link server (đã hoặc chưa chuyển hướng)";
@@ -1530,12 +1593,7 @@ class StatusHandler {
       };
     }
 
-    // Khớp nếu rootPlaceId HOẶC placeId hiện tại trùng với place đã cấu hình. Game nhiều world: nếu cấu hình
-    // world phụ (không phải world gốc) thì rootPlaceId luôn là world gốc -> trước đây bị báo "Sai map" và rejoin liên tục.
-    const matches = [presence.rootPlaceId, presence.placeId].some(
-      (id) => id !== undefined && id !== null && id !== "" && String(id) === String(targetRootPlaceId)
-    );
-    if (!matches) {
+    if (String(actual) !== String(targetRootPlaceId)) {
       return {
         status: "Sai map",
         info: `User đang trong game nhưng sai rootPlaceId (${actual}). Đã rejoin đúng map! `,
@@ -2482,13 +2540,6 @@ class UIRenderer {
     ], width);
   }
 
-  /** "3/20" khi biết số người trên server hiện tại, ngược lại "". */
-  static _players(instance) {
-    const sv = instance && instance.server;
-    if (!sv || !Number.isFinite(sv.playing)) return "";
-    return sv.maxPlayers ? `${sv.playing}/${sv.maxPlayers}` : String(sv.playing);
-  }
-
   /** Mỗi instance 2 dòng: [chấm package user ... ↻n · đếm ngược] + [trạng thái — thông tin]. */
   static _instancePanel(instances, frame, width) {
     const inner = width - 4;
@@ -2504,8 +2555,11 @@ class UIRenderer {
       const pkg = Utils.packageLabel(instance.packageName);
       const dot = this._dot(instance.status, frame);
 
-      const players = this._players(instance);
-      const meta = `↻${instance.rejoinCount || 0}${players ? ` · ${players}` : ""} · ${this.formatCountdown(instance.countdownSeconds)}`;
+      const hasPopulation = Number.isFinite(instance.serverPlaying);
+      const population = hasPopulation
+        ? `${instance.serverPlaying}/${Number.isFinite(instance.serverMaxPlayers) ? instance.serverMaxPlayers : "?"} người`
+        : (instance.config && instance.config.linkCode ? "VIP/? người" : "? người");
+      const meta = `${population} · ↻${instance.rejoinCount || 0} · ${this.formatCountdown(instance.countdownSeconds)}`;
       const left = Math.max(6, inner - this._len(meta) - 1);
       const pkgW = clamp(Math.floor(left * 0.45), 4, 14);
       const userW = left - 2 - pkgW - 1;
@@ -2564,13 +2618,17 @@ class UIRenderer {
         (instance.config && instance.config.username) ||
         (instance.user && instance.user.username) ||
         "Unknown";
+      const hasPopulation = Number.isFinite(instance.serverPlaying);
+      const population = hasPopulation
+        ? `${instance.serverPlaying}/${Number.isFinite(instance.serverMaxPlayers) ? instance.serverMaxPlayers : "?"}`
+        : (instance.config && instance.config.linkCode ? "VIP/?" : "-");
       return [
         Utils.packageLabel(instance.packageName),
         Utils.maskSensitiveInfo(username),
         this.statusColor(instance.status, frame),
+        this.color(hasPopulation ? "good" : "dim", population),
         instance.info || "-",
         this._clock(instance.lastCheck),
-        this._players(instance) ? this.color("accent", this._players(instance)) : this.color("dim", "-"),
         this.color("violet", this.formatCountdown(instance.countdownSeconds))
       ];
     });
@@ -2579,9 +2637,9 @@ class UIRenderer {
       summary +
       "\n" +
       this._table(
-        ["PACKAGE", "USER", "TRẠNG THÁI", "THÔNG TIN", "CẬP NHẬT", "NGƯỜI", "QUÉT SAU"],
+        ["PACKAGE", "USER", "TRẠNG THÁI", "NGƯỜI", "THÔNG TIN", "CẬP NHẬT", "QUÉT SAU"],
         rows,
-        [0.16, 0.11, 0.17, 0.23, 0.12, 0.10, 0.11],
+        [0.15, 0.11, 0.17, 0.08, 0.25, 0.13, 0.11],
         width
       )
     );
@@ -2606,8 +2664,7 @@ class UIRenderer {
               ["Game", c.gameName || "Chưa đặt", "violet"],
               ["Place ID", c.placeId || "-", "dim"],
               ["Nhịp quét", c.delaySec ? `${c.delaySec} giây` : "Chưa đặt"],
-              ["Server VIP", c.linkCode ? "ĐÃ CẤU HÌNH" : "KHÔNG", c.linkCode ? "good" : "dim"],
-              ["Kiểu join", c.linkCode ? "SERVER VIP" : "SERVER ÍT NGƯỜI", c.linkCode ? "good" : "accent"]
+              ["Server", c.linkCode ? "VIP" : (c.joinLeastServer ? "ÍT NGƯỜI NHẤT" : "MẶC ĐỊNH"), c.linkCode || c.joinLeastServer ? "good" : "dim"]
             ],
             `CẤU HÌNH ${String(index + 1).padStart(2, "0")}`
           );
@@ -2623,12 +2680,12 @@ class UIRenderer {
         Utils.maskSensitiveInfo(c.username || "Unknown"),
         `${c.gameName || "Chưa đặt"}  (${c.placeId || "-"})`,
         c.delaySec ? `${c.delaySec}s` : "-",
-        c.linkCode ? this.color("good", "VIP") : this.color("accent", "ÍT NGƯỜI")
+        this.color(c.linkCode || c.joinLeastServer ? "good" : "dim", c.linkCode ? "VIP" : (c.joinLeastServer ? "ÍT NGƯỜI" : "MẶC ĐỊNH"))
       ];
     });
 
     return this._table(
-      ["#", "PACKAGE", "TÀI KHOẢN", "GAME / PLACE ID", "NHỊP QUÉT", "JOIN"],
+      ["#", "PACKAGE", "TÀI KHOẢN", "GAME / PLACE ID", "NHỊP QUÉT", "SERVER"],
       rows,
       [0.05, 0.23, 0.17, 0.35, 0.10, 0.10],
       width
@@ -2981,8 +3038,10 @@ class MultiRejoinTool {
         username: user.username,
         userId,
         placeId: game.placeId,
+        rootPlaceId: game.rootPlaceId || game.placeId,
         gameName: game.name,
         linkCode: game.linkCode,
+        joinLeastServer: Boolean(game.joinLeastServer),
         delaySec,
         packageName
       };
@@ -2991,7 +3050,7 @@ class MultiRejoinTool {
       console.log(UIRenderer.infoCard([
         ["Package", packageInfo.displayName],
         ["Game", game.name, "1;36"],
-        ["Kiểu join", game.linkCode ? "SERVER VIP" : "SERVER ÍT NGƯỜI", game.linkCode ? "1;32" : "1;35"],
+        ["Chọn server", game.joinLeastServer ? "ÍT NGƯỜI NHẤT" : (game.linkCode ? "SERVER VIP" : "MẶC ĐỊNH"), game.joinLeastServer ? "1;32" : "2;37"],
         ["Nhịp quét", `${delaySec} giây`],
         ["Kết quả", "ĐÃ CẤU HÌNH", "1;32"]
       ], "HOÀN TẤT TÀI KHOẢN"));
@@ -3343,8 +3402,14 @@ class MultiRejoinTool {
     this.instances = [];
     this.startTime = Date.now();
 
+    let upgradedRootPlaceIds = false;
     for (const packageName of selectedPackages) {
       const config = configs[packageName];
+      // Tự nâng cấp cấu hình cũ: lưu rootPlaceId để game nhiều world không bị báo sai map.
+      if (!config.rootPlaceId && config.placeId) {
+        config.rootPlaceId = await GameSelector.resolveRootPlaceId(config.placeId);
+        upgradedRootPlaceIds = true;
+      }
       const cookie = Utils.getRobloxCookie(packageName);
 
       if (!cookie) {
@@ -3365,10 +3430,17 @@ class MultiRejoinTool {
         countdown: "00s",
         lastCheck: 0,
         presenceType: "Unknown",
+        currentRootPlaceId: null,
+        currentPlaceId: null,
+        currentGameId: null,
+        serverPlaying: null,
+        serverMaxPlayers: null,
         // Chỉ để bảng giám sát hiển thị số lần rejoin
         rejoinCount: 0
       });
     }
+
+    if (upgradedRootPlaceIds) Utils.saveMultiConfigs(configs);
 
     if (this.instances.length === 0) {
       console.log(UIRenderer.infoCard([
@@ -3455,33 +3527,51 @@ class MultiRejoinTool {
         }
       }
     }
-    return check;
-  }
 
-  /**
-   * Cập nhật số người trên server mà tài khoản đang ở (hiện ở bảng trạng thái).
-   * Lấy Job ID từ presence (gameId); không có thì dùng Job ID lúc join. Không bao giờ ném lỗi.
-   */
-  async _refreshServerInfo(instance, check) {
-    try {
-      const presence = check && check.presence;
-      if (!presence || presence.userPresenceType !== 2 || instance.config.linkCode) return;
-      const jobId = presence.gameId || instance.serverJobId;
-      if (!jobId) return;
-
-      const now = Date.now();
-      if (instance.serverJobId === jobId && now - (instance.serverCheckedAt || 0) < SERVER_INFO_REFRESH_MS) return;
-      instance.serverJobId = jobId;
-      instance.serverCheckedAt = now;
-
-      // Game nhiều world: Job ID thuộc world đang đứng (presence.placeId) chứ không nhất thiết là world đã cấu hình.
-      const info = await Utils.lookupServerPlayers(presence.placeId || instance.config.placeId, jobId);
-      if (info) {
-        instance.server = { jobId, ...info };
-      } else if (instance.server && instance.server.jobId !== jobId) {
-        instance.server = null; // đã sang server khác mà chưa tra được -> bỏ số cũ cho khỏi sai
+    const presence = check && check.presence;
+    if (!check.error && presence && presence.userPresenceType === 2) {
+      // Một số tài khoản không được Presence trả rootPlaceId. Khi đó tự đổi world hiện tại
+      // về root place để không rejoin nhầm chỉ vì game vừa teleport sang sub-place.
+      if (!presence.rootPlaceId && presence.placeId) {
+        presence.rootPlaceId = await GameSelector.resolveRootPlaceId(presence.placeId);
       }
-    } catch (_) { }
+
+      // rootPlaceId xác định đúng universe; placeId là world/sub-place hiện tại;
+      // gameId là Job ID để tìm đúng server và số người.
+      instance.currentRootPlaceId = presence.rootPlaceId ? String(presence.rootPlaceId) : null;
+      instance.currentPlaceId = presence.placeId ? String(presence.placeId) : instance.currentRootPlaceId;
+      instance.currentGameId = presence.gameId ? String(presence.gameId) : null;
+
+      if (instance.currentPlaceId && instance.currentGameId) {
+        try {
+          const population = await GameLauncher.getServerPopulation(
+            instance.currentPlaceId,
+            instance.currentGameId
+          );
+          if (population) {
+            instance.serverPlaying = population.playing;
+            instance.serverMaxPlayers = population.maxPlayers;
+            instance.serverPopulationAt = Date.now();
+          } else {
+            instance.serverPlaying = null;
+            instance.serverMaxPlayers = null;
+          }
+        } catch (_) {
+          // Không biến lỗi phụ của API server thành lỗi presence/rejoin.
+          instance.serverPlaying = null;
+          instance.serverMaxPlayers = null;
+        }
+      } else {
+        instance.serverPlaying = null;
+        instance.serverMaxPlayers = null;
+      }
+    } else if (!check.error && (!presence || presence.userPresenceType !== 2)) {
+      instance.currentPlaceId = null;
+      instance.currentGameId = null;
+      instance.serverPlaying = null;
+      instance.serverMaxPlayers = null;
+    }
+    return check;
   }
 
   /** Một nhịp giám sát: kiểm tra song song các instance đến hạn, rồi mở lại game tuần tự (giãn cách). */
@@ -3500,9 +3590,7 @@ class MultiRejoinTool {
     const results = await Promise.all(due.map(async (instance) => {
       instance.checking = true;
       try {
-        const check = await this._checkInstance(instance);
-        await this._refreshServerInfo(instance, check);
-        return { instance, check };
+        return { instance, check: await this._checkInstance(instance) };
       } catch (e) {
         return { instance, check: { presence: null, error: e.message } };
       } finally {
@@ -3514,13 +3602,20 @@ class MultiRejoinTool {
     for (const { instance, check } of results) {
       const { config, statusHandler } = instance;
       const label = Utils.packageLabel(instance.packageName);
-      const analysis = statusHandler.evaluate(check, config.placeId);
+      const analysis = statusHandler.evaluate(check, config.rootPlaceId || config.placeId);
       const previous = String(instance.status || "").trim();
 
       instance.lastCheck = Date.now();
       instance.status = analysis.status;
       instance.info = analysis.info;
-      if (analysis.shouldLaunch) instance.server = null; // sắp vào server mới: số người cũ không còn đúng
+      if (
+        !analysis.shouldLaunch &&
+        instance.currentPlaceId &&
+        config.rootPlaceId &&
+        String(instance.currentPlaceId) !== String(config.rootPlaceId)
+      ) {
+        instance.info = `Đúng game • World ${instance.currentPlaceId}`;
+      }
       instance.presenceType = check && check.presence && check.presence.userPresenceType !== undefined
         ? String(check.presence.userPresenceType)
         : "Unknown";
@@ -3535,25 +3630,24 @@ class MultiRejoinTool {
       if (analysis.shouldLaunch) {
         if (launched++ > 0) await sleep(LAUNCH_STAGGER_MS);
         const result = await GameLauncher.handleGameLaunch(
-          true, config.placeId, config.linkCode, config.packageName, true
+          true, config.placeId, config.linkCode, config.packageName, true, config.joinLeastServer
         );
         if (result.ok) {
           statusHandler.updateJoinStatus(true);
           instance.rejoinCount = (instance.rejoinCount || 0) + 1;
-          instance.server = result.lowpop
-            ? { jobId: result.lowpop.jobId, playing: result.lowpop.playing, maxPlayers: result.lowpop.maxPlayers }
-            : null;
-          instance.serverJobId = result.lowpop ? result.lowpop.jobId : null;
-          instance.serverCheckedAt = Date.now();
-          const mode = config.linkCode
-            ? " (server VIP)"
-            : result.lowpop
-              ? ` (server ít người ${result.lowpop.playing}/${result.lowpop.maxPlayers})`
-              : "";
-          this.logEvent("success", `${label}: đã gửi lệnh mở game${mode} — lần ${instance.rejoinCount}`);
-          if (result.lowpopError) {
-            this.logEvent("warning", `${label}: không tìm được server ít người (${result.lowpopError}) — đã join thường`);
+          if (result.leastServer && result.server) {
+            instance.serverPlaying = result.server.playing;
+            instance.serverMaxPlayers = result.server.maxPlayers;
+            instance.serverPopulationAt = Date.now();
           }
+          const serverNote = config.linkCode
+            ? " (server VIP)"
+            : result.leastServer && result.server
+              ? ` (server ít nhất: ${result.server.playing}/${result.server.maxPlayers || "?"})`
+              : result.leastServerFallback
+                ? " (không lấy được server ít người, đã vào thường)"
+                : "";
+          this.logEvent("success", `${label}: đã gửi lệnh mở game${serverNote} — lần ${instance.rejoinCount}`);
         } else {
           instance.status = "Lỗi mở game";
           instance.info = result.error || "am start thất bại";
@@ -3999,8 +4093,7 @@ class ConfigEditor {
             ["User ID", Utils.maskSensitiveInfo(config.userId)],
             ["Game", `${config.gameName || "Unknown"} (${config.placeId || "Unknown"})`],
             ["Nhịp quét", `${config.delaySec || "Unknown"} giây`],
-            ["Server VIP", config.linkCode ? "ĐÃ CẤU HÌNH" : "KHÔNG", config.linkCode ? "1;32" : "2;37"],
-            ["Kiểu join", config.linkCode ? "SERVER VIP" : "SERVER ÍT NGƯỜI", config.linkCode ? "1;32" : "1;35"]
+            ["Server", config.linkCode ? "VIP" : (config.joinLeastServer ? "ÍT NGƯỜI NHẤT" : "MẶC ĐỊNH"), config.linkCode || config.joinLeastServer ? "1;32" : "2;37"]
           ], "CHI TIẾT CẤU HÌNH"));
           console.log(UIRenderer.options([
             { key: "1", label: "Thay đổi game", description: "Chọn game hoặc Place ID mới" },
@@ -4018,13 +4111,14 @@ class ConfigEditor {
                 const selector = new GameSelector();
                 const game = await selector.chooseGame(rl, Utils.getRobloxCookie(packageName));
                 config.placeId = game.placeId;
+                config.rootPlaceId = game.rootPlaceId || game.placeId;
                 config.gameName = game.name;
                 config.linkCode = game.linkCode;
+                config.joinLeastServer = Boolean(game.joinLeastServer);
                 console.log(UIRenderer.infoCard([
                   ["Game", game.name, "1;32"],
                   ["Place ID", game.placeId],
-                  ["Server VIP", game.linkCode ? "ĐÃ CẤU HÌNH" : "KHÔNG"],
-                  ["Kiểu join", game.linkCode ? "SERVER VIP" : "SERVER ÍT NGƯỜI"],
+                  ["Server", game.linkCode ? "VIP" : (game.joinLeastServer ? "ÍT NGƯỜI NHẤT" : "MẶC ĐỊNH")],
                   ["Kết quả", "ĐÃ CẬP NHẬT", "1;32"]
                 ], "CẬP NHẬT GAME"));
                 break;
@@ -4082,8 +4176,10 @@ class ConfigEditor {
                       continue;
                     }
                     config.placeId = game.placeId;
+                    config.rootPlaceId = await GameSelector.resolveRootPlaceId(game.placeId);
                     config.gameName = "Private Server";
                     config.linkCode = game.linkCode;
+                    config.joinLeastServer = false;
                     console.log(UIRenderer.infoCard([
                       ["Place ID", game.placeId, "1;36"],
                       ["Link code", "ĐÃ CẬP NHẬT"],
