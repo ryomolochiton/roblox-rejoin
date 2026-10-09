@@ -75,13 +75,55 @@ echo "$CHOICE" > "$LAST_FILE" 2>/dev/null
 if [ "$CHOICE" = "2" ]; then ENTRY="$ENTRY_LITE"; NAME="LITE"; else ENTRY="$ENTRY_VIP"; NAME="VIP"; fi
 echo "[*] Dang chay ban $NAME..."
 
-# git
-command -v git >/dev/null || { pkg update; pkg install git || exit 1; }
+# ---------- cai package co tu sua loi mirror (404 / Failed to fetch) ----------
+PREFIX_DIR="${PREFIX:-/data/data/com.termux/files/usr}"
+
+# doi sang mirror chinh thuc khi mirror dang dung bi loi thoi / 404
+use_official_mirror() {
+  echo "[*] Mirror loi, doi sang mirror chinh thuc packages.termux.dev..."
+  rm -f "$PREFIX_DIR/etc/termux/chosen_mirrors" 2>/dev/null
+  mkdir -p "$PREFIX_DIR/etc/apt" 2>/dev/null
+  echo "deb https://packages.termux.dev/apt/termux-main stable main" > "$PREFIX_DIR/etc/apt/sources.list"
+  rm -rf "$PREFIX_DIR/var/lib/apt/lists/"* 2>/dev/null
+}
+
+# pkg_install <ten...>: thu lan luot cach thong thuong -> fix-missing -> doi mirror
+pkg_install() {
+  pkg update >/dev/null 2>&1; pkg install "$@" && return 0
+  echo "[!] Cai '$*' loi, thu lai voi --fix-missing..."
+  apt-get update >/dev/null 2>&1; apt-get install -y --fix-missing "$@" && return 0
+  use_official_mirror
+  apt-get update >/dev/null 2>&1; apt-get install -y --fix-missing "$@" && return 0
+  return 1
+}
+
+# tai ma nguon bang tarball (khong can git)
+download_tarball() {
+  T="$(mktemp -d 2>/dev/null || echo "$HOME/.rejoin_dl")"; mkdir -p "$T"
+  URL="$R/archive/refs/heads/main.tar.gz"
+  if command -v curl >/dev/null; then curl -fL --retry 3 -o "$T/r.tgz" "$URL" || return 1
+  elif command -v wget >/dev/null; then wget -O "$T/r.tgz" "$URL" || return 1
+  else echo "[-] Khong co git / curl / wget de tai ma nguon."; return 1; fi
+  mkdir -p "$D"
+  # xoa file cu nhung giu node_modules
+  find "$D" -mindepth 1 -maxdepth 1 ! -name node_modules -exec rm -rf {} + 2>/dev/null
+  tar -xzf "$T/r.tgz" -C "$D" --strip-components=1 || return 1
+  rm -rf "$T"
+  return 0
+}
+
+# git (neu khong cai duoc thi tu dong chuyen sang tai tarball)
+USE_TAR=0
+if ! command -v git >/dev/null; then
+  pkg_install git || { echo "[!] Khong cai duoc git, chuyen sang tai ma nguon truc tiep."; USE_TAR=1; }
+fi
 
 # clone / update
-if [ ! -d "$D/.git" ]; then
+if [ "$USE_TAR" = "1" ]; then
+  download_tarball || { echo "[-] Tai ma nguon that bai. Kiem tra mang roi chay lai."; exit 1; }
+elif [ ! -d "$D/.git" ]; then
   rm -rf "$D"
-  git clone "$R" "$D" || exit 1
+  git clone "$R" "$D" || { echo "[!] git clone loi, thu tai tarball..."; download_tarball || exit 1; }
 else
   cd "$D" || exit 1
   # neu remote cu tro sai repo thi sua lai
@@ -104,11 +146,12 @@ fi
 
 # node
 N="/data/data/com.termux/files/usr/bin/node"
-[ ! -x "$N" ] && { pkg install which >/dev/null 2>&1; N=$(which node); }
-[ -z "${N:-}" ] && { pkg update; pkg upgrade; pkg install nodejs; N=$(which node) || exit 1; }
+[ ! -x "$N" ] && N="$(command -v node 2>/dev/null)"
+[ -z "${N:-}" ] && { pkg_install nodejs; N="$(command -v node 2>/dev/null)"; }
+[ -z "${N:-}" ] && { echo "[-] Khong cai duoc nodejs."; exit 1; }
 
 # sqlite3 (ca 2 ban deu can)
-command -v sqlite3 >/dev/null || pkg install sqlite >/dev/null 2>&1 || true
+command -v sqlite3 >/dev/null || pkg_install sqlite || echo "[!] Chua cai duoc sqlite3 — tool se bao loi khi doc cookie."
 
 # alias khi chay bang su/root (chi them 1 lan, tranh phinh ~/.bashrc moi lan chay)
 S=$(which su 2>/dev/null)
