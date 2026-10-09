@@ -166,8 +166,9 @@ const DEFAULT_ACTIVITY = "com.roblox.client.ActivityProtocolLaunch";
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 const clamp = (value, min, max) => Math.max(min, Math.min(max, value));
-// Giám sát trực tiếp vẽ lại mỗi N nhịp (1 nhịp = 1 giây) để hoạt ảnh và đồng hồ chạy mượt.
-const LIVE_REFRESH_TICKS = 1;
+// Giao diện giám sát trực tiếp được làm mới mỗi 10 giây (tính theo thời gian thật, không đếm vòng lặp).
+// Bấm R hoặc đổi cỡ màn hình thì vẽ lại ngay, không phải chờ hết chu kỳ.
+const LIVE_REFRESH_MS = 10 * 1000;
 
 // ---- Tham số vận hành ----
 const HTTP_TIMEOUT = 15000;            // timeout cho MỌI request mạng (trước đây không có -> treo cả tool khi mạng chập chờn)
@@ -2677,7 +2678,6 @@ class UIRenderer {
         Utils.maskSensitiveInfo(username),
         this.statusColor(instance.status, frame),
         instance.info || "-",
-        this._clock(instance.lastCheck),
         this.color("violet", this.formatCountdown(instance.countdownSeconds))
       ];
     });
@@ -2686,9 +2686,9 @@ class UIRenderer {
       summary +
       "\n" +
       this._table(
-        ["PACKAGE", "USER", "TRẠNG THÁI", "THÔNG TIN", "CẬP NHẬT", "QUÉT SAU"],
+        ["PACKAGE", "USER", "TRẠNG THÁI", "THÔNG TIN", "QUÉT SAU"],
         rows,
-        [0.18, 0.12, 0.19, 0.27, 0.13, 0.11],
+        [0.18, 0.12, 0.19, 0.40, 0.11],
         width
       )
     );
@@ -3623,6 +3623,7 @@ class MultiRejoinTool {
       if (/r/i.test(s)) {
         this.instances.forEach((i) => { i.lastCheck = 0; });
         this.logEvent("info", "Kiểm tra ngay theo yêu cầu (phím R)");
+        this.repaintNow = true;   // làm mới 10 giây/lần -> phải vẽ lại ngay để thấy kết quả kiểm tra
       }
     };
     try { process.stdin.setRawMode(true); } catch (_) { }
@@ -3832,9 +3833,16 @@ class MultiRejoinTool {
     let nextAutoexecCheck = Date.now() + 15 * 60 * 1000;
 
     this.events = [];
+    this.repaintNow = false;
     const restoreConsole = this._captureLogs();
     const unbindKeys = this._bindLiveKeys(rl);
     let renderCounter = 0;
+    let paintCount = 0;   // số lần đã vẽ: dùng làm "frame" để chấm nhịp tim / spinner nhích 1 bước mỗi lần làm mới
+    let lastPaintAt = 0;
+
+    // Làm mới 10 giây/lần nên khi đổi cỡ màn hình (xoay ngang, bật bàn phím...) phải vẽ lại ngay cho khỏi vỡ khung.
+    const onResize = () => { this.repaintNow = true; };
+    if (process.stdout.isTTY) process.stdout.on("resize", onResize);
 
     try {
       this.logEvent("info", `Bắt đầu giám sát ${this.instances.length} instance`);
@@ -3864,11 +3872,19 @@ class MultiRejoinTool {
           this.logEvent("error", `Lỗi vòng giám sát: ${e.message}`);
         }
 
+        // Terminal thật: vẽ lại mỗi LIVE_REFRESH_MS (10 giây), hoặc ngay khi có cờ repaintNow (phím R / đổi cỡ màn hình).
+        // Trừ 250ms vì mỗi vòng lặp dài ~1 giây + độ trễ nhỏ, tránh bị lệch sang vòng thứ 11 (≈11 giây).
         // Ngoài terminal thật (ghi ra file / pipe) chỉ in 1 khung mỗi 30 giây cho đỡ spam.
-        if (process.stdout.isTTY || renderCounter % 30 === 0) {
+        const paintNow = Date.now();
+        const shouldPaint = process.stdout.isTTY
+          ? this.repaintNow || paintNow - lastPaintAt >= LIVE_REFRESH_MS - 250
+          : renderCounter % 30 === 0;
+        if (shouldPaint) {
+          this.repaintNow = false;
+          lastPaintAt = paintNow;
           let frame;
           try {
-            frame = this._buildLiveFrame({ frame: renderCounter, webhookConfig, webhookOn, nextWebhookAt });
+            frame = this._buildLiveFrame({ frame: paintCount++, webhookConfig, webhookOn, nextWebhookAt });
           } catch (e) {
             frame = "\n  R E J O I N\n  " + e.message;
           }
@@ -3879,6 +3895,7 @@ class MultiRejoinTool {
         await sleep(Math.max(100, 1000 - (Date.now() - tickStart)));
       }
     } finally {
+      process.stdout.off("resize", onResize);
       restoreConsole();
       unbindKeys();
     }
