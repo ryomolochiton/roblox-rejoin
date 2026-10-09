@@ -144,6 +144,14 @@ else
   git clean -fd $EXCL
 fi
 
+# tu cap nhat loader tu repo (neu repo co loader.sh moi hon ban dang cai) roi chay lai
+if [ -z "${LOADER_REEXEC:-}" ] && [ -f "$D/loader.sh" ] && [ -f "$L" ] && ! cmp -s "$D/loader.sh" "$L"; then
+  if cp "$D/loader.sh" "$L" 2>/dev/null && sed -i 's/\r$//' "$L" && chmod +x "$L"; then
+    echo "[*] Da cap nhat loader tu repo, dang chay lai..."
+    LOADER_REEXEC=1 exec bash "$L" "$CHOICE" "$@"
+  fi
+fi
+
 # node
 N="/data/data/com.termux/files/usr/bin/node"
 [ ! -x "$N" ] && N="$(command -v node 2>/dev/null)"
