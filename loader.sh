@@ -150,6 +150,23 @@ N="/data/data/com.termux/files/usr/bin/node"
 [ -z "${N:-}" ] && { pkg_install nodejs; N="$(command -v node 2>/dev/null)"; }
 [ -z "${N:-}" ] && { echo "[-] Khong cai duoc nodejs."; exit 1; }
 
+# node phai chay duoc: loi "cannot locate symbol OSSL_PROVIDER_..." = node moi nhung openssl cu (cap nhat do dang)
+node_ok() { "$N" -v >/dev/null 2>&1; }
+if ! node_ok; then
+  echo "[!] node bi loi thu vien (openssl cu). Dang cap nhat package Termux..."
+  pkg update >/dev/null 2>&1
+  pkg upgrade -y -o Dpkg::Options::=--force-confnew 2>&1 | tail -3
+  node_ok || { echo "[!] Cai lai openssl + nodejs..."; apt-get install -y --reinstall openssl nodejs >/dev/null 2>&1; }
+  if ! node_ok; then
+    use_official_mirror
+    apt-get update >/dev/null 2>&1
+    apt-get upgrade -y -o Dpkg::Options::=--force-confnew 2>&1 | tail -3
+    apt-get install -y --reinstall openssl nodejs >/dev/null 2>&1
+  fi
+  node_ok || { echo "[-] node van loi. Hay chay: pkg upgrade -y  (neu van loi: termux-change-repo roi pkg upgrade -y)"; exit 1; }
+  echo "[+] node da chay duoc: $("$N" -v)"
+fi
+
 # sqlite3 (ca 2 ban deu can)
 command -v sqlite3 >/dev/null || pkg_install sqlite || echo "[!] Chua cai duoc sqlite3 — tool se bao loi khi doc cookie."
 
