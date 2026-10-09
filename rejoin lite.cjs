@@ -177,7 +177,7 @@ const UI = (() => {
     const timer = setInterval(draw, 120);
     return { stop() { clearInterval(timer); process.stdout.write("\r\x1b[K\x1b[?25h"); } };
   };
-  return { c, strip, vlen, width, fit, padTo, split, box, card, msg, prompt, section, options, screen, paint, spinner, wrap };
+  return { c, strip, vlen, width, fit, padTo, split, box, card, msg, prompt, section, options, screen, paint, spinner, wrap, clear };
 })();
 
 const ask = (rl, q) => new Promise((r) => rl.question(q, r));
