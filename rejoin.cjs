@@ -159,6 +159,123 @@ function cleanTmpDir(maxAgeMs = 60 * 60 * 1000) {
 }
 cleanTmpDir();
 
+/** Chờ đồng bộ — chỉ dùng khi thiết lập/khởi động (không gọi trong vòng giám sát). */
+function sleepSync(ms) {
+  try { Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms); } catch (_) {
+    try { execFileSync("sleep", [String(ms / 1000)], { stdio: "ignore" }); } catch (_) { }
+  }
+}
+
+/**
+ * Đọc .ROBLOSECURITY từ database cookie của WebView trong app Roblox (cần root).
+ * Các lỗi hay gặp đã được xử lý/chẩn đoán rõ:
+ *  - Bản copy do root tạo ra thuộc về root nên sqlite3 (user Termux) không mở được -> chown/chmod sau khi copy.
+ *  - Đường dẫn DB khác nhau giữa các bản WebView -> thử cả Default/Cookies, Default/Network/Cookies, Cookies.
+ *  - Vừa đăng nhập xong, WebView chưa kịp ghi cookie xuống đĩa -> thử lại vài lần (retries).
+ *  - Thiếu sqlite3 / cookie bị mã hoá -> báo đúng nguyên nhân thay vì báo chung chung.
+ */
+function readRobloxCookie(packageName, label, { retries = 0, baseDir = "/data/data" } = {}) {
+  const base = `${baseDir}/${packageName}`;
+  const sources = [
+    `${base}/app_webview/Default/Cookies`,
+    `${base}/app_webview/Default/Network/Cookies`,
+    `${base}/app_webview/Cookies`
+  ];
+  const uid = typeof process.getuid === "function" ? process.getuid() : null;
+  const gid = typeof process.getgid === "function" ? process.getgid() : null;
+  const owner = uid !== null && gid !== null ? `${uid}:${gid}` : null;
+  const q = shQuote;
+
+  // Copy thường; nếu không đọc được thì copy bằng root rồi trả quyền sở hữu về user hiện tại.
+  const copyFile = (from, to) => {
+    try { execFileSync("cp", [from, to], { stdio: "pipe" }); return true; } catch (_) { }
+    const fix = owner
+      ? `{ { /system/bin/chown ${owner} ${q(to)} && /system/bin/chmod 600 ${q(to)}; } || /system/bin/chmod 666 ${q(to)} || true; }`
+      : `{ /system/bin/chmod 666 ${q(to)} || true; }`;
+    const cmd = `unset LD_PRELOAD LD_LIBRARY_PATH; { /system/bin/cp ${q(from)} ${q(to)} || cp ${q(from)} ${q(to)}; } && ${fix}`;
+    try { execFileSync("su", ["-c", cmd], { stdio: "pipe", timeout: 20000 }); return true; } catch (_) { return false; }
+  };
+
+  const cleanup = (file) => {
+    for (const f of [file, `${file}-journal`, `${file}-wal`, `${file}-shm`]) {
+      try { if (!fs.existsSync(f)) continue; } catch (_) { }
+      try { fs.unlinkSync(f); } catch (_) { try { execFileSync("rm", ["-f", f], { stdio: "ignore" }); } catch (_) { } }
+    }
+  };
+
+  const attempt = () => {
+    const problems = [];
+    let foundDb = false;
+    let retryable = false;
+    for (const src of sources) {
+      const stamp = `${process.pid}_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`;
+      const targets = [path.join(TMP_DIR, `ck_${stamp}.db`), `/sdcard/cookies_temp_${stamp}.db`];
+      let db = null;
+      for (const t of targets) { if (copyFile(src, t)) { db = t; break; } }
+      if (!db) { cleanup(targets[0]); cleanup(targets[1]); continue; }
+      foundDb = true;
+      const where = src.slice(base.length + 1);
+      try {
+        for (const suffix of ["-journal", "-wal"]) copyFile(`${src}${suffix}`, `${db}${suffix}`);
+        const run = (sql) => execFileSync("sqlite3", [db, sql], {
+          encoding: "utf8", stdio: ["ignore", "pipe", "pipe"], timeout: 15000
+        }).trim();
+
+        let value = "";
+        try {
+          value = run("SELECT value FROM cookies WHERE name = '.ROBLOSECURITY' ORDER BY expires_utc DESC LIMIT 1");
+        } catch (e) {
+          if (e && e.code === "ENOENT") return { fatal: "Chưa cài sqlite3 — chạy: pkg install sqlite" };
+          const msg = String((e && e.stderr) || "").trim().split("\n")[0] || String((e && e.message) || e).split("\n")[0];
+          const perm = /unable to open|readonly|permission|denied/i.test(msg)
+            ? " (không đọc được file vừa copy — thường do quyền sở hữu file; kiểm tra Termux có chạy được `su -c id`)"
+            : "";
+          problems.push(`${where}: ${msg}${perm}`);
+          continue;
+        }
+        if (value) return { value };
+
+        let meta = "";
+        try { meta = run("SELECT count(*), ifnull(max(length(encrypted_value)), 0) FROM cookies WHERE name = '.ROBLOSECURITY'"); } catch (_) { }
+        const [n, enc] = meta.split("|").map((x) => Number(x));
+        if (n > 0 && enc > 0) {
+          problems.push(`${where}: cookie nằm trong encrypted_value (bị mã hoá) nên không đọc trực tiếp được`);
+        } else {
+          problems.push(`${where}: DB chưa có dòng .ROBLOSECURITY`);
+          retryable = true;
+        }
+      } finally {
+        cleanup(db);
+      }
+    }
+    return { problems, foundDb, retryable };
+  };
+
+  let res;
+  for (let i = 0; ; i++) {
+    res = attempt();
+    if (res.value || res.fatal || !res.retryable || i >= retries) break;
+    console.log(`[*] [${label}] Chưa thấy cookie trong DB (WebView ghi xuống đĩa chậm sau khi đăng nhập) — chờ 6s rồi thử lại (${i + 1}/${retries})...`);
+    sleepSync(6000);
+  }
+
+  if (res.value) {
+    let v = res.value;
+    if (!v.startsWith("_")) v = "_" + v;
+    return `.ROBLOSECURITY=${v}`;
+  }
+  if (res.fatal) { console.error(`[-] [${label}] ${res.fatal}`); return null; }
+  if (!res.foundDb) {
+    console.error(`[-] [${label}] Không sao chép được database cookie của ${packageName}. Kiểm tra: đã cấp root cho Termux (thử \`su -c id\`), đúng tên package, và app đã từng mở.`);
+    return null;
+  }
+  for (const p of res.problems) console.error(`[-] [${label}] ${p}`);
+  if (res.retryable) {
+    console.error(`[-] [${label}] Chưa có cookie trong DB. Nếu vừa đăng nhập: để Roblox ở màn hình chính 30–60 giây (cookie ghi xuống đĩa chậm) rồi thử lại.`);
+  }
+  return null;
+}
+
 const execFileAsync = util.promisify(execFile);
 
 // Activity mặc định cố định, KHÔNG phụ thuộc prefix package.
@@ -880,88 +997,14 @@ class Utils {
     }
   }
 
-  static getRobloxCookie(packageName) {
-    console.log(`[*] [${Utils.packageLabel(packageName)}] Đang lấy cookie ROBLOSECURITY...`);
-
+  static getRobloxCookie(packageName, opts = {}) {
+    const label = Utils.packageLabel(packageName);
+    console.log(`[*] [${label}] Đang lấy cookie ROBLOSECURITY...`);
     if (!/^[A-Za-z0-9_.]+$/.test(String(packageName || ""))) {
       console.error(`[-] Tên package không hợp lệ: ${packageName}`);
       return null;
     }
-
-    const srcDb = `/data/data/${packageName}/app_webview/Default/Cookies`;
-    const stamp = `${process.pid}_${Date.now()}`;
-    // Ưu tiên thư mục riêng tư (0700). /sdcard chỉ là phương án cuối vì mọi app đều đọc được ở đó.
-    const candidates = [
-      path.join(TMP_DIR, `ck_${stamp}.db`),
-      `/sdcard/cookies_temp_${stamp}.db`
-    ];
-
-    const copyFile = (from, to) => {
-      try {
-        execFileSync("cp", [from, to], { stdio: "pipe" });
-        return true;
-      } catch {
-        try {
-          execFileSync("su", ["-c", `cp ${shQuote(from)} ${shQuote(to)}`], { stdio: "pipe" });
-          return true;
-        } catch {
-          return false;
-        }
-      }
-    };
-
-    const created = [];
-    let dbCopy = null;
-    try {
-      for (const target of candidates) {
-        if (copyFile(srcDb, target)) {
-          dbCopy = target;
-          created.push(target);
-          break;
-        }
-      }
-      if (!dbCopy) {
-        console.error(`[-] [${Utils.packageLabel(packageName)}] Không sao chép được database cookie (cần quyền root).`);
-        return null;
-      }
-      try { fs.chmodSync(dbCopy, 0o600); } catch (_) { }
-
-      // Sao chép kèm journal/wal (nếu có) để không bỏ sót dữ liệu chưa ghi hẳn vào file chính.
-      for (const suffix of ["-journal", "-wal"]) {
-        if (copyFile(`${srcDb}${suffix}`, `${dbCopy}${suffix}`)) created.push(`${dbCopy}${suffix}`);
-      }
-
-      let cookieValue;
-      try {
-        cookieValue = execFileSync(
-          "sqlite3",
-          [dbCopy, "SELECT value FROM cookies WHERE name = '.ROBLOSECURITY' LIMIT 1"],
-          { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] }
-        ).trim();
-      } catch (err) {
-        console.error(`[-] [${Utils.packageLabel(packageName)}] Lỗi khi query sqlite3: ${String(err.message).split("\n")[0]}`);
-        return null;
-      }
-
-      if (!cookieValue) {
-        console.error(`[-] [${Utils.packageLabel(packageName)}] Không tìm được cookie ROBLOSECURITY (đã đăng nhập chưa?).`);
-        return null;
-      }
-
-      if (!cookieValue.startsWith("_")) cookieValue = "_" + cookieValue;
-      return `.ROBLOSECURITY=${cookieValue}`;
-    } catch (e) {
-      console.error(`[-] [${Utils.packageLabel(packageName)}] Lỗi khi lấy cookie: ${e.message}`);
-      return null;
-    } finally {
-      for (const file of created) {
-        try {
-          fs.unlinkSync(file);
-        } catch {
-          try { execFileSync("rm", ["-f", file], { stdio: "ignore" }); } catch (_) { }
-        }
-      }
-    }
+    return readRobloxCookie(packageName, label, opts);
   }
 
   static maskSensitiveInfo(text) {
@@ -3048,7 +3091,7 @@ class MultiRejoinTool {
         ["Package", packageName]
       ], "PACKAGE ĐANG XỬ LÝ"));
 
-      const cookie = Utils.getRobloxCookie(packageName);
+      const cookie = Utils.getRobloxCookie(packageName, { retries: 2 });
       if (!cookie) {
         console.log(UIRenderer.message("error", `Không lấy được cookie cho ${packageName}; đã bỏ qua.`));
         skippedPackages.push(packageInfo.displayName);
@@ -3542,7 +3585,7 @@ class MultiRejoinTool {
 
     for (const packageName of selectedPackages) {
       const config = configs[packageName];
-      const cookie = Utils.getRobloxCookie(packageName);
+      const cookie = Utils.getRobloxCookie(packageName, { retries: 1 });
 
       if (!cookie) {
         console.log(UIRenderer.message("error", `Không lấy được cookie cho ${packageName}, bỏ qua...`));
