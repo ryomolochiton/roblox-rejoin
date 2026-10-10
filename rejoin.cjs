@@ -175,6 +175,14 @@ const HTTP_TIMEOUT = 15000;            // timeout cho MỌI request mạng (trư
 const LAUNCH_GRACE_MS = 75 * 1000;     // sau khi gửi lệnh mở game, chờ chừng này rồi mới đánh giá lại (tránh mở lại giữa lúc game đang load)
 const LAUNCH_STAGGER_MS = 2000;        // giãn cách khi mở nhiều instance cùng lúc cho đỡ nặng máy
 const COOKIE_REFRESH_MS = 3 * 60 * 1000;
+// --- Chống logout ---
+// Nhịp quét tối thiểu: quét dày (15s) bằng cookie thật từ ngoài app dễ bị Roblox coi là bất thường -> thu hồi phiên.
+const MIN_CHECK_SEC = 30;
+// Khi bị 429 thì lùi thêm chừng này trước lần kiểm tra kế tiếp.
+const RATE_LIMIT_BACKOFF_MS = 90 * 1000;
+// Auto rejoin MẶC ĐỊNH KHÔNG force-stop: giết app lúc WebView đang ghi cookie có thể làm mất/hỏng cookie -> văng ra màn hình đăng nhập.
+// Muốn quay lại kiểu dừng hẳn app thì chạy: REJOIN_HARD_STOP=1 node <file>
+const HARD_STOP_ON_REJOIN = process.env.REJOIN_HARD_STOP === "1";
 const RECENT_GAMES_LIMIT = 5;           // số game "tài khoản hay chơi" hiển thị khi chọn game (trước đây là 10)
 const USER_AGENT = "Mozilla/5.0 (Linux; Android 10; Termux)";
 
@@ -3075,12 +3083,12 @@ class MultiRejoinTool {
 
       let delaySec;
       while (true) {
-        const input = parseInt(await Utils.ask(rl, UIRenderer.prompt("Nhịp kiểm tra [15-120 giây]"))) || 1;
-        if (input >= 15 && input <= 120) {
+        const input = parseInt(await Utils.ask(rl, UIRenderer.prompt("Nhịp kiểm tra [30-120 giây]"))) || 1;
+        if (input >= MIN_CHECK_SEC && input <= 120) {
           delaySec = input;
           break;
         }
-        console.log(UIRenderer.message("error", "Giá trị phải nằm trong khoảng 15-120 giây."));
+        console.log(UIRenderer.message("error", "Giá trị phải nằm trong khoảng 30-120 giây."));
       }
 
       configs[packageName] = {
@@ -3675,7 +3683,7 @@ class MultiRejoinTool {
       }
     }
 
-    if (forced) {
+    if (forced && HARD_STOP_ON_REJOIN) {
       await Utils.forceStop(instance.packageName);
       await sleep(2000);
     }
@@ -3718,7 +3726,7 @@ class MultiRejoinTool {
     const now = Date.now();
     const due = [];
     for (const instance of this.instances) {
-      const delayMs = Math.max(15, Number(instance.config.delaySec) || 30) * 1000;
+      const delayMs = Math.max(MIN_CHECK_SEC, Number(instance.config.delaySec) || 30) * 1000;
       const since = now - instance.lastCheck;
       instance.countdownSeconds = Math.ceil(Math.max(0, delayMs - since) / 1000);
       if (since >= delayMs && !instance.checking) due.push(instance);
@@ -3752,6 +3760,8 @@ class MultiRejoinTool {
       const previous = String(instance.status || "").trim();
 
       instance.lastCheck = Date.now();
+      // Bị 429 -> lùi thêm để không dồn dập request bằng cookie thật.
+      if (check && check.status === 429) instance.lastCheck += RATE_LIMIT_BACKOFF_MS;
       instance.status = analysis.status;
       instance.info = analysis.info;
       instance.presenceType = check && check.presence && check.presence.userPresenceType !== undefined
@@ -4243,7 +4253,7 @@ class ConfigEditor {
           ], "CHI TIẾT CẤU HÌNH"));
           console.log(UIRenderer.options([
             { key: "1", label: "Thay đổi game", description: "Chọn game hoặc Place ID mới" },
-            { key: "2", label: "Thay đổi nhịp quét", description: "Khoảng 15-120 giây" },
+            { key: "2", label: "Thay đổi nhịp quét", description: "Khoảng 30-120 giây" },
             { key: "3", label: "Thay đổi server VIP", description: "Cập nhật link private server", color: "1;35" },
             { key: "4", label: "Xóa cấu hình", description: "Loại tài khoản này khỏi danh sách", color: "1;31" },
             { key: "5", label: "Giữ nguyên", description: "Bỏ qua cấu hình này", color: "1;33" }
@@ -4272,13 +4282,13 @@ class ConfigEditor {
                 let newDelay;
                 while (true) {
                   try {
-                    const input = await Utils.ask(rl, UIRenderer.prompt("Nhịp quét mới [15-120 giây]"));
+                    const input = await Utils.ask(rl, UIRenderer.prompt("Nhịp quét mới [30-120 giây]"));
                     const delayValue = parseInt(input) || 0;
-                    if (delayValue >= 15 && delayValue <= 120) {
+                    if (delayValue >= MIN_CHECK_SEC && delayValue <= 120) {
                       newDelay = delayValue;
                       break;
                     }
-                    console.log(UIRenderer.message("error", "Giá trị phải nằm trong khoảng 15-120 giây."));
+                    console.log(UIRenderer.message("error", "Giá trị phải nằm trong khoảng 30-120 giây."));
                   } catch (error) {
                     console.log(UIRenderer.message("error", "Không đọc được nhịp quét; vui lòng thử lại."));
                   }
