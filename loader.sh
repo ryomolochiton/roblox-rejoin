@@ -32,6 +32,20 @@ fi
 LAST="$(cat "$LAST_FILE" 2>/dev/null)"
 case "$LAST" in 1|2) ;; *) LAST=1 ;; esac
 
+# autostart mode (called by the Termux:Boot script after a reboot or crash):
+#   - strips --autostart from "$@" so it doesn't confuse normalize()
+#   - skips the git update (network unavailable at boot, tool already up-to-date)
+#   - skips the interactive menu, uses the last saved choice
+#   - re-injects --autostart when exec'ing node at the end
+AUTOSTART=0
+_rebuild=()
+for _a in "$@"; do
+  [ "$_a" = "--autostart" ] && { AUTOSTART=1; continue; }
+  _rebuild+=("$_a")
+done
+set -- "${_rebuild[@]+"${_rebuild[@]}"}"
+unset _a _rebuild
+
 normalize() {
   case "$(echo "${1:-}" | tr 'A-Z' 'a-z')" in
     1|vip) echo 1 ;;
@@ -41,13 +55,18 @@ normalize() {
 }
 
 CHOICE=""
-# first argument: vip / lite / 1 / 2
-if [ $# -gt 0 ]; then
-  CHOICE="$(normalize "$1")"
-  [ -n "$CHOICE" ] && shift
+# autostart: use the last saved choice, no menu
+if [ "$AUTOSTART" = "1" ]; then
+  CHOICE="$LAST"
+else
+  # first argument: vip / lite / 1 / 2
+  if [ $# -gt 0 ]; then
+    CHOICE="$(normalize "$1")"
+    [ -n "$CHOICE" ] && shift
+  fi
+  # or the environment variable
+  [ -z "$CHOICE" ] && CHOICE="$(normalize "${LOADER_CHOICE:-}")"
 fi
-# or the environment variable
-[ -z "$CHOICE" ] && CHOICE="$(normalize "${LOADER_CHOICE:-}")"
 
 # otherwise show the menu
 if [ -z "$CHOICE" ]; then
@@ -118,8 +137,12 @@ if ! command -v git >/dev/null; then
   pkg_install git || { echo "[!] Could not install git, downloading the source directly."; USE_TAR=1; }
 fi
 
-# clone / update
-if [ "$USE_TAR" = "1" ]; then
+# skip git update in autostart mode: network may be unavailable at boot and
+# the tool is already up-to-date from the last manual run.
+# if the repo dir is missing entirely, still clone/download so the tool can run.
+if [ "$AUTOSTART" = "1" ] && [ -d "$D" ]; then
+  echo "[*] Autostart — skipping update."
+elif [ "$USE_TAR" = "1" ]; then
   download_tarball || { echo "[-] Source download failed. Check your network and run again."; exit 1; }
 elif [ ! -d "$D/.git" ]; then
   rm -rf "$D"
@@ -178,6 +201,11 @@ fi
 # sqlite3 (both versions need it)
 command -v sqlite3 >/dev/null || pkg_install sqlite || echo "[!] Could not install sqlite3, the tool will fail when reading cookies."
 
+# termux-api + termux-boot: needed for wake-lock and autostart on reboot
+# install silently; missing is non-fatal (tool still runs, just no wake-lock / boot)
+command -v termux-wake-lock >/dev/null 2>&1 || pkg_install termux-api 2>/dev/null || echo "[!] Could not install termux-api (wake-lock won't work)."
+[ -d "/data/data/com.termux.boot" ] || pkg_install termux-boot 2>/dev/null || echo "[!] Could not install termux-boot (autostart on reboot won't work)."
+
 # alias for running under su / root (added once so ~/.bashrc doesn't grow on every run)
 S=$(which su 2>/dev/null)
 [ -n "${S:-}" ] && {
@@ -196,4 +224,8 @@ fi
 [ ! -f "$W/$ENTRY" ] && { echo "[-] '$ENTRY' not found in $W"; exit 1; }
 
 cd "$W" || exit 1
-exec "$N" "$ENTRY" "$@"
+if [ "$AUTOSTART" = "1" ]; then
+  exec "$N" "$ENTRY" --autostart "$@"
+else
+  exec "$N" "$ENTRY" "$@"
+fi
