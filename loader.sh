@@ -1,14 +1,10 @@
 #!/bin/bash
-# loader.sh - Environment installer, updater, autostart manager & launcher for Roblox Rejoin (VIP & LITE)
-# Usage:
-#   loader                   -> interactive menu (1 = VIP, 2 = LITE, 3 = Repair Env)
-#   loader 1|vip [args...]   -> run VIP directly
-#   loader 2|lite [args...]  -> run LITE directly
-#   loader --repair          -> force check & install all Termux + NPM dependencies
-#   loader --boot-status     -> show reboot autostart diagnostics
-#   loader --autostart-on    -> enable Termux:Boot + shell autostart
-#   loader --autostart-off   -> disable Termux:Boot + shell autostart
-#   loader --no-update       -> skip git/tarball update on this run
+# loader.sh - install, update, autostart & launch Roblox Rejoin (VIP / LITE)
+# Run `loader --help` for usage.
+#
+# Speed: nothing is installed unless really missing (no blanket `pkg update`), one stamp records the
+# last healthy env so a start with entry+node+modules intact goes straight to node, and the repo is
+# refreshed at most once a day.
 set -u
 
 R="https://github.com/ryomolochiton/roblox-rejoin"
@@ -38,16 +34,15 @@ case "$REAL_HOME" in
 esac
 
 D="${REJOIN_REPO_DIR:-$REAL_HOME/roblox-rejoin}"
-W="$D"
 ENTRY_VIP="rejoin.cjs"
 ENTRY_LITE="rejoin lite.cjs"
 L="$TERMUX_BIN/loader"
 
 # Persistent config & isolated NPM environment outside the git repo
 ROBLOX_REJOIN_HOME="${ROBLOX_REJOIN_HOME:-$REAL_HOME/.roblox-rejoin}"
-ENV_DIR="$ROBLOX_REJOIN_HOME/env"
-TMP_DIR="$ROBLOX_REJOIN_HOME/tmp"
-export ROBLOX_REJOIN_HOME
+ENV_DIR="${ROBLOX_REJOIN_ENV:-$ROBLOX_REJOIN_HOME/env}"
+TMP_DIR="${ROBLOX_REJOIN_TMP:-$ROBLOX_REJOIN_HOME/tmp}"
+export ROBLOX_REJOIN_HOME ROBLOX_REJOIN_ENV="$ENV_DIR" ROBLOX_REJOIN_TMP="$TMP_DIR" ROBLOX_REJOIN_REPO="$D"
 export NODE_PATH="$ENV_DIR/node_modules"
 
 mkdir -p "$ROBLOX_REJOIN_HOME" "$ENV_DIR" "$TMP_DIR" 2>/dev/null
@@ -55,8 +50,17 @@ chmod 700 "$TMP_DIR" 2>/dev/null || true
 
 CFGS="multi_configs.json webhook_config.json package_prefix_config.json activity_config.json autoexec_config.json ui_config.json run_options.json last_session.json"
 LAST_FILE="$ROBLOX_REJOIN_HOME/loader_choice"
-ENV_STAMP_FILE="$ENV_DIR/.env_ok_v2"
-VIP_DEPS="axios cli-table3 figlet"
+
+# Stamps (all optional: a missing stamp only means "do the slower check once")
+ENV_STAMP_V3="$ENV_DIR/.env_ok_v3"
+UPDATE_STAMP_FILE="$ROBLOX_REJOIN_HOME/.repo_checked"
+UPDATE_MAX_AGE_S=86400   # refresh the repo at most once a day on a plain start
+
+VIP_NPM_DEPS="axios cli-table3 figlet"
+VIP_REQUIRED_MODULES="axios cli-table3"
+LITE_REQUIRED_MODULES=""
+OPT_SYS_PKGS="termux-api procps"
+VIP_EXTRA_PKGS="nano"
 
 AUTOSTART_BOOT_SCRIPT="$REAL_HOME/.termux/boot/roblox-rejoin.sh"
 AUTOSTART_OFF_PATH="$ROBLOX_REJOIN_HOME/autostart_disabled"
@@ -71,11 +75,14 @@ RC_END="# <<< roblox-rejoin autostart <<<"
 IS_ROOT=0
 [ "$(id -u 2>/dev/null || echo 1)" = "0" ] && IS_ROOT=1
 
-pkg_wrap() { yes | command pkg "$@"; }
+# one "y" keeps apt non-interactive (a piped `yes` would write forever and block the install)
+pkg_wrap() { printf 'y\n' | command pkg "$@"; }
 
 sh_quote() {
   printf "'%s'" "$(printf "%s" "$1" | sed "s/'/'\\\\''/g")"
 }
+
+now_s() { date +%s; }
 
 # Hand files back to the Termux user if loader was invoked as root
 fix_owner() {
@@ -88,9 +95,12 @@ fix_owner() {
   fi
 }
 
+file_mtime() { stat -c '%Y' "$1" 2>/dev/null || echo 0; }
+
 # Migrate legacy configs out of the git repo before any reset/clean
 save_old_configs() {
   [ -d "$D" ] || return 0
+  local f
   for f in $CFGS; do
     if [ -f "$D/$f" ] && [ ! -f "$ROBLOX_REJOIN_HOME/$f" ]; then
       cp -f "$D/$f" "$ROBLOX_REJOIN_HOME/$f" 2>/dev/null && mv -f "$D/$f" "$D/$f.migrated" 2>/dev/null || true
@@ -111,7 +121,363 @@ install_self() {
   fi
 }
 
-# Write Termux:Boot script & ~/.bashrc / ~/.zshrc autostart hook
+# ---------------------------------------------------------------------------------------
+# Stamp helpers: the stamp is only "ok" while the entry script is still newer-older than it,
+# so an update / reinstall invalidates it automatically.
+# ---------------------------------------------------------------------------------------
+node_bin_path() {
+  local n="$TERMUX_BIN/node"
+  [ -x "$n" ] && { echo "$n"; return 0; }
+  command -v node 2>/dev/null || echo ""
+}
+
+stamp_valid() {
+  local stamp="$1" entry="$2"
+  [ -f "$stamp" ] || return 1
+  [ -f "$entry" ] || return 1
+  [ "$(file_mtime "$stamp")" -ge "$(file_mtime "$entry")" ] || return 1
+  return 0
+}
+
+write_stamp() {
+  local stamp="$1" mode="$2"
+  {
+    echo "mode=$mode"
+    echo "node=$(node_bin_path)"
+    printf 'entry=%s\n' "$3"
+    echo "modules=$ENV_DIR/node_modules"
+    echo "written=$(now_s)"
+  } > "$stamp.tmp" 2>/dev/null && mv -f "$stamp.tmp" "$stamp" 2>/dev/null
+  fix_owner "$stamp"
+}
+
+entry_for_mode() {
+  case "$1" in
+    2|lite) echo "$D/$ENTRY_LITE" ;;
+    *) echo "$D/$ENTRY_VIP" ;;
+  esac
+}
+
+# True when this start can go straight to node: everything the entry needs was verified after the
+# last change of the entry file / node binary. Costs two stats + one read, no subprocess.
+fast_ready() {
+  local mode="$1" entry n
+  entry="$(entry_for_mode "$mode")"
+  [ -f "$entry" ] || return 1
+  stamp_valid "$ENV_STAMP_V3" "$entry" || return 1
+  n="$(node_bin_path)"
+  [ -n "$n" ] || return 1
+  # the stamp stores the exact node + mode verified: any change forces the slow path once
+  # (shell builtins, because grep would fork a process on every start)
+  local line want_node="node=$n" want_mode="mode=$mode" _st_node=0 _st_mode=0
+  while IFS= read -r line; do
+    case "$line" in
+      "$want_node") _st_node=1 ;;
+      "$want_mode"|"mode=repair") _st_mode=1 ;;
+    esac
+  done < "$ENV_STAMP_V3" 2>/dev/null
+  [ "$_st_node" = "1" ] && [ "$_st_mode" = "1" ] || return 1
+  # sqlite3 is the only thing the tool cannot start without; one -x test instead of a `command -v` fork
+  [ -x "$TERMUX_BIN/sqlite3" ] || command -v sqlite3 >/dev/null 2>&1 || return 1
+  return 0
+}
+
+# ---------------------------------------------------------------------------------------
+# Repo update
+# ---------------------------------------------------------------------------------------
+download_tarball() {
+  local tmp_dl url
+  tmp_dl="$(mktemp -d 2>/dev/null || echo "$TMP_DIR/dl_$$")"
+  mkdir -p "$tmp_dl"
+  url="$R/archive/refs/heads/main.tar.gz"
+  if command -v curl >/dev/null 2>&1; then
+    curl -fL --connect-timeout 8 --retry 1 -o "$tmp_dl/r.tgz" "$url" || { rm -rf "$tmp_dl"; return 1; }
+  elif command -v wget >/dev/null 2>&1; then
+    wget -T 12 -O "$tmp_dl/r.tgz" "$url" || { rm -rf "$tmp_dl"; return 1; }
+  else
+    rm -rf "$tmp_dl"
+    return 1
+  fi
+  mkdir -p "$D"
+  find "$D" -mindepth 1 -maxdepth 1 ! -name node_modules -exec rm -rf {} + 2>/dev/null || true
+  tar -xzf "$tmp_dl/r.tgz" -C "$D" --strip-components=1 || { rm -rf "$tmp_dl"; return 1; }
+  rm -rf "$tmp_dl"
+  fix_owner "$D"
+  return 0
+}
+
+# should_update <force>
+#   0 = update now, 1 = skip
+should_update() {
+  local force="${1:-0}"
+  [ "$force" = "1" ] && return 0
+  [ -d "$D/.git" ] || return 0               # first install / tarball installs keep working offline
+  [ -f "$UPDATE_STAMP_FILE" ] || return 0
+  local last age
+  last="$(cat "$UPDATE_STAMP_FILE" 2>/dev/null | tr -dc '0-9')"
+  [ -n "$last" ] || return 0
+  age=$(( $(now_s) - last ))
+  [ "$age" -ge "$UPDATE_MAX_AGE_S" ] && return 0
+  return 1
+}
+
+mark_update_checked() {
+  now_s > "$UPDATE_STAMP_FILE" 2>/dev/null || true
+}
+
+sync_repo() {
+  local force="${1:-0}"
+  save_old_configs
+
+  if [ -d "$D" ] && { [ "$AUTOSTART" = "1" ] || [ "$NO_UPDATE" = "1" ]; } \
+     && { [ -f "$D/$ENTRY_VIP" ] || [ -f "$D/$ENTRY_LITE" ]; }; then
+    [ "$AUTOSTART" = "1" ] && echo "[*] Autostart mode — using existing local files." \
+                          || echo "[*] Skipping repo update (--no-update)."
+    return 0
+  fi
+  if ! should_update "$force"; then
+    echo "[*] Using local files (repo last checked $(( ($(now_s) - $(cat "$UPDATE_STAMP_FILE" 2>/dev/null | tr -dc '0-9' || echo 0)) / 3600 ))h ago, max ${UPDATE_MAX_AGE_S}s)."
+    return 0
+  fi
+
+  local use_tar=0 rc=0
+  if [ ! -d "$D/.git" ]; then
+    if [ -f "$D/$ENTRY_VIP" ] || [ -f "$D/$ENTRY_LITE" ]; then
+      # installed without git (tarball / copied by hand): never re-download on start
+      echo "[*] Existing local install in $D, not re-downloading."
+      mark_update_checked
+      return 0
+    fi
+    use_tar=1
+  fi
+
+  if [ "$use_tar" = "1" ]; then
+    echo "[*] Downloading repository..."
+    if download_tarball; then mark_update_checked; else
+      echo "[-] Could not download repository. Check your internet connection."
+      return 1
+    fi
+  else
+    # a git checkout is guaranteed here: use_tar=1 covers every non-git case above
+    (
+      cd "$D" || exit 1
+      cur="$(git remote get-url origin 2>/dev/null || echo "")"
+      [ -n "$cur" ] && [ "$cur" != "$R" ] && git remote set-url origin "$R" 2>/dev/null || true
+      if git fetch --depth 1 origin main >/dev/null 2>&1 || git fetch --all --prune >/dev/null 2>&1; then
+        excl="-e node_modules"
+        for f in $CFGS; do excl="$excl -e $f"; done
+        git reset --hard origin/main >/dev/null 2>&1 || git reset --hard FETCH_HEAD >/dev/null 2>&1 || true
+        # shellcheck disable=SC2086
+        git clean -fd $excl >/dev/null 2>&1 || true
+        exit 0
+      fi
+      # offline: keep the local copy instead of failing the launch
+      exit 2
+    ) || rc=$?
+    if [ "$rc" = "2" ]; then
+      echo "[!] Network/GitHub unreachable — continuing with local version."
+    fi
+    mark_update_checked
+  fi
+  fix_owner "$D"
+  return 0
+}
+
+# ---------------------------------------------------------------------------------------
+# Environment
+# ---------------------------------------------------------------------------------------
+use_official_mirror() {
+  echo "[*] Switching Termux mirror to packages.termux.dev..."
+  rm -f "$PREFIX_DIR/etc/termux/chosen_mirrors" 2>/dev/null || true
+  mkdir -p "$PREFIX_DIR/etc/apt" 2>/dev/null || true
+  echo "deb https://packages.termux.dev/apt/termux-main stable main" > "$PREFIX_DIR/etc/apt/sources.list"
+  rm -rf "$PREFIX_DIR/var/lib/apt/lists/"* 2>/dev/null || true
+}
+
+heal_dpkg() {
+  dpkg --configure -a >/dev/null 2>&1 || true
+}
+
+# install only what is listed and really missing; no blanket `pkg update`
+pkg_install() {
+  if [ "$IS_ROOT" = "1" ]; then
+    echo "[!] Running as root: Termux pkg/apt cannot run under UID 0."
+    echo "    Exit 'su' and run 'loader --repair' as the normal Termux user to install: $*"
+    return 1
+  fi
+  heal_dpkg
+  # `pkg install` refreshes the index by itself when it is stale, no need for a separate update
+  DEBIAN_FRONTEND=noninteractive pkg_wrap install -y "$@" && return 0
+  echo "[!] Retrying install ($*) with apt-get --fix-missing..."
+  heal_dpkg
+  # only now is a fresh index worth the wait (first try failed, most likely a stale list)
+  DEBIAN_FRONTEND=noninteractive apt-get update -o Acquire::Retries=2 >/dev/null 2>&1 || true
+  DEBIAN_FRONTEND=noninteractive apt-get install -y --fix-missing "$@" && return 0
+  use_official_mirror
+  DEBIAN_FRONTEND=noninteractive apt-get install -y --fix-missing "$@" && return 0
+  return 1
+}
+
+# install the subset of "$@" that is not on PATH yet.
+# termux-wake-lock is the binary from the termux-api package but NOT the package name, so the
+# binary -> package mapping is explicit here (otherwise it asked apt for a package called "termux-wake-lock").
+pkg_name_for() {
+  case "$1" in
+    sqlite3) echo sqlite ;;
+    termux-wake-lock) echo termux-api ;;
+    *) echo "$1" ;;
+  esac
+}
+
+pkg_ensure() {
+  local missing="" p
+  for p in "$@"; do
+    command -v "$p" >/dev/null 2>&1 || missing="$missing $(pkg_name_for "$p")"
+  done
+  [ -z "$missing" ] && return 0
+  echo "[*] Installing missing system package(s):$missing"
+  # shellcheck disable=SC2086
+  pkg_install $missing || return 1
+  # `pkg install` can report success while a package was only partially configured;
+  # verify the binaries are really on PATH now instead of trusting the exit code
+  local still=""
+  for p in "$@"; do
+    command -v "$p" >/dev/null 2>&1 || still="$still $p"
+  done
+  [ -z "$still" ] && return 0
+  echo "[-] Still missing after install:$still"
+  return 1
+}
+
+node_modules_ok() {
+  local n="$1" m
+  [ -d "$ENV_DIR/node_modules" ] || return 1
+  for m in $2; do
+    NODE_PATH="$ENV_DIR/node_modules" "$n" -e "require.resolve('$m')" >/dev/null 2>&1 || return 1
+  done
+  return 0
+}
+
+# --repair / menu option 3: install everything, no shortcuts
+setup_environment() {
+  local mode="${1:-1}"
+  local force="${2:-0}"
+  local want_vip=0
+  case "$mode" in 1|vip|repair|all) want_vip=1 ;; esac
+
+  echo "[*] Checking Termux runtime environment..."
+
+  command -v curl >/dev/null 2>&1 || pkg_ensure curl
+  command -v tar >/dev/null 2>&1 || pkg_ensure tar
+  command -v git >/dev/null 2>&1 || pkg_ensure git
+
+  local n
+  n="$(node_bin_path)"
+  if [ -z "$n" ]; then
+    pkg_ensure nodejs || { echo "[-] Could not install nodejs."; return 1; }
+    n="$(node_bin_path)"
+  fi
+  if ! "$n" -v >/dev/null 2>&1; then
+    echo "[!] Node.js binary failed ABI/OpenSSL check, repairing Termux packages..."
+    if [ "$IS_ROOT" = "1" ]; then
+      echo "[-] Node.js is broken and cannot be upgraded while running as root. Exit 'su' and run: loader --repair"
+      return 1
+    fi
+    heal_dpkg
+    DEBIAN_FRONTEND=noninteractive pkg_wrap upgrade -y -o Dpkg::Options::=--force-confnew 2>&1 | tail -n 4
+    "$n" -v >/dev/null 2>&1 || DEBIAN_FRONTEND=noninteractive apt-get install -y --reinstall openssl nodejs >/dev/null 2>&1 || true
+    if ! "$n" -v >/dev/null 2>&1; then
+      use_official_mirror
+      DEBIAN_FRONTEND=noninteractive apt-get upgrade -y -o Dpkg::Options::=--force-confnew 2>&1 | tail -n 4
+      DEBIAN_FRONTEND=noninteractive apt-get install -y --reinstall openssl nodejs >/dev/null 2>&1 || true
+    fi
+    "$n" -v >/dev/null 2>&1 || { echo "[-] Node.js still cannot start. Run manually: pkg upgrade -y"; return 1; }
+    echo "[+] Node.js repaired: $("$n" -v)"
+  fi
+  # sqlite3 is required by both versions (cookie read / login)
+  pkg_ensure sqlite || { echo "[-] sqlite3 is required (pkg install sqlite)."; return 1; }
+
+  # optional helpers
+  pkg_ensure $OPT_SYS_PKGS
+  if [ "$want_vip" = "1" ]; then
+    pkg_ensure $VIP_EXTRA_PKGS
+  fi
+
+  # isolated npm env (VIP only: LITE has no npm dependency)
+  if [ "$want_vip" = "1" ]; then
+    mkdir -p "$ENV_DIR" 2>/dev/null
+    if [ ! -f "$ENV_DIR/package.json" ]; then
+      cat > "$ENV_DIR/package.json" <<'EOF'
+{
+  "name": "roblox-rejoin-env",
+  "private": true,
+  "description": "Managed runtime dependencies for Roblox Rejoin VIP"
+}
+EOF
+    fi
+    if [ "$force" = "1" ] || ! node_modules_ok "$n" "$VIP_NPM_DEPS"; then
+      command -v npm >/dev/null 2>&1 || pkg_ensure nodejs
+      echo "[*] Installing NPM packages into isolated env: $VIP_NPM_DEPS"
+      local npm_log="$TMP_DIR/npm_install.log"
+      ( cd "$ENV_DIR" && npm install --save --no-audit --no-fund --prefer-offline --loglevel=error $VIP_NPM_DEPS ) >"$npm_log" 2>&1 || \
+      ( cd "$ENV_DIR" && rm -rf node_modules package-lock.json && npm install --save --no-audit --no-fund --loglevel=error $VIP_NPM_DEPS ) >>"$npm_log" 2>&1 || {
+        echo "[!] NPM install failed, last lines:"
+        tail -n 5 "$npm_log" 2>/dev/null | sed 's/^/    /'
+      }
+      rm -f "$npm_log" 2>/dev/null || true
+      fix_owner "$ENV_DIR"
+    fi
+    local crit
+    for crit in $VIP_REQUIRED_MODULES; do
+      if ! NODE_PATH="$ENV_DIR/node_modules" "$n" -e "require.resolve('$crit')" >/dev/null 2>&1; then
+        echo "[-] Missing required NPM module '$crit'. Check internet and run: loader --repair"
+        return 1
+      fi
+    done
+    # `node rejoin.cjs` by hand should find the modules too
+    if [ -d "$D" ] && [ ! -e "$D/node_modules" ]; then
+      ln -s "$ENV_DIR/node_modules" "$D/node_modules" 2>/dev/null || true
+    fi
+  fi
+
+  setup_autostart_files || true
+  write_stamp "$ENV_STAMP_V3" "$mode" "$(entry_for_mode "$mode")"
+  fix_owner "$ROBLOX_REJOIN_HOME"
+  return 0
+}
+
+# Incremental environment check used on a normal start: only touches what is missing.
+verify_environment() {
+  local mode="$1"
+  local required="$LITE_REQUIRED_MODULES"
+  [ "$mode" = "1" ] && required="$VIP_REQUIRED_MODULES"
+
+  local n
+  n="$(node_bin_path)"
+  if [ -z "$n" ] || ! "$n" -v >/dev/null 2>&1; then
+    echo "[*] Node.js missing or broken, repairing..."
+    setup_environment "$mode" "0" || return 1
+    return 0
+  fi
+  local need_install=0
+  command -v sqlite3 >/dev/null 2>&1 || { echo "[*] sqlite3 missing."; need_install=1; }
+  if [ "$mode" = "1" ] && ! node_modules_ok "$n" "$required"; then
+    echo "[*] Some npm modules are missing."
+    need_install=1
+  fi
+  if [ "$need_install" = "1" ]; then
+    setup_environment "$mode" "0" || return 1
+  else
+    # cheap: refresh the stamp so the next start takes the fast path
+    write_stamp "$ENV_STAMP_V3" "$mode" "$(entry_for_mode "$mode")"
+    setup_autostart_files >/dev/null 2>&1 || true
+  fi
+  return 0
+}
+
+# ---------------------------------------------------------------------------------------
+# Autostart
+# ---------------------------------------------------------------------------------------
 setup_autostart_files() {
   [ "${REJOIN_NO_AUTOSTART:-0}" = "1" ] || [ -f "$AUTOSTART_OFF_PATH" ] && return 0
   local boot_dir="$REAL_HOME/.termux/boot"
@@ -182,15 +548,36 @@ if mv "\$FLAG" "\$FLAG.fb" 2>/dev/null; then
   rm -f "\$FLAG.fb"
   if [ ! -x "\$LOADER" ]; then st failed "\$n" headless "loader command not found"; exit 1; fi
   st headless "\$n" headless "Termux could not be opened, running in background"
-  "\$LOADER" --autostart < /dev/null 2>&1 | { head -n 300 > "\$CFG/autostart.log"; cat > /dev/null; }
+  "\$LOADER" --autostart --no-update < /dev/null 2>&1 | { head -n 300 > "\$CFG/autostart.log"; cat > /dev/null; }
   grep -q '"stage":"failed"' "\$ST" 2>/dev/null || st stopped "\$n" headless "The tool exited"
 fi
 exit 0
 EOF
-  mv -f "$AUTOSTART_BOOT_SCRIPT.tmp" "$AUTOSTART_BOOT_SCRIPT"
+  # skip the rewrite when nothing changed: the fast path calls this on every start and a
+  # unchanged boot script must not cost a disk write (flash wear on long-lived devices)
+  if [ -f "$AUTOSTART_BOOT_SCRIPT" ] && cmp -s "$AUTOSTART_BOOT_SCRIPT.tmp" "$AUTOSTART_BOOT_SCRIPT"; then
+    rm -f "$AUTOSTART_BOOT_SCRIPT.tmp" 2>/dev/null || true
+  else
+    mv -f "$AUTOSTART_BOOT_SCRIPT.tmp" "$AUTOSTART_BOOT_SCRIPT" 2>/dev/null || return 0
+  fi
   chmod 755 "$AUTOSTART_BOOT_SCRIPT" 2>/dev/null || true
 
-  local rc_file tmp_rc
+  # only rewrite the rc files when the managed block is missing or outdated.
+  # The check runs on a normal (fast) start too, so it stays cheap: one grep per rc file.
+  local rc_file tmp_rc block_needed=0 env_q
+  env_q="NODE_PATH=\"$ENV_DIR/node_modules\""
+  for rc_name in .bashrc .zshrc; do
+    rc_file="$REAL_HOME/$rc_name"
+    [ "$rc_name" = ".zshrc" ] && [ ! -f "$rc_file" ] && continue
+    if ! grep -qF "$RC_BEGIN" "$rc_file" 2>/dev/null || ! grep -qF "$env_q" "$rc_file" 2>/dev/null; then
+      block_needed=1
+      break
+    fi
+  done
+  if [ "$block_needed" = "0" ] && [ -f "$AUTOSTART_ARMED_PATH" ]; then
+    return 0
+  fi
+
   for rc_name in .bashrc .zshrc; do
     rc_file="$REAL_HOME/$rc_name"
     [ "$rc_name" = ".zshrc" ] && [ ! -f "$rc_file" ] && continue
@@ -207,6 +594,9 @@ EOF
 $RC_BEGIN
 export PATH="$TERMUX_BIN:\$PATH"
 export NODE_PATH="$ENV_DIR/node_modules"
+export ROBLOX_REJOIN_HOME="$ROBLOX_REJOIN_HOME"
+export ROBLOX_REJOIN_ENV="$ENV_DIR"
+export ROBLOX_REJOIN_TMP="$TMP_DIR"
 if [ -f $q_flag ] && [ -t 0 ]; then
   if mv $q_flag ${q_flag}.run 2>/dev/null; then
     _rj_ts=\$(cat ${q_flag}.run 2>/dev/null); rm -f ${q_flag}.run
@@ -214,7 +604,7 @@ if [ -f $q_flag ] && [ -t 0 ]; then
       ''|*[!0-9]*) ;;
       *) if [ \$(( \$(date +%s) - _rj_ts )) -lt 900 ]; then
            echo "\$(date '+%m-%d %H:%M:%S') hook: Termux shell opened, starting loader" >> $q_log 2>/dev/null
-           if command -v loader >/dev/null 2>&1; then loader --autostart; else "$L" --autostart; fi
+           if command -v loader >/dev/null 2>&1; then loader --autostart --no-update; else "$L" --autostart --no-update; fi
          fi ;;
     esac
     unset _rj_ts
@@ -232,8 +622,9 @@ EOF
 
 remove_autostart_files() {
   rm -f "$AUTOSTART_BOOT_SCRIPT" "$AUTOSTART_PENDING_PATH" "$AUTOSTART_PENDING_PATH.run" "$AUTOSTART_PENDING_PATH.fb" "$AUTOSTART_ARMED_PATH" 2>/dev/null || true
+  local rc_name rc_file
   for rc_name in .bashrc .zshrc; do
-    local rc_file="$REAL_HOME/$rc_name"
+    rc_file="$REAL_HOME/$rc_name"
     [ -f "$rc_file" ] || continue
     awk -v b="$RC_BEGIN" -v e="$RC_END" '
       $0 == b || $0 == "# >>> roblox-rejoin autostart (managed by the tool) >>>" { skip=1; next }
@@ -252,11 +643,13 @@ print_boot_status_fast() {
   printf "  %-18s: %s\n" "Saved session" "$([ -f "$ROBLOX_REJOIN_HOME/last_session.json" ] && echo "OK (last_session.json)" || echo "None yet")"
   printf "  %-18s: %s\n" "Node.js" "$(command -v node >/dev/null 2>&1 && node -v 2>/dev/null || echo "NOT INSTALLED")"
   printf "  %-18s: %s\n" "SQLite3" "$(command -v sqlite3 >/dev/null 2>&1 && sqlite3 --version 2>/dev/null | cut -d' ' -f1 || echo "NOT INSTALLED")"
+  printf "  %-18s: %s\n" "Env stamp" "$([ -f "$ENV_STAMP_V3" ] && echo "OK (fast start)" || echo "MISSING (run loader --repair)")"
+  printf "  %-18s: %s\n" "Repo check" "$([ -f "$UPDATE_STAMP_FILE" ] && echo "$(( ($(now_s) - $(cat "$UPDATE_STAMP_FILE" 2>/dev/null | tr -dc '0-9' || echo 0)) / 60 ))m ago" || echo "never")"
   printf "  %-18s: %s\n" "Wake-lock API" "$(command -v termux-wake-lock >/dev/null 2>&1 && echo "OK" || echo "MISSING (pkg install termux-api)")"
   if [ -f "$HEARTBEAT_PATH" ]; then
     local hb now age
     hb="$(cat "$HEARTBEAT_PATH" 2>/dev/null | tr -dc '0-9')"
-    now="$(date +%s)"
+    now="$(now_s)"
     age=$((now - ${hb:-0}))
     printf "  %-18s: %s\n" "Monitor alive" "$([ "$age" -lt 150 ] && echo "YES (${age}s ago)" || echo "NO (last beat ${age}s ago)")"
   fi
@@ -282,6 +675,7 @@ Options:
   2, lite            Start LITE version (rejoin lite.cjs)
   --repair, --env    Check & reinstall all system + NPM dependencies
   --no-update        Skip git/tarball update on this launch
+  --update           Force a repo update on this launch
   --boot-status      Display autostart & environment status
   --autostart-on     Enable auto-start on device reboot
   --autostart-off    Disable auto-start on device reboot
@@ -289,12 +683,13 @@ Options:
 EOF
 }
 
+# runs before any menu; configs are migrated later inside sync_repo, right before a reset
 install_self
-save_old_configs
 
 # Parse flags cleanly before showing any menu
 AUTOSTART=0
 NO_UPDATE=0
+FORCE_UPDATE=0
 REPAIR_ONLY=0
 CHOICE=""
 PASS_ARGS=()
@@ -313,6 +708,7 @@ while [ $# -gt 0 ]; do
     -h|--help) show_help; exit 0 ;;
     --autostart) AUTOSTART=1 ;;
     --no-update|--offline) NO_UPDATE=1 ;;
+    --update) FORCE_UPDATE=1 ;;
     --repair|--env|--setup-env) REPAIR_ONLY=1 ;;
     --autostart-off)
       echo "1" > "$AUTOSTART_OFF_PATH"
@@ -331,13 +727,13 @@ while [ $# -gt 0 ]; do
       exit 0
       ;;
     --boot-status)
-      # If node + VIP/LITE exist, let cjs print detailed status, else use fast shell status
+      # node prints the authoritative report (boot_status.json + boot.log); shell summary is the
+      # fallback when node is missing or the entry file was not downloaded yet
       if command -v node >/dev/null 2>&1 && [ -f "$D/$ENTRY_VIP" ]; then
         exec node "$D/$ENTRY_VIP" --boot-status
-      else
-        print_boot_status_fast
-        exit 0
       fi
+      print_boot_status_fast
+      exit 0
       ;;
     *)
       if [ -z "$CHOICE" ]; then
@@ -354,244 +750,9 @@ while [ $# -gt 0 ]; do
   shift
 done
 
-# Mirror & APT recovery helpers
-use_official_mirror() {
-  echo "[*] Switching Termux mirror to packages.termux.dev..."
-  rm -f "$PREFIX_DIR/etc/termux/chosen_mirrors" 2>/dev/null || true
-  mkdir -p "$PREFIX_DIR/etc/apt" 2>/dev/null || true
-  echo "deb https://packages.termux.dev/apt/termux-main stable main" > "$PREFIX_DIR/etc/apt/sources.list"
-  rm -rf "$PREFIX_DIR/var/lib/apt/lists/"* 2>/dev/null || true
-}
-
-heal_dpkg() {
-  [ "$IS_ROOT" = "1" ] && return 0
-  dpkg --configure -a >/dev/null 2>&1 || true
-}
-
-pkg_install() {
-  if [ "$IS_ROOT" = "1" ]; then
-    echo "[!] Running as root: Termux pkg/apt cannot run under UID 0."
-    echo "    Exit 'su' and run 'loader --repair' as the normal Termux user to install: $*"
-    return 1
-  fi
-  heal_dpkg
-  DEBIAN_FRONTEND=noninteractive pkg_wrap update >/dev/null 2>&1 || true
-  DEBIAN_FRONTEND=noninteractive pkg_wrap install -y "$@" && return 0
-  echo "[!] Retrying install ($*) with apt-get --fix-missing..."
-  heal_dpkg
-  apt-get update >/dev/null 2>&1 || true
-  DEBIAN_FRONTEND=noninteractive apt-get install -y --fix-missing "$@" && return 0
-  use_official_mirror
-  apt-get update >/dev/null 2>&1 || true
-  DEBIAN_FRONTEND=noninteractive apt-get install -y --fix-missing "$@" && return 0
-  return 1
-}
-
-# Complete Environment Installer (System packages + Node ABI + Isolated NPM modules)
-setup_environment() {
-  local mode="${1:-1}" # 1 = VIP (full), 2 = LITE, repair = everything
-  local force="${2:-0}"
-
-  echo "[*] Checking Termux runtime environment..."
-
-  # 1. Core download / archive utilities
-  if ! command -v git >/dev/null 2>&1 && ! command -v curl >/dev/null 2>&1; then
-    echo "[*] Installing curl & git..."
-    pkg_install curl git tar || true
-  fi
-  command -v tar >/dev/null 2>&1 || pkg_install tar || true
-
-  # 2. Node.js + OpenSSL ABI check
-  local node_bin="$TERMUX_BIN/node"
-  [ ! -x "$node_bin" ] && node_bin="$(command -v node 2>/dev/null || echo "")"
-  if [ -z "$node_bin" ]; then
-    echo "[*] Installing nodejs..."
-    pkg_install nodejs || { echo "[-] Could not install nodejs."; return 1; }
-    node_bin="$(command -v node 2>/dev/null || echo "$TERMUX_BIN/node")"
-  fi
-
-  if ! "$node_bin" -v >/dev/null 2>&1; then
-    echo "[!] Node.js binary failed ABI/OpenSSL check, repairing Termux packages..."
-    if [ "$IS_ROOT" = "1" ]; then
-      echo "[-] Node.js is broken and cannot be upgraded while running as root. Exit 'su' and run: loader --repair"
-      return 1
-    fi
-    heal_dpkg
-    pkg_wrap update >/dev/null 2>&1 || true
-    DEBIAN_FRONTEND=noninteractive pkg_wrap upgrade -y -o Dpkg::Options::=--force-confnew 2>&1 | tail -n 4
-    "$node_bin" -v >/dev/null 2>&1 || DEBIAN_FRONTEND=noninteractive apt-get install -y --reinstall openssl nodejs >/dev/null 2>&1 || true
-    if ! "$node_bin" -v >/dev/null 2>&1; then
-      use_official_mirror
-      apt-get update >/dev/null 2>&1 || true
-      DEBIAN_FRONTEND=noninteractive apt-get upgrade -y -o Dpkg::Options::=--force-confnew 2>&1 | tail -n 4
-      DEBIAN_FRONTEND=noninteractive apt-get install -y --reinstall openssl nodejs >/dev/null 2>&1 || true
-    fi
-    "$node_bin" -v >/dev/null 2>&1 || { echo "[-] Node.js still cannot start. Run manually: pkg upgrade -y"; return 1; }
-    echo "[+] Node.js repaired: $("$node_bin" -v)"
-  fi
-  N="$node_bin"
-
-  # 3. SQLite3 (required by both VIP & LITE for cookie read/login)
-  if ! command -v sqlite3 >/dev/null 2>&1; then
-    echo "[*] Installing sqlite..."
-    pkg_install sqlite || { echo "[-] sqlite3 is required. Run 'pkg install sqlite' as normal Termux user."; return 1; }
-  fi
-
-  # 4. Termux:API (wake-lock), procps (pidof), nano (VIP script editor)
-  command -v termux-wake-lock >/dev/null 2>&1 || {
-    [ "$force" = "1" ] || [ ! -f "$ENV_STAMP_FILE" ] && pkg_install termux-api >/dev/null 2>&1 || true
-  }
-  if [ ! -x "/system/bin/pidof" ] && ! command -v pidof >/dev/null 2>&1; then
-    pkg_install procps >/dev/null 2>&1 || true
-  fi
-  if [ "$mode" = "1" ] || [ "$mode" = "repair" ]; then
-    command -v nano >/dev/null 2>&1 || {
-      [ "$force" = "1" ] || [ ! -f "$ENV_STAMP_FILE" ] && pkg_install nano >/dev/null 2>&1 || true
-    }
-  fi
-
-  # 5. Isolated NPM packages for VIP (axios, cli-table3, figlet) inside $ENV_DIR
-  if [ "$mode" = "1" ] || [ "$mode" = "repair" ]; then
-    mkdir -p "$ENV_DIR" 2>/dev/null
-    if [ ! -f "$ENV_DIR/package.json" ]; then
-      cat > "$ENV_DIR/package.json" <<'EOF'
-{
-  "name": "roblox-rejoin-env",
-  "private": true,
-  "description": "Managed runtime dependencies for Roblox Rejoin VIP"
-}
-EOF
-    fi
-
-    local missing_npm=""
-    for m in $VIP_DEPS; do
-      if [ "$force" = "1" ] || ! NODE_PATH="$ENV_DIR/node_modules" "$N" -e "require.resolve('$m')" >/dev/null 2>&1; then
-        missing_npm="$missing_npm $m"
-      fi
-    done
-
-    if [ -n "$missing_npm" ]; then
-      echo "[*] Installing NPM packages into isolated env:$missing_npm"
-      if ! command -v npm >/dev/null 2>&1; then
-        pkg_install nodejs || true
-      fi
-      # shellcheck disable=SC2086
-      (cd "$ENV_DIR" && npm install --save --no-audit --no-fund --prefer-offline $missing_npm) || \
-      (cd "$ENV_DIR" && rm -rf node_modules package-lock.json && npm install --save --no-audit --no-fund $missing_npm) || {
-        echo "[!] NPM install encountered an error."
-      }
-      fix_owner "$ENV_DIR"
-    fi
-
-    # Verify critical VIP dependencies (axios & cli-table3; figlet has a built-in fallback)
-    for crit in axios cli-table3; do
-      if ! NODE_PATH="$ENV_DIR/node_modules" "$N" -e "require('$crit')" >/dev/null 2>&1; then
-        echo "[-] Missing required NPM module '$crit'. Check internet and run: loader --repair"
-        return 1
-      fi
-    done
-
-    # Link $D/node_modules -> $ENV_DIR/node_modules so running `node rejoin.cjs` directly also works
-    if [ -d "$D" ] && [ ! -e "$D/node_modules" ]; then
-      ln -s "$ENV_DIR/node_modules" "$D/node_modules" 2>/dev/null || true
-    fi
-  fi
-
-  # 6. Configure autostart scripts & PATH exports
-  setup_autostart_files || true
-  date +%s > "$ENV_STAMP_FILE" 2>/dev/null || true
-  fix_owner "$ROBLOX_REJOIN_HOME"
-  return 0
-}
-
-download_tarball() {
-  local tmp_dl url
-  tmp_dl="$(mktemp -d 2>/dev/null || echo "$TMP_DIR/dl_$$")"
-  mkdir -p "$tmp_dl"
-  url="$R/archive/refs/heads/main.tar.gz"
-  if command -v curl >/dev/null 2>&1; then
-    curl -fL --connect-timeout 10 --retry 2 -o "$tmp_dl/r.tgz" "$url" || { rm -rf "$tmp_dl"; return 1; }
-  elif command -v wget >/dev/null 2>&1; then
-    wget -T 15 -O "$tmp_dl/r.tgz" "$url" || { rm -rf "$tmp_dl"; return 1; }
-  else
-    rm -rf "$tmp_dl"
-    return 1
-  fi
-  mkdir -p "$D"
-  find "$D" -mindepth 1 -maxdepth 1 ! -name node_modules -exec rm -rf {} + 2>/dev/null || true
-  tar -xzf "$tmp_dl/r.tgz" -C "$D" --strip-components=1 || { rm -rf "$tmp_dl"; return 1; }
-  rm -rf "$tmp_dl"
-  fix_owner "$D"
-  return 0
-}
-
-sync_repo() {
-  save_old_configs
-  if [ "$AUTOSTART" = "1" ] && [ -d "$D" ] && { [ -f "$D/$ENTRY_VIP" ] || [ -f "$D/$ENTRY_LITE" ]; }; then
-    echo "[*] Autostart mode — using existing local files."
-    return 0
-  fi
-  if [ "$NO_UPDATE" = "1" ] && [ -d "$D" ]; then
-    echo "[*] Skipping repo update (--no-update)."
-    return 0
-  fi
-
-  local use_tar=0
-  if ! command -v git >/dev/null 2>&1; then
-    pkg_install git || use_tar=1
-  fi
-
-  if [ "$use_tar" = "1" ]; then
-    if ! download_tarball; then
-      if [ -f "$D/$ENTRY_VIP" ] || [ -f "$D/$ENTRY_LITE" ]; then
-        echo "[!] Update download failed — continuing with local version."
-        return 0
-      fi
-      echo "[-] Could not download repository. Check your internet connection."
-      return 1
-    fi
-  elif [ ! -d "$D/.git" ]; then
-    if [ -f "$D/$ENTRY_VIP" ] && [ "$IS_ROOT" = "1" ]; then
-      echo "[*] Running existing local files in $D."
-      return 0
-    fi
-    local tmp_clone="$D.clone_$$"
-    rm -rf "$tmp_clone" 2>/dev/null || true
-    if git clone --depth 1 "$R" "$tmp_clone"; then
-      rm -rf "$D" 2>/dev/null || true
-      mv "$tmp_clone" "$D"
-      fix_owner "$D"
-    else
-      rm -rf "$tmp_clone" 2>/dev/null || true
-      echo "[!] git clone failed, trying tarball..."
-      if ! download_tarball; then
-        [ -f "$D/$ENTRY_VIP" ] && { echo "[!] Using existing local copy."; return 0; }
-        return 1
-      fi
-    fi
-  else
-    (
-      cd "$D" || exit 1
-      cur="$(git remote get-url origin 2>/dev/null || echo "")"
-      [ "$cur" != "$R" ] && git remote set-url origin "$R" 2>/dev/null || true
-      if git fetch --depth 1 origin main >/dev/null 2>&1 || git fetch --all --prune >/dev/null 2>&1; then
-        excl="-e node_modules"
-        for f in $CFGS; do excl="$excl -e $f"; done
-        git reset --hard origin/main >/dev/null 2>&1 || git reset --hard FETCH_HEAD >/dev/null 2>&1 || true
-        # shellcheck disable=SC2086
-        git clean -fd $excl >/dev/null 2>&1 || true
-      else
-        echo "[!] Network/GitHub unreachable — continuing with local version."
-      fi
-    )
-    fix_owner "$D"
-  fi
-  return 0
-}
-
 # Handle standalone --repair mode
 if [ "$REPAIR_ONLY" = "1" ]; then
-  sync_repo || true
+  sync_repo "1" || true
   if setup_environment "repair" "1"; then
     echo "[+] Environment check & repair completed!"
     print_boot_status_fast
@@ -607,9 +768,6 @@ case "$LAST" in 1|2) ;; *) LAST=1 ;; esac
 
 if [ "$AUTOSTART" = "1" ]; then
   CHOICE="$LAST"
-elif [ -z "$CHOICE" ]; then
-  CHOICE="$(normalize_choice "${LOADER_CHOICE:-}")"
-  [ "$CHOICE" = "3" ] && CHOICE=""
 fi
 
 # Interactive Loader Menu
@@ -632,7 +790,7 @@ if [ -z "$CHOICE" ]; then
   else
     CHOICE="$(normalize_choice "$ANS")"
     if [ "$CHOICE" = "3" ]; then
-      sync_repo || true
+      sync_repo "1" || true
       setup_environment "repair" "1"
       exit $?
     fi
@@ -643,33 +801,44 @@ fi
 echo "$CHOICE" > "$LAST_FILE" 2>/dev/null || true
 fix_owner "$LAST_FILE"
 if [ "$CHOICE" = "2" ]; then ENTRY="$ENTRY_LITE"; NAME="LITE"; else ENTRY="$ENTRY_VIP"; NAME="VIP"; fi
-echo "[*] Preparing $NAME..."
 
-sync_repo || exit 1
+# ---------------------------------------------------------------------------------------
+# Fast path: everything verified after the last change of the entry script -> no checks at all
+# ---------------------------------------------------------------------------------------
+FAST=0
+if [ "$FORCE_UPDATE" = "0" ] && [ "$NO_UPDATE" = "0" ] && fast_ready "$CHOICE"; then
+  FAST=1
+  # still refresh autostart here: a boot script left by an older version must not keep launching
+  # the stale copy after a reboot (cheap: a couple of cmp/writes, failures ignored)
+  setup_autostart_files >/dev/null 2>&1 || true
+fi
 
-# Self-update loader if repository has a newer loader.sh
-if [ -z "${LOADER_REEXEC:-}" ] && [ -f "$D/loader.sh" ] && [ -f "$L" ] && ! cmp -s "$D/loader.sh" "$L"; then
-  if cp -f "$D/loader.sh" "$L" 2>/dev/null && sed -i 's/\r$//' "$L" 2>/dev/null && chmod 755 "$L" 2>/dev/null; then
-    fix_owner "$L"
-    echo "[*] Loader updated, restarting..."
-    if [ "$AUTOSTART" = "1" ]; then
-      LOADER_REEXEC=1 exec bash "$L" --autostart --no-update "${PASS_ARGS[@]+"${PASS_ARGS[@]}"}"
-    else
-      LOADER_REEXEC=1 exec bash "$L" "$CHOICE" --no-update "${PASS_ARGS[@]+"${PASS_ARGS[@]}"}"
+if [ "$FAST" = "0" ]; then
+  echo "[*] Preparing $NAME..."
+  sync_repo "$FORCE_UPDATE" || exit 1
+
+  # Self-update loader if repository has a newer loader.sh
+  if [ -z "${LOADER_REEXEC:-}" ] && [ -f "$D/loader.sh" ] && [ -f "$L" ] && ! cmp -s "$D/loader.sh" "$L"; then
+    if cp -f "$D/loader.sh" "$L" 2>/dev/null && sed -i 's/\r$//' "$L" 2>/dev/null && chmod 755 "$L" 2>/dev/null; then
+      fix_owner "$L"
+      echo "[*] Loader updated, restarting..."
+      if [ "$AUTOSTART" = "1" ]; then
+        LOADER_REEXEC=1 exec bash "$L" --autostart --no-update "${PASS_ARGS[@]+"${PASS_ARGS[@]}"}"
+      else
+        LOADER_REEXEC=1 exec bash "$L" "$CHOICE" --no-update "${PASS_ARGS[@]+"${PASS_ARGS[@]}"}"
+      fi
     fi
   fi
+
+  verify_environment "$CHOICE" || exit 1
 fi
 
-# Ensure full runtime environment before launching Node
-setup_environment "$CHOICE" "0" || exit 1
+N="$(node_bin_path)"
+[ -n "$N" ] || { echo "[-] Node.js is not available."; exit 1; }
 
-if [ -d "$D" ] && [ ! -e "$D/node_modules" ] && [ -d "$ENV_DIR/node_modules" ]; then
-  ln -s "$ENV_DIR/node_modules" "$D/node_modules" 2>/dev/null || true
-fi
+[ ! -f "$D/$ENTRY" ] && { echo "[-] Entry file '$ENTRY' not found in $D"; exit 1; }
 
-[ ! -f "$W/$ENTRY" ] && { echo "[-] Entry file '$ENTRY' not found in $W"; exit 1; }
-
-cd "$W" || exit 1
+cd "$D" || exit 1
 if [ "$AUTOSTART" = "1" ]; then
   exec "$N" "$ENTRY" --autostart "${PASS_ARGS[@]+"${PASS_ARGS[@]}"}"
 else
