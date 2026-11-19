@@ -7,7 +7,7 @@ set -u
 
 pkg(){ yes | command pkg "$@"; }
 
-R="https://github.com/ryomolochiton/roblox-rejoin"
+R="https://github.com/QT305/roblox-rejoin"
 D="$HOME/roblox-rejoin"
 W="$D"
 ENTRY_VIP="rejoin.cjs"
