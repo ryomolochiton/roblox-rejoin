@@ -20,7 +20,7 @@
   ],
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/ryomolochiton/roblox-rejoin.git"
+    "url": "git+https://github.com/QT3005/roblox-rejoin.git"
   },
   "keywords": [
     "roblox",
@@ -28,12 +28,12 @@
     "termux",
     "android"
   ],
-  "author": "ryomolochiton",
+  "author": "QT3005",
   "license": "ISC",
   "bugs": {
-    "url": "https://github.com/ryomolochiton/roblox-rejoin/issues"
+    "url": "https://github.com/QT3005/roblox-rejoin/issues"
   },
-  "homepage": "https://github.com/ryomolochiton/roblox-rejoin#readme",
+  "homepage": "https://github.com/QT3005/roblox-rejoin#readme",
   "engines": {
     "node": ">=18"
   },
